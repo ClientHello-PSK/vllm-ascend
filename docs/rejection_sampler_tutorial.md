@@ -191,12 +191,29 @@ accept_prob(x) = min(1, p_target(x) / p_draft(x))
 │                  不匹配！                                   │
 │                                                            │
 │  处理逻辑:                                                  │
-│  1. 位置0: A == A → 接受                                   │
-│  2. 位置1: B == B → 接受                                   │
-│  3. 位置2: C != X → 拒绝，使用 X 替换                      │
+│  1. 位置0: A == A → 接受，填入 target[A]                   │
+│  2. 位置1: B == B → 接受，填入 target[B]                   │
+│  3. 位置2: C != X → 拒绝，填入 target[X]                   │
 │  4. 位置3: D → 跳过（因为前面已经拒绝）                     │
 │                                                            │
-│  最终输出: [A, B, X, bonus]                                │
+│  最终输出: [A, B, X, -1]    ← 无 bonus，因为有不匹配        │
+│                                                            │
+│  ────────────────────────────────────────────────────────  │
+│                                                            │
+│  另一个例子（全部匹配）:                                    │
+│  Draft tokens:  [A, B, C]                                  │
+│  Target argmax: [A, B, C]                                  │
+│                                                            │
+│  处理逻辑:                                                  │
+│  1. 位置0: A == A → 接受                                   │
+│  2. 位置1: B == B → 接受                                   │
+│  3. 位置2: C == C → 接受                                   │
+│                                                            │
+│  最终输出: [A, B, C, bonus] ← 全部接受，追加 bonus          │
+│                                                            │
+│  ★ 关键规则: bonus token 仅当所有 draft tokens 都被接受    │
+│             （即 first_mismatch_pos >= draft_tokens数量）  │
+│             时才添加！                                     │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -259,7 +276,7 @@ accept_prob(x) = min(1, p_target(x) / p_draft(x))
 
 ### 4.4 Block Verify（块验证）
 
-Block Verify 是 MagicMTP 论文提出的一种改进方法。
+Block Verify 是 MagicMTP（Magic Multi-Token Prediction）论文提出的一种改进方法。
 
 **传统方法**：逐个验证每个 token
 ```
@@ -302,16 +319,27 @@ u:         [0.5]   [0.7]   [0.6]
 ```
 rejection_sample()                        # 主入口函数
 ├── apply_sampling_constraints()          # 应用温度、top-k、top-p
-├── rejection_greedy_sample_pytorch()     # 贪婪采样路径
-│   └── 比较draft和target的argmax
+├── 贪婪采样路径 (not all_random)
+│   ├── rejection_greedy_sample_spec_len_1_pytorch()  # 特殊优化: spec_len=1
+│   │   └── 简化逻辑，直接比较
+│   └── rejection_greedy_sample_pytorch() # 通用贪婪采样
+│       └── 比较draft和target的argmax
 ├── sample_recovered_tokens()             # 预计算恢复token
 │   └── sample_recovered_tokens_pytorch()
 │       └── Gumbel-max采样
-├── rejection_random_sample_pytorch()     # 随机采样路径（传统）
+├── rejection_random_sample_pytorch()     # 随机采样路径（传统，spec_len<3）
 │   └── 逐个验证
-└── rejection_random_sample_block_verify_pytorch()  # 随机采样路径（Block Verify）
+└── rejection_random_sample_block_verify_pytorch()  # 随机采样路径（Block Verify，spec_len>=3）
     └── 累积乘积验证
 ```
+
+**特殊优化路径说明**：
+
+| 条件 | 使用函数 | 说明 |
+|------|----------|------|
+| `min(num_draft_tokens)==1 && max(num_draft_tokens)==1 && all_greedy` | `rejection_greedy_sample_spec_len_1_pytorch` | 每个请求只有1个draft token且全部贪婪采样时的优化 |
+| `max_spec_len >= 3` | `rejection_random_sample_block_verify_pytorch` | 使用 Block Verify 提高接受率 |
+| `max_spec_len < 3` | `rejection_random_sample_pytorch` | 传统逐个验证 |
 
 ### 5.2 关键数据结构
 
@@ -485,11 +513,16 @@ Step 2: 找到第一个拒绝位置
 
 Step 3: 创建跳过掩码
 ─────────────────────────────────────────────────────────────────────
-  should_skip = (pos >= first_reject_pos) & valid
+  should_skip = (pos > first_reject_pos) & valid
+  # 注意: 第一个拒绝位置本身不跳过，而是使用 recovered_token
+  #       只有第一个拒绝位置之后的才跳过
 
   示例:
   位置:        [0]     [1]     [2]
-  should_skip: [No]    [No]    [Yes]   ← 位置1是拒绝点，位置2跳过
+  should_skip: [No]    [No]    [Yes]
+               ↑       ↑       ↑
+               接受    拒绝但   跳过
+               draft   使用recovered
 
 Step 4: 选择最终tokens
 ─────────────────────────────────────────────────────────────────────
@@ -549,9 +582,26 @@ target_argmax = [101, 102, 104]       # ["很", "好", "。"]
 
 输出:
 ────────────────────────────────────────────────────────────────
-output_token_ids = [101, 102, 104, bonus]
+output_token_ids = [101, 102, 104, -1]
 
-解码: "天气很好。" + bonus_token
+解码: "天气很好。"
+
+注意: 由于位置2不匹配 (first_mismatch_pos=2 < draft_tokens=3)，
+      所以没有 bonus token，位置3保持为 PLACEHOLDER (-1)。
+
+────────────────────────────────────────────────────────────────
+
+另一个例子（全部匹配）:
+draft_token_ids = [101, 102, 103]
+target_argmax   = [101, 102, 103]  # 全部匹配
+
+输出:
+output_token_ids = [101, 102, 103, bonus]
+
+解码: "天气很好，" + bonus_token
+
+注意: 由于全部匹配 (first_mismatch_pos=3 >= draft_tokens=3)，
+      所以追加 bonus token。
 ```
 
 ### 7.2 随机采样完整示例
@@ -712,10 +762,10 @@ P(最终输出 = x)
 
 - [Fast Inference from Transformers via Speculative Decoding](https://arxiv.org/abs/2211.17192) - 投机解码原始论文
 - [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318) - 拒绝采样详细推导
-- [MagicMT: Magic Multi-Token Prediction](https://arxiv.org/abs/2408.01870) - Block Verify 方法
+- [MagicMTP: Magic Multi-Token Prediction](https://arxiv.org/abs/2408.01870) - Block Verify 方法
 
 ---
 
-*文档版本: 1.0*
-*最后更新: 2024*
+*文档版本: 1.1*
+*最后更新: 2025-03*
 *作者: Claude Code 自动生成*
