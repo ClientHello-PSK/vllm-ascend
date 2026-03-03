@@ -70,7 +70,7 @@
 | **Draft Token** | 草稿 Token | Draft Model 生成的候选 token |
 | **Bonus Token** | 奖励 Token | 当所有 Draft Token 都被接受时，额外生成的一个 token |
 | **Recovered Token** | 恢复 Token | 当 Draft Token 被拒绝时，从修正分布中采样的 token |
-| **Greedy Sampling** | 贪婪采样 | 每次选择概率最高的 token（确定性） |
+| **Greedy Sampling** | 贪心采样 | 每次选择概率最高的 token（确定性） |
 | **Random Sampling** | 随机采样 | 根据概率分布随机选择 token（有随机性） |
 | **Temperature** | 温度 | 控制采样随机性的参数。温度越高越随机，越低越确定 |
 | **Top-k** | 前 k 采样 | 只从概率最高的 k 个 token 中采样 |
@@ -138,9 +138,9 @@
 
 你可能会问：为什么不直接比较 Draft Token 和 Target Model 的输出是否相同？
 
-**答案是**：这只适用于贪婪采样（Greedy Sampling），但不适用于随机采样。
+**答案是**：这只适用于贪心采样（Greedy Sampling），但不适用于随机采样。
 
-#### 贪婪采样的简单情况
+#### 贪心采样的简单情况
 
 ```
 Draft 预测:  "很" (概率最高)
@@ -179,11 +179,11 @@ accept_prob(x) = min(1, p_target(x) / p_draft(x))
 
 ### 4.2 两种采样模式对比
 
-#### 贪婪采样模式
+#### 贪心采样模式
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  贪婪采样拒绝采样                                           │
+│  贪心采样拒绝采样                                           │
 │                                                            │
 │  Draft tokens:  [A, B, C, D]                               │
 │  Target argmax: [A, B, X, D]                               │
@@ -319,10 +319,10 @@ u:         [0.5]   [0.7]   [0.6]
 ```
 rejection_sample()                        # 主入口函数
 ├── apply_sampling_constraints()          # 应用温度、top-k、top-p
-├── 贪婪采样路径 (not all_random)
+├── 贪心采样路径 (not all_random)
 │   ├── rejection_greedy_sample_spec_len_1_pytorch()  # 特殊优化: spec_len=1
 │   │   └── 简化逻辑，直接比较
-│   └── rejection_greedy_sample_pytorch() # 通用贪婪采样
+│   └── rejection_greedy_sample_pytorch() # 通用贪心采样
 │       └── 比较draft和target的argmax
 ├── sample_recovered_tokens()             # 预计算恢复token
 │   └── sample_recovered_tokens_pytorch()
@@ -337,7 +337,7 @@ rejection_sample()                        # 主入口函数
 
 | 条件 | 使用函数 | 说明 |
 |------|----------|------|
-| `min(num_draft_tokens)==1 && max(num_draft_tokens)==1 && all_greedy` | `rejection_greedy_sample_spec_len_1_pytorch` | 每个请求只有1个draft token且全部贪婪采样时的优化 |
+| `min(num_draft_tokens)==1 && max(num_draft_tokens)==1 && all_greedy` | `rejection_greedy_sample_spec_len_1_pytorch` | 每个请求只有1个draft token且全部贪心采样时的优化 |
 | `max_spec_len >= 3` | `rejection_random_sample_block_verify_pytorch` | 使用 Block Verify 提高接受率 |
 | `max_spec_len < 3` | `rejection_random_sample_pytorch` | 传统逐个验证 |
 
@@ -421,12 +421,12 @@ output_token_ids (初始):
               │                                   │
               ▼                                   ▼
     ┌─────────────────┐                 ┌─────────────────┐
-    │ 有贪婪采样请求  │                 │ 全部随机采样    │
+    │ 有贪心采样请求  │                 │ 全部随机采样    │
     └────────┬────────┘                 └────────┬────────┘
              │                                   │
              ▼                                   │
     ┌─────────────────────────┐                 │
-    │ 4. 贪婪采样拒绝采样     │                 │
+    │ 4. 贪心采样拒绝采样     │                 │
     │ - 计算target_argmax     │                 │
     │ - 比较draft vs target   │                 │
     │ - 填充output_token_ids  │                 │
@@ -551,7 +551,7 @@ Step 5: 填充bonus token
 
 ## 7. 实例演示
 
-### 7.1 贪婪采样完整示例
+### 7.1 贪心采样完整示例
 
 ```
 场景: 用户输入 "今天天气"，Draft Model 生成 3 个候选 token
@@ -706,7 +706,7 @@ u = [0.5, 0.7, 0.6]
 ### Q2: 如果 Draft Model 的猜测全错怎么办？
 
 **A**: 即使全部猜错，投机解码也能保证输出质量。最坏情况下：
-- 贪婪采样：第一个 token 就被拒绝，使用 Target 的输出
+- 贪心采样：第一个 token 就被拒绝，使用 Target 的输出
 - 随机采样：每个位置都可能被拒绝，用 recovered token 替代
 
 这确保了输出**永远不会比 Target Model 单独推理差**。
@@ -751,7 +751,7 @@ P(最终输出 = x)
 
 理解 rejection_sampler.py 的关键点：
 
-1. **两种采样模式**：贪婪采样（简单比较）和随机采样（概率接受）
+1. **两种采样模式**：贪心采样（简单比较）和随机采样（概率接受）
 2. **三种输出**：接受的 draft token、recovered token、bonus token
 3. **两种验证方法**：传统逐个验证和 Block Verify（累积乘积）
 4. **批处理优化**：通过向量化操作同时处理多个请求
