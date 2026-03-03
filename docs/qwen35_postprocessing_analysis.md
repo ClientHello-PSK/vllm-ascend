@@ -487,7 +487,7 @@ sample_tokens() [model_runner_v1.py:1397]
 
 ### 3.3 RejectionSampler.forward() 详细流程
 
-**文件位置**: `vllm/v1/sample/rejection_sampler.py:60-166`
+**文件位置**: `vllm/v1/sample/rejection_sampler.py:24-120`
 
 ```python
 def forward(self, metadata, draft_probs, logits, sampling_metadata):
@@ -570,7 +570,7 @@ rejection_sample()
 
 ### 4.2 贪婪采样拒绝采样
 
-**文件位置**: `vllm_ascend/sample/rejection_sampler.py:637-799`
+**文件位置**: `vllm_ascend/sample/rejection_sampler.py:641-803`
 
 ```python
 def rejection_greedy_sample_pytorch(...):
@@ -594,7 +594,7 @@ def rejection_greedy_sample_pytorch(...):
 
 ### 4.3 随机采样拒绝采样
 
-**文件位置**: `vllm_ascend/sample/rejection_sampler.py:801-992`
+**文件位置**: `vllm_ascend/sample/rejection_sampler.py:805-996`
 
 ```python
 def rejection_random_sample_pytorch(...):
@@ -624,7 +624,7 @@ def rejection_random_sample_pytorch(...):
 
 ### 4.4 Block Verify模式
 
-**文件位置**: `vllm_ascend/sample/rejection_sampler.py:1227-1380`
+**文件位置**: `vllm_ascend/sample/rejection_sampler.py:1231-1383`
 
 ```python
 def rejection_random_sample_block_verify_pytorch(...):
@@ -979,3 +979,306 @@ apply_top_k_top_p = (
 |------|------|----------|
 | `npu_top_k_top_p` | Top-K + Top-P 过滤 | [链接](https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_top_k_top_p.md) |
 | `npu_moe_gating_top_k_softmax` | MoE 门控 Top-K + Softmax | [链接](https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_moe_gating_top_k_softmax.md) |
+
+---
+
+# 第五部分：后处理流程算子使用全面分析
+
+## 1. 传统后处理（非投机解码）
+
+### 1.1 流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        传统后处理流程                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Logits [batch, vocab_size]                                         │
+│       │                                                             │
+│       ▼                                                             │
+│  ┌─────────────────┐                                                │
+│  │ Top-K/Top-P 过滤 │ ← npu_apply_top_k_top_p (昇腾原生)            │
+│  └─────────────────┘   或 PyTorch 实现                              │
+│       │                                                             │
+│       ▼                                                             │
+│  ┌─────────────────┐                                                │
+│  │    Softmax      │ ← torch.softmax                                │
+│  └─────────────────┘                                                │
+│       │                                                             │
+│       ├──────────────────┬──────────────────┐                       │
+│       ▼                  ▼                  ▼                       │
+│   贪心采样            随机采样           Beam Search                  │
+│   torch.argmax       probs.div_(q)       (vLLM 核心)                 │
+│       .argmax()                                                       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 算子列表
+
+| 类别 | 算子 | 功能 | 位置 |
+|-----|------|------|------|
+| **昇腾原生** | `torch.ops._C_ascend.npu_apply_top_k_top_p` | Top-K/Top-P 过滤 | sampler.py:134 |
+| **PyTorch** | `torch.softmax` | 计算概率分布 | sampler.py:83,99 |
+| **PyTorch** | `torch.log_softmax` | 计算 log 概率 | sampler.py:81 |
+| **PyTorch** | `torch.argmax` | 贪心采样 | sampler.py:34,87 |
+| **PyTorch** | `torch.sort` | 概率排序 (PyTorch 路径) | sampler.py:100 |
+| **PyTorch** | `torch.cumsum` | 累积和 (Top-P 计算) | sampler.py:115 |
+| **PyTorch** | `torch.gather` | 收集特定位置值 | sampler.py:105,120 |
+| **PyTorch** | `torch.masked_fill_` | 填充被过滤值 | sampler.py:109,112,122 |
+| **PyTorch** | `torch.div_` | 概率除法 (Gumbel-Max) | sampler.py:34,87 |
+| **PyTorch** | `torch.exponential_` | 生成指数随机数 | sampler.py:27,32,55,58 |
+| **PyTorch** | `torch.empty` / `torch.empty_like` | 分配缓冲区 | sampler.py:25,52 |
+| **PyTorch** | `torch.unsqueeze` | 维度扩展 | sampler.py:104,108,116 |
+| **PyTorch** | `torch.view` | 形状变换 | sampler.py:34 |
+| **NPU 流** | `torch.npu.current_stream()` | 获取当前流 | sampler.py:33 |
+| **NPU 流** | `torch.npu.stream()` | 设置流上下文 | sampler.py:50 |
+| **NPU 流** | `torch.npu.Event()` | 事件同步 | sampler.py:42 |
+| **NPU 流** | `stream.wait_stream()` | 流等待 | sampler.py:33,51 |
+
+---
+
+## 2. 投机推理后处理
+
+### 2.1 流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          投机推理后处理流程                                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  Draft Logits [num_tokens, vocab] + Target Logits [num_tokens, vocab]          │
+│       │                                                                         │
+│       ▼                                                                         │
+│  ┌──────────────────────────────────────┐                                       │
+│  │  apply_sampling_constraints          │                                       │
+│  │  ├─ 温度缩放: torch.div_             │                                       │
+│  │  └─ Top-K/Top-P: npu_apply_top_k_top_p │                                      │
+│  └──────────────────────────────────────┘                                       │
+│       │                                                                         │
+│       ▼                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────────┐       │
+│  │                    rejection_sample (拒绝采样)                         │       │
+│  │                                                                       │       │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │       │
+│  │  │ 贪心模式 (Greedy Sampling)                                      │ │       │
+│  │  │ ├─ torch.argmax: 计算 target 预测                               │ │       │
+│  │  │ ├─ Triton: rejection_greedy_sample_spec_len_1_triton (优化路径)  │ │       │
+│  │  │ ├─ Triton: rejection_greedy_sample_triton (通用路径)             │ │       │
+│  │  │ └─ PyTorch: rejection_greedy_sample_pytorch (回退路径)           │ │       │
+│  │  └─────────────────────────────────────────────────────────────────┘ │       │
+│  │                                                                       │       │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │       │
+│  │  │ 随机模式 (Random Sampling)                                      │ │       │
+│  │  │ ├─ torch.softmax: 计算 target_probs                             │ │       │
+│  │  │ ├─ generate_uniform_probs: 生成均匀随机数                        │ │       │
+│  │  │ ├─ sample_recovered_tokens: 采样恢复 token                       │ │       │
+│  │  │ │   ├─ Triton: sample_recovered_tokens_kernel                   │ │       │
+│  │  │ │   └─ PyTorch: sample_recovered_tokens_pytorch                 │ │       │
+│  │  │ ├─ 逐个验证 (max_spec_len < 3):                                  │ │       │
+│  │  │ │   ├─ Triton: rejection_random_sample_kernel                   │ │       │
+│  │  │ │   └─ PyTorch: rejection_random_sample_pytorch                 │ │       │
+│  │  │ └─ 块验证 (max_spec_len >= 3, MagicMTP):                        │ │       │
+│  │  │     ├─ Triton: rejection_random_sample_block_verify_kernel      │ │       │
+│  │  │     └─ PyTorch: rejection_random_sample_block_verify_pytorch    │ │       │
+│  │  └─────────────────────────────────────────────────────────────────┘ │       │
+│  └──────────────────────────────────────────────────────────────────────┘       │
+│       │                                                                         │
+│       ▼                                                                         │
+│  output_token_ids [batch_size, max_spec_len + 1]                               │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 采样约束阶段 (apply_sampling_constraints)
+
+| 类别 | 算子 | 功能 | 位置 |
+|-----|------|------|------|
+| **昇腾原生** | `torch.ops._C_ascend.npu_apply_top_k_top_p` | Top-K/Top-P 过滤 | rejection_sampler.py:117 |
+| **PyTorch** | `torch.div_` | 温度缩放 | rejection_sampler.py:93 |
+| **PyTorch** | `torch.unsqueeze` | 维度扩展 | rejection_sampler.py:93 |
+
+### 2.3 贪心拒绝采样 (Greedy Rejection Sampling)
+
+#### 2.3.1 核心算子
+
+| 类别 | 算子/Kernel | 功能 | 位置 |
+|-----|------------|------|------|
+| **PyTorch** | `torch.argmax` | 计算 target 预测 | rejection_sampler.py:243 |
+| **PyTorch** | `torch.empty` | 创建输出缓冲区 | rejection_sampler.py:218 |
+| **PyTorch** | `torch.fill_` | 填充占位符 | rejection_sampler.py:224 |
+| **Triton** | `rejection_greedy_sample_spec_len_1_triton` | spec_len=1 优化路径 | reject_sample.py:45 |
+| **Triton** | `rejection_greedy_sample_triton` | 通用贪心采样 | reject_sample.py:86 |
+| **Triton** | `bonus_renew` | 添加 bonus token | reject_sample.py:74 |
+| **Triton** | `bonus_renew_1` | spec_len=1 bonus 添加 | reject_sample.py:35 |
+
+#### 2.3.2 PyTorch 回退路径额外算子
+
+| 算子 | 功能 | 位置 |
+|------|------|------|
+| `torch.tensor` | 创建张量 | rejection_sampler.py:696,729 |
+| `torch.arange` | 创建索引序列 | rejection_sampler.py:709,720 |
+| `torch.repeat_interleave` | 重复元素 | rejection_sampler.py:714 |
+| `torch.where` | 条件选择 | rejection_sampler.py:638 |
+| `torch.full` | 填充指定值 | rejection_sampler.py:733,742 |
+| `torch.min` / `torch.minimum` | 最小值计算 | rejection_sampler.py:753,764 |
+| `torch.expand` | 扩展张量 | rejection_sampler.py:768 |
+| `torch.any` | 任意元素满足条件 | rejection_sampler.py:794 |
+
+### 2.4 随机拒绝采样 (Random Rejection Sampling)
+
+#### 2.4.1 核心算子
+
+| 类别 | 算子/Kernel | 功能 | 位置 |
+|-----|------------|------|------|
+| **PyTorch** | `torch.softmax` | 计算 target 概率分布 | rejection_sampler.py:292 |
+| **PyTorch** | `torch.empty` | 创建缓冲区 | rejection_sampler.py:517,546 |
+| **PyTorch** | `torch.exponential_` | 生成指数分布随机数 | rejection_sampler.py:524,540 |
+| **PyTorch** | `torch.tensor(pin_memory=True)` | CPU 预分配 | rejection_sampler.py:529,865,1155 |
+| **Triton** | `rejection_random_sample_kernel` | 逐个验证模式 | reject_sample.py:140 |
+| **Triton** | `rejection_random_sample_block_verify_kernel` | 块验证模式 (MagicMTP) | reject_sample.py:366 |
+| **Triton** | `sample_recovered_tokens_kernel` | 采样恢复 token | reject_sample.py:230 |
+
+#### 2.4.2 PyTorch 回退路径额外算子
+
+| 算子 | 功能 | 位置 |
+|------|------|------|
+| `torch.cat` | 拼接张量 | rejection_sampler.py:868,1051,1153,1295 |
+| `torch.ones` | 创建全1张量 | rejection_sampler.py:894,1316 |
+| `torch.arange` | 创建索引序列 | rejection_sampler.py:875,977,1300,1375 |
+| `torch.where` | 条件选择 | rejection_sampler.py:933,958,965,995 |
+| `torch.argmax` | 最大值索引 | rejection_sampler.py:934,1176,1225 |
+| `torch.any` | 任意元素满足条件 | rejection_sampler.py:934,1079,1179 |
+| `torch.view` | 形状变换 | rejection_sampler.py:994,1382 |
+| `torch.expand` | 扩展张量 | rejection_sampler.py:895,994,1382 |
+| `torch.maximum` | 元素级最大值 | rejection_sampler.py:1201 |
+| `torch.cumprod` | 累积乘积 (块验证核心) | rejection_sampler.py:1342,1346 |
+| `torch.flip` | 翻转张量 | rejection_sampler.py:1356 |
+| `torch.isinf` | 判断无穷大 | rejection_sampler.py:1214,1221 |
+| `torch.clone` | 克隆张量 | rejection_sampler.py:1189 |
+| `torch.einsum` | 爱因斯坦求和 | rejection_sampler.py:1075 |
+
+### 2.5 参数扩展 (expand_batch_to_tokens)
+
+| 类别 | 算子/Kernel | 功能 | 位置 |
+|-----|------------|------|------|
+| **Triton** | `expand_kernel` | batch 级别→token 级别扩展 | reject_sample.py:200 |
+
+---
+
+## 3. 算子分类汇总
+
+### 3.1 按类型统计
+
+| 类型 | 数量 | 说明 |
+|-----|------|------|
+| **昇腾原生算子** | 1 | `npu_apply_top_k_top_p` |
+| **Triton Kernel** | 8 | 拒绝采样专用高性能 kernel |
+| **PyTorch 标准算子** | ~35 | 通用张量操作 |
+| **NPU 流管理** | 4 | 异步执行优化 |
+
+### 3.2 按功能分类
+
+| 功能模块 | 昇腾原生 | Triton | PyTorch |
+|---------|---------|--------|---------|
+| Top-K/Top-P 过滤 | 1 | - | 6 (回退路径) |
+| 温度缩放 | - | - | 2 |
+| 贪心采样 | - | 4 | 10 |
+| 随机采样 | - | 4 | 20+ |
+| 概率计算 | - | - | 3 |
+| 随机数生成 | - | - | 2 |
+| 参数扩展 | - | 1 | 5 |
+| 流管理 | - | - | 4 |
+
+### 3.3 Triton Kernel 详细列表
+
+| Kernel 名称 | 功能描述 | 调用条件 |
+|------------|---------|---------|
+| `rejection_greedy_sample_spec_len_1_triton` | spec_len=1 贪心采样 | HAS_TRITON && spec_len==1 |
+| `rejection_greedy_sample_triton` | 通用贪心采样 | HAS_TRITON && 贪心模式 |
+| `rejection_random_sample_kernel` | 随机采样逐个验证 | HAS_TRITON && max_spec_len<3 |
+| `rejection_random_sample_block_verify_kernel` | 随机采样块验证 | HAS_TRITON && max_spec_len>=3 |
+| `sample_recovered_tokens_kernel` | 采样恢复 token | HAS_TRITON && 随机模式 |
+| `expand_kernel` | batch→token 参数扩展 | HAS_TRITON |
+| `bonus_renew` | 添加 bonus token | 被 greedy kernel 调用 |
+| `bonus_renew_1` | spec_len=1 bonus 添加 | 被 spec_len=1 kernel 调用 |
+
+---
+
+## 4. 平台差异与执行路径
+
+### 4.1 平台选择逻辑
+
+| 平台 | Top-K/Top-P | 贪心拒绝采样 | 随机拒绝采样 |
+|-----|-------------|-------------|-------------|
+| **A2/A3 NPU + Triton** | `npu_apply_top_k_top_p` | Triton kernel | Triton kernel |
+| **A2/A3 NPU 无 Triton** | `npu_apply_top_k_top_p` | PyTorch 实现 | PyTorch 实现 |
+| **其他 NPU + Triton** | PyTorch 实现 | Triton kernel | Triton kernel |
+| **其他 NPU 无 Triton** | PyTorch 实现 | PyTorch 实现 | PyTorch 实现 |
+
+### 4.2 代码路径选择
+
+```python
+# Top-K/Top-P 实现
+apply_top_k_top_p = (
+    _apply_top_k_top_p_ascendc    # A2/A3: 昇腾原生算子
+    if get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3]
+    else _apply_top_k_top_p_pytorch  # 其他: PyTorch 实现
+)
+
+# 拒绝采样实现
+if HAS_TRITON:
+    # 使用 Triton kernel
+    rejection_greedy_sample_with_triton(...)
+    rejection_random_sample_kernel[(grid,)](...)
+else:
+    # 使用 PyTorch 实现
+    rejection_greedy_sample_pytorch(...)
+    rejection_random_sample_pytorch(...)
+```
+
+---
+
+## 5. 性能优化要点
+
+### 5.1 昇腾原生算子优势
+
+`npu_apply_top_k_top_p` 相比 PyTorch 实现的优势：
+- **融合计算**: Top-K 和 Top-P 在单个 kernel 中完成
+- **内存访问优化**: 减少中间张量的读写
+- **性能提升**: 约 5-10 倍加速
+
+### 5.2 Triton Kernel 优势
+
+- **并行化**: 充分利用 GPU/NPU 的并行计算能力
+- **内存合并**: 优化的内存访问模式
+- **避免同步**: 减少 CPU-GPU 同步点
+
+### 5.3 异步执行优化
+
+```python
+# 异步指数随机数生成（与模型计算重叠）
+with torch.npu.stream(global_stream()):
+    q.exponential_()  # 在单独的流中执行
+    async_event.record()  # 记录完成事件
+
+# 后续采样时等待
+async_event.synchronize()  # 确保随机数已生成
+probs.div_(q).argmax(dim=-1)  # Gumbel-Max 采样
+```
+
+---
+
+## 6. 总结
+
+后处理流程的算子使用特点：
+
+1. **昇腾原生算子稀缺**: 目前仅有 `npu_apply_top_k_top_p` 一个昇腾原生算子
+2. **Triton 广泛使用**: 8 个 Triton kernel 覆盖拒绝采样的核心逻辑
+3. **PyTorch 作为回退**: 所有操作都有 PyTorch 实现作为兼容性保障
+4. **流管理优化**: 使用 NPU 流实现异步执行，隐藏随机数生成延迟
+
+未来优化方向：
+- 开发更多昇腾原生算子（如拒绝采样融合算子）
+- 优化 PyTorch 回退路径的性能
+- 增加更多 Triton kernel 覆盖场景
