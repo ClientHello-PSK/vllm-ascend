@@ -41,15 +41,15 @@ def apply_sampling_constraints(
 
     特殊情况：
     =========
-    - 贪婪采样 (greedy decoding): 直接返回原始logits，不做任何处理
-      因为贪婪采样只需要argmax，不需要概率分布
+    - 贪心采样 (greedy decoding): 直接返回原始logits，不做任何处理
+      因为贪心采样只需要argmax，不需要概率分布
 
     举例说明：
     =========
     假设 batch_size=2, num_tokens=5, vocab_size=100
 
     请求0: 3个draft tokens, temperature=0.8, top_k=50, top_p=0.9
-    请求1: 2个draft tokens, temperature=1.0 (贪婪)
+    请求1: 2个draft tokens, temperature=0.0 (贪心)
 
     处理流程：
     1. 检查all_greedy -> 不是，继续处理
@@ -67,9 +67,9 @@ def apply_sampling_constraints(
     assert logits.ndim == 2  # 必须是2D张量 [num_tokens, vocab_size]
     assert cu_num_draft_tokens.ndim == 1  # 必须是1D张量 [batch_size]
 
-    # ==================== 步骤2: 贪婪采样快速路径 ====================
-    # 如果所有请求都是贪婪采样，直接返回原始logits
-    # 贪婪采样只需要argmax，不需要温度缩放和top-k/top-p
+    # ==================== 步骤2: 贪心采样快速路径 ====================
+    # 如果所有请求都是贪心采样，直接返回原始logits
+    # 贪心采样只需要argmax，不需要温度缩放和top-k/top-p
     if sampling_metadata.all_greedy:
         return logits
 
@@ -78,7 +78,7 @@ def apply_sampling_constraints(
 
     # 将batch级别的temperature扩展到token级别
     # replace_from=GREEDY_TEMPERATURE, replace_to=1 表示：
-    #   如果temperature是贪婪温度（通常是0），替换为1（即不缩放）
+    #   如果temperature是贪心温度（通常是0），替换为1（即不缩放）
     temperature = expand_batch_to_tokens(
         sampling_metadata.temperature,
         cu_num_draft_tokens,
@@ -138,7 +138,7 @@ def rejection_sample(
     """
     投机解码的核心拒绝采样函数。
 
-    这是推测解码(Speculative Decoding)的主入口函数，负责：
+    这是投机解码(Speculative Decoding)的主入口函数，负责：
     1. 验证draft模型生成的tokens
     2. 决定接受或拒绝每个draft token
     3. 生成最终输出的token序列
@@ -148,7 +148,7 @@ def rejection_sample(
     投机解码的核心思想是用一个小而快的draft模型生成候选tokens，
     然后用大而慢的target模型并行验证这些tokens。
 
-    对于贪婪采样：
+    对于贪心采样：
     - 比较draft token和target token是否相同
     - 从第一个不匹配的位置开始拒绝
 
@@ -166,7 +166,7 @@ def rejection_sample(
     =========
     假设 batch_size=2, max_spec_len=4
 
-    请求0: draft生成3个tokens [10, 20, 30], temperature=0 (贪婪)
+    请求0: draft生成3个tokens [10, 20, 30], temperature=0 (贪心)
     请求1: draft生成2个tokens [40, 50], temperature=0.8 (随机)
 
     draft_token_ids: [10, 20, 30, 40, 50]
@@ -175,7 +175,7 @@ def rejection_sample(
 
     处理流程：
     1. 创建输出缓冲区 [2, 5]，填充占位符
-    2. 请求0使用贪婪采样路径
+    2. 请求0使用贪心采样路径
     3. 请求1使用随机采样路径
     4. 返回output_token_ids
 
@@ -224,22 +224,22 @@ def rejection_sample(
     output_token_ids.fill_(PLACEHOLDER_TOKEN_ID)
 
     # ==================== 步骤4: 确定采样类型 ====================
-    # is_greedy[i] = True 表示请求i使用贪婪采样
+    # is_greedy[i] = True 表示请求i使用贪心采样
     if sampling_metadata.all_greedy:
-        # 所有请求都是贪婪采样
+        # 所有请求都是贪心采样
         is_greedy = None
     else:
-        # 根据temperature判断：GREEDY_TEMPERATURE(通常是0)表示贪婪
+        # 根据temperature判断：GREEDY_TEMPERATURE(通常是0)表示贪心
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
 
     # 如果有Triton支持，计算grid和block大小
     if HAS_TRITON:
         grid, block_size = cal_grid_and_block_size(batch_size)
 
-    # ==================== 步骤5: 贪婪采样拒绝采样 ====================
-    # 如果不是所有请求都是随机采样，则处理贪婪采样的请求
+    # ==================== 步骤5: 贪心采样拒绝采样 ====================
+    # 如果不是所有请求都是随机采样，则处理贪心采样的请求
     if not sampling_metadata.all_random:
-        # 计算target模型对每个位置的argmax（贪婪选择）
+        # 计算target模型对每个位置的argmax（贪心选择）
         target_argmax = target_logits.argmax(dim=-1)
 
         if HAS_TRITON:
@@ -259,7 +259,7 @@ def rejection_sample(
         else:
             # 使用PyTorch实现
             if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and sampling_metadata.all_greedy:
-                # 特殊优化：所有请求都只有1个draft token且都是贪婪采样
+                # 特殊优化：所有请求都只有1个draft token且都是贪心采样
                 rejection_greedy_sample_spec_len_1_pytorch(
                     output_token_ids,
                     draft_token_ids,
@@ -267,7 +267,7 @@ def rejection_sample(
                     bonus_token_ids,
                 )
             else:
-                # 通用贪婪采样拒绝采样
+                # 通用贪心采样拒绝采样
                 rejection_greedy_sample_pytorch(
                     output_token_ids,
                     cu_num_draft_tokens,
@@ -279,7 +279,7 @@ def rejection_sample(
                     is_greedy,
                 )
 
-        # 如果所有请求都是贪婪采样，直接返回结果
+        # 如果所有请求都是贪心采样，直接返回结果
         if sampling_metadata.all_greedy:
             return output_token_ids
 
@@ -464,7 +464,7 @@ def sample_recovered_tokens(
     device: torch.device,  # 计算设备（CPU/GPU）
 ) -> torch.Tensor:
     """
-    推测解码中的恢复token采样函数。
+    投机解码中的恢复token采样函数。
 
     核心目的：
     =========
@@ -581,7 +581,7 @@ def rejection_greedy_sample_spec_len_1_pytorch(
     bonus_token_ids,  # [batch_size] bonus token ids
 ):
     """
-    贪婪采样拒绝采样的特殊优化版本（spec_len=1）。
+    贪心采样拒绝采样的特殊优化版本（spec_len=1）。
 
     核心目的：
     =========
@@ -642,10 +642,10 @@ def rejection_greedy_sample_pytorch(
     bonus_token_ids,  # [batch_size] 每个请求的bonus token（当所有draft tokens都被接受时使用）
     draft_tokens_per_req,  # [batch_size], list 每个请求的draft token数量
     max_spec_len,  # 最大投机长度（即draft模型最多生成多少个token）
-    is_greedy=None,  # [batch_size] or None 标记每个请求是否使用贪婪采样
+    is_greedy=None,  # [batch_size] or None 标记每个请求是否使用贪心采样
 ):
     """
-    投机解码(Speculative Decoding)中的贪婪采样拒绝采样函数。
+    投机解码(Speculative Decoding)中的贪心采样拒绝采样函数。
 
     核心思想：
     - Draft模型快速生成多个候选tokens
@@ -654,25 +654,33 @@ def rejection_greedy_sample_pytorch(
 
     举例说明：
     ==========
-    假设 batch_size=2, max_spec_len=4
+    假设 batch_size=3, max_spec_len=4
 
-    请求0: draft生成3个tokens  [10, 20, 30]
-    请求1: draft生成2个tokens  [40, 50]
+    请求0: draft生成3个tokens  [10, 20, 30]  → 全部匹配，有bonus
+    请求1: draft生成2个tokens  [40, 50]      → 第1个位置不匹配，无bonus
+    请求2: draft生成2个tokens  [60, 70]      → 全部匹配，有bonus
 
-    draft_token_ids (展平): [10, 20, 30, 40, 50]
-    draft_tokens_per_req: [3, 2]
-    cu_num_draft_tokens: [3, 5]  (累积和)
+    draft_token_ids (展平): [10, 20, 30, 40, 50, 60, 70]
+    draft_tokens_per_req: [3, 2, 2]
+    cu_num_draft_tokens: [3, 5, 7]  (累积和)
 
-    target_argmax (展平): [10, 20, 35, 40, 55]
-                          ↑匹配  ↑匹配  ↑不匹配  ↑匹配  ↑不匹配
+    target_argmax (展平): [10, 20, 30, 40, 55, 60, 70]
+                          ↑匹配  ↑匹配  ↑匹配  ↑匹配  ↑不匹配  ↑匹配  ↑匹配
 
-    处理过程：
-    - 请求0: 第2个位置不匹配(30 vs 35)，所以接受[10,20]，拒绝[30]，bonus token放到位置3
-    - 请求1: 第1个位置不匹配(50 vs 55)，所以接受[40]，拒绝[50]，bonus token放到位置2
+    处理过程（贪心采样的核心规则：第一个不匹配位置用target替代，之后全部丢弃）：
+    - 请求0: 所有位置都匹配(10=10, 20=20, 30=30)，first_mismatch_pos=3 >= draft_tokens=3
+             → 所有draft tokens被接受，bonus token放到位置3
+    - 请求1: 第1个位置不匹配(50 vs 55)，first_mismatch_pos=1 < draft_tokens=2
+             → 接受[40]，位置1用target(55)替代，无bonus
+    - 请求2: 所有位置都匹配(60=60, 70=70)，first_mismatch_pos=2 >= draft_tokens=2
+             → 所有draft tokens被接受，bonus token放到位置2
 
     最终 output_token_ids:
-    请求0: [10, 20, bonus0, -1]  (位置0,1接受，位置2放bonus)
-    请求1: [40, bonus1, -1, -1]  (位置0接受，位置1放bonus)
+    请求0: [10, 20, 30, bonus0]  (全部接受 + bonus)
+    请求1: [40, 55, -1, -1]      (位置0接受，位置1用target替代，无bonus)
+    请求2: [60, 70, bonus2, -1]  (全部接受 + bonus)
+
+    ★ 关键点：bonus token仅当 first_mismatch_pos >= draft_tokens_per_req 时才添加！
     """
 
     # ==================== 步骤1: 初始化基本信息 ====================
@@ -683,7 +691,7 @@ def rejection_greedy_sample_pytorch(
     # 将draft_tokens_per_req从list转为tensor，异步传输到GPU以提高效率
     draft_tokens_per_req = torch.tensor(draft_tokens_per_req).to(device, non_blocking=True)
 
-    # 如果is_greedy为None，说明所有请求都是贪婪采样，创建全True的mask
+    # 如果is_greedy为None，说明所有请求都是贪心采样，创建全True的mask
     if is_greedy is None:
         is_greedy = torch.ones(batch_size, dtype=torch.bool, device=device)
 
@@ -762,7 +770,7 @@ def rejection_greedy_sample_pytorch(
     # 扩展greedy mask以便与copy_mask进行广播
     greedy_mask = is_greedy.unsqueeze(1)
 
-    # 最终复制mask：需要复制且是贪婪采样的请求
+    # 最终复制mask：需要复制且是贪心采样的请求
     final_copy_mask = copy_mask & greedy_mask
 
     # 计算每个输出位置对应的draft_token_ids中的全局索引
@@ -775,7 +783,7 @@ def rejection_greedy_sample_pytorch(
 
     # ==================== 步骤5: 填充bonus token ====================
     # bonus token的条件：
-    # 1. 是贪婪采样 (is_greedy)
+    # 1. 是贪心采样 (is_greedy)
     # 2. 所有draft tokens都被接受 (第一个不匹配位置 >= draft_tokens数量)
     needs_bonus = is_greedy & (first_mismatch_pos_per_req >= draft_tokens_per_req)
 
@@ -799,7 +807,7 @@ def rejection_random_sample_pytorch(
     bonus_token_ids,  # [batch_size] bonus token ids
     recovered_token_ids,  # [num_tokens] 每个位置的恢复token
     uniform_probs,  # [num_tokens] 均匀随机数，用于拒绝判断
-    is_greedy,  # [batch_size] 是否贪婪采样的标记
+    is_greedy,  # [batch_size] 是否贪心采样的标记
     max_spec_len,  # 最大投机长度
     vocab_size,  # 词表大小
     IS_NGRAM=False,  # 是否为N-gram模式（无draft概率）
@@ -809,7 +817,7 @@ def rejection_random_sample_pytorch(
 
     核心功能：
     =========
-    实现推测解码的拒绝采样步骤，使用完全向量化的方法，
+    实现投机解码的拒绝采样步骤，使用完全向量化的方法，
     避免了逐请求逐token循环的高开销。
 
     算法步骤：
@@ -823,7 +831,7 @@ def rejection_random_sample_pytorch(
        - 接受的位置：draft token
        - 第一个拒绝的位置：recovered token
        - 全部接受：bonus token
-    5. **掩码处理**: 确保只对非贪婪请求和有效序列长度进行操作
+    5. **掩码处理**: 确保只对非贪心请求和有效序列长度进行操作
 
     举例说明：
     =========
@@ -932,10 +940,10 @@ def rejection_random_sample_pytorch(
     # 最终接受：原本接受且不在跳过范围内
     final_acceptance = acceptance_condition & (~should_skip)
 
-    # 非贪婪掩码
+    # 非贪心掩码
     non_greedy_mask = ~is_greedy
 
-    # 需要更新的掩码：非贪婪 + 有效 + 不跳过
+    # 需要更新的掩码：非贪心 + 有效 + 不跳过
     update_mask = non_greedy_mask[:, None] & valid_mask & (~should_skip)
 
     # 第一个拒绝位置也需要更新（填入recovered token）
@@ -1080,7 +1088,7 @@ def sample_recovered_tokens_pytorch(
     IS_NGRAM=False,  # 是否为N-gram模式（无draft概率）
 ):
     """
-    推测解码中的恢复token采样函数（PyTorch实现）。
+    投机解码中的恢复token采样函数（PyTorch实现）。
 
     核心目的：
     =========
@@ -1094,7 +1102,7 @@ def sample_recovered_tokens_pytorch(
 
     2. **概率修正**:
        - N-GRAM模式: 将draft token在target分布中的概率置零
-       - 概率模式: 计算 max(0, target_probs - draft_probs)，标准推测解码算法
+       - 概率模式: 计算 max(0, target_probs - draft_probs)，标准投机解码算法
 
     3. **归一化与采样**: 将修正概率除以归一化分布 'q'，使用向量化操作。
 
@@ -1181,7 +1189,7 @@ def sample_recovered_tokens_pytorch(
         prob = modified_target_probs
 
     else:
-        # 概率模式：标准推测解码算法
+        # 概率模式：标准投机解码算法
         # 修正概率 = max(0, target_probs - draft_probs)
         # 这确保:
         # 1. 只保留target比draft概率高的部分
@@ -1225,7 +1233,7 @@ def rejection_random_sample_block_verify_pytorch(
     bonus_token_ids,  # [batch_size] bonus token ids
     recovered_token_ids,  # [num_tokens] 每个位置的恢复token
     uniform_probs,  # [num_tokens] 均匀随机数
-    is_greedy,  # [batch_size] 是否贪婪采样
+    is_greedy,  # [batch_size] 是否贪心采样
     max_spec_len,  # 最大投机长度
     vocab_size,  # 词表大小
     IS_NGRAM=False,  # 是否为N-gram模式
