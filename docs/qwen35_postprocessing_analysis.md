@@ -41,7 +41,7 @@ class NPUModelRunner(GPUModelRunner):
 @dataclass
 class SamplingMetadata:
     temperature: torch.Tensor | None      # 温度参数 [batch_size]
-    all_greedy: bool                      # 是否全部贪婪采样
+    all_greedy: bool                      # 是否全部贪心采样
     all_random: bool                      # 是否全部随机采样
     top_p: torch.Tensor | None            # top-p参数 [batch_size]
     top_k: torch.Tensor | None            # top-k参数 [batch_size]
@@ -70,7 +70,7 @@ class SamplingMetadata:
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `temperature` | float | 1.0 | 控制采样随机性，0表示贪婪采样 |
+| `temperature` | float | 1.0 | 控制采样随机性，0表示贪心采样 |
 | `top_p` | float | 1.0 | nucleus采样累积概率阈值 |
 | `top_k` | int | 0 | 只考虑top-k个token，0表示全部 |
 | `presence_penalty` | float | 0.0 | 存在惩罚 |
@@ -132,25 +132,50 @@ def _sample(self, logits, spec_decode_metadata):
 sample_tokens() [model_runner_v1.py:1397]
     │
     ├── 1. 解包 execute_model_state
-    │       └── 获取 logits
+    │       └── 获取 logits, scheduler_output, attn_metadata 等
     │
     ├── 2. 【可选】应用结构化输出约束
     │       └── apply_grammar_bitmask(logits)
     │
     ├── 3. 调用 _sample()
     │       │
-    │       └── AscendSampler.forward() [sampler.py]
+    │       └── AscendSampler [sampler.py]
     │               │
     │               ├── 计算logprobs（如果需要）
     │               ├── 转换为float32
     │               ├── apply_logits_processors()
     │               └── sample()
     │
-    ├── 4. _bookkeeping_sync()
+    ├── 4. 【可选】_update_states_after_model_execute()
+    │       └── need_accepted_tokens 时更新状态
+    │
+    ├── 5. 【可选】propose_draft_token_ids() [推测解码]
+    │       │
+    │       ├── EAGLE 模式: 使用 GPU 采样结果
+    │       └── 其他模式: 使用 CPU 采样结果
+    │
+    ├── 6. 【可选】KV 传输组清理
+    │       └── get_kv_transfer_group().clear_connector_metadata()
+    │
+    ├── 7. 【可选】RoutedExpertsCapturer 保存
+    │       └── capturer.save_captured_experts()
+    │
+    ├── 8. _bookkeeping_sync()
     │       └── 解析采样结果，更新状态
     │
-    └── 5. 返回 ModelRunnerOutput
+    ├── 9. 【可选】dynamic_eplb 更新
+    │       └── eplb_updator.forward_end()
+    │
+    ├── 10. 【可选】debugger 处理
+    │       └── debugger.stop() / debugger.step()
+    │
+    └── 11. 返回结果
+            │
+            ├── 同步模式: ModelRunnerOutput
+            └── 异步模式: AsyncGPUModelRunnerOutput
 ```
+
+> **注意**: 步骤 4-7 为可选步骤，根据配置和条件触发
 
 ### 3.3 Sampler.forward() 详细流程
 
@@ -201,13 +226,13 @@ logits [num_reqs, vocab_size]
     │       └── penalties (repetition/frequency/presence)
     │
     └── 3. sample()
-            ├── 贪婪采样: argmax
+            ├── 贪心采样: argmax
             └── 随机采样: temperature → top_k/top_p → multinomial
 ```
 
 ### 4.2 采样方法
 
-**贪婪采样** (`sampler.py:144-145`):
+**贪心采样** (`sampler.py:144-145`):
 ```python
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return logits.argmax(dim=-1).view(-1)
@@ -216,7 +241,7 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
 **随机采样** (`sampler.py:147-203`):
 ```python
 def sample(self, logits, sampling_metadata):
-    # 1. 贪婪采样（如果需要）
+    # 1. 贪心采样（如果需要）
     if not sampling_metadata.all_random:
         greedy_sampled = self.greedy_sample(logits)
         if sampling_metadata.all_greedy:
@@ -471,7 +496,7 @@ sample_tokens() [model_runner_v1.py:1397]
     │               │       apply_sampling_constraints()
     │               │
     │               ├── 2.3 调用 rejection_sample()
-    │               │       ├── 贪婪采样路径
+    │               │       ├── 贪心采样路径
     │               │       └── 随机采样路径
     │               │
     │               └── 2.4 返回 SamplerOutput
@@ -530,6 +555,259 @@ def forward(self, metadata, draft_probs, logits, sampling_metadata):
 
 ---
 
+### 3.4 提取 Bonus Logits 并采样 Bonus Tokens
+
+**文件位置**: `vllm/v1/sample/rejection_sampler.py:93-115`
+
+> **注意**: 此代码来自 vLLM 官方实现 (`vllm/v1/sample/rejection_sampler.py`)，vllm-ascend 直接复用此实现，仅提供底层的拒绝采样函数 (`rejection_sample` 等)。
+
+#### 3.4.1 概述
+
+Bonus Token 是投机解码中的一个特殊概念。当一个请求的**所有 draft tokens 都被接受**时，target 模型会获得一个额外的"奖励"token（bonus token），这相当于在标准自回归解码中额外生成的一个 token。
+
+#### 3.4.2 数据结构
+
+```
+bonus_logits_indices: torch.Tensor  # [batch_size] bonus位置的logits索引
+bonus_token_ids: torch.Tensor       # [batch_size, 1] 采样到的bonus tokens
+```
+
+#### 3.4.3 完整处理流程
+
+```python
+# ==================== 步骤1: 提取 Bonus Logits ====================
+# 从完整的logits张量中提取bonus位置的logits
+bonus_logits_indices = metadata.bonus_logits_indices
+bonus_logits = logits[bonus_logits_indices]  # [batch_size, vocab_size]
+
+# ==================== 步骤2: 构建 Bonus 采样的元数据 ====================
+# 创建用于bonus token采样的元数据
+# max_num_logprobs=-1 表示返回完整logprobs（用于后续计算接受token的logprobs）
+bonus_sampling_metadata = replace(
+    sampling_metadata,
+    max_num_logprobs=-1,
+)
+
+# ==================== 步骤3: 调用 Sampler 采样 Bonus Token ====================
+# Sampler 接口说明（vLLM 官方实现）
+#
+# self.sampler 实际上是 AscendSampler（vllm-ascend 封装），其 forward 方法执行以下步骤：
+# 1. compute_logprobs(logits): 计算原始 logprobs（如果需要）
+# 2. logits.to(float32): 转换为 float32 提高精度
+# 3. apply_logits_processors(): 应用 logits 处理器（惩罚项、坏词过滤等）
+# 4. sample(): 执行采样（贪心或随机）
+# 5. gather_logprobs(): 收集采样 token 的 logprobs
+#
+# 具体参数说明：
+# - logits: bonus 位置的 logits，形状 [batch_size, vocab_size]
+# - sampling_metadata: 采样元数据（temperature, top_k, top_p, generators 等）
+# - predict_bonus_token: 标记为 bonus token 采样，用于特殊处理
+# - logprobs_mode_override: 覆盖默认 logprobs 模式，返回处理后的 logits 用于后续计算
+bonus_sampler_output = self.sampler(
+    logits=bonus_logits,
+    sampling_metadata=bonus_sampling_metadata,
+    predict_bonus_token=True,  # 标记这是bonus token采样
+    # 覆盖logprobs模式，返回processed logits用于计算logprobs
+    logprobs_mode_override="processed_logits" if self.is_processed_logprobs_mode else "raw_logits"
+)
+
+# ==================== 步骤4: 提取采样结果 ====================
+bonus_token_ids = bonus_sampler_output.sampled_token_ids  # [batch_size, 1]
+```
+
+#### 3.4.4 关键设计要点
+
+| 要点 | 说明 |
+|-----|------|
+| **何时使用** | 只有当一个请求的**所有 draft tokens 都被接受**时才使用 |
+| **位置** | Bonus token 放在输出的**最后一个位置**（索引 = max_spec_len） |
+| **形状** | `bonus_token_ids.shape = [batch_size, 1]` |
+| **Logprobs** | 需要保存 bonus_logits 用于后续计算输出 logprobs |
+
+#### 3.4.5 处理流程图
+
+```
+logits [num_tokens + batch_size, vocab_size]
+    │
+    ├── target_logits_indices ──▶ target_logits ──▶ 拒绝采样
+    │
+    └── bonus_logits_indices ──▶ bonus_logits ──▶ Sampler 采样
+                                                    │
+                                                    ▼
+                                           bonus_token_ids [batch_size, 1]
+                                                    │
+                                                    ▼
+                                           当所有draft被接受时:
+                                           output[:, max_spec_len] = bonus_token_id
+```
+
+---
+
+### 3.5 提取并处理 Target Logits
+
+**文件位置**: `vllm/v1/sample/rejection_sampler.py:117-139`
+
+> **注意**: 此代码来自 vLLM 官方实现 (`vllm/v1/sample/rejection_sampler.py`)，vllm-ascend 直接复用此实现，仅提供底层的 `apply_sampling_constraints` 等函数。
+
+#### 3.5.1 概述
+
+Target Logits 是 target 模型对 draft 位置的输出，用于与 draft tokens 进行对比验证。这是投机解码的核心数据。
+
+#### 3.5.2 数据结构
+
+```
+target_logits_indices: torch.Tensor   # [num_tokens] target位置的logits索引
+target_logits: torch.Tensor           # [num_tokens, vocab_size]
+raw_target_logits: torch.Tensor       # 处理前的原始logits（用于logprobs计算）
+```
+
+#### 3.5.3 完整处理流程
+
+```python
+# ==================== 步骤1: 提取 Target Logits ====================
+target_logits_indices = metadata.target_logits_indices
+
+# 从完整logits中提取target位置的logits
+# 注意: PyTorch索引会创建新的张量，不会影响原始logits
+raw_target_logits = logits[target_logits_indices]  # [num_tokens, vocab_size]
+
+# ==================== 步骤2: 类型转换 ====================
+# 使用float32进行后续计算，提高精度
+raw_target_logits = raw_target_logits.to(torch.float32)
+target_logits = raw_target_logits
+
+# ==================== 步骤3: 克隆原始logits ====================
+# 保存原始logits用于后续logprobs计算，因为apply_logits_processors会修改张量
+if not self.is_processed_logprobs_mode:
+    target_logits = target_logits.clone()
+
+# ==================== 步骤4: 应用 Logits Processors ====================
+# apply_logits_processors 接口说明（vLLM 官方 Sampler 实现）
+#
+# 函数签名：
+#   def apply_logits_processors(
+#       self,
+#       logits: torch.Tensor,           # 输入 logits [num_tokens, vocab_size]
+#       sampling_metadata: SamplingMetadata,
+#       predict_bonus_token: bool,
+#   ) -> torch.Tensor
+#
+# 功能流程：
+# 1. 应用 allowed_token_ids_mask: 将不在白名单的 token 概率设为 -inf
+# 2. 应用 bad_words: 排除禁用词（包含禁用词的 token 概率设为 -inf）
+# 3. 应用 non_argmax_invariant processors: 用户自定义的处理器
+# 4. 应用惩罚项 (apply_penalties):
+#    - repetition_penalty: 重复惩罚
+#    - frequency_penalty: 频率惩罚
+#    - presence_penalty: 存在惩罚
+#
+# 具体代码位置：vllm/v1/sample/sampler.py:266-300
+#
+# 应用用户自定义的logits处理器（如自定义约束、过滤等）
+target_logits = self.apply_logits_processors(
+    target_logits,
+    sampling_metadata,
+    metadata  # 传入metadata用于特殊处理
+)
+
+# ==================== 步骤5: 应用采样约束 ====================
+# 应用温度缩放、Top-K、Top-P等采样约束
+# 注意: 这个函数可能in-place修改target_logits
+target_logits = apply_sampling_constraints(
+    target_logits,
+    metadata.cu_num_draft_tokens,  # 累积draft token数量
+    sampling_metadata,
+)
+# target_logits 形状: [num_tokens, vocab_size]
+```
+
+#### 3.5.4 apply_sampling_constraints 详细说明
+
+这是 vllm-ascend 特有的实现，位于 `vllm_ascend/sample/rejection_sampler.py:24`
+
+```python
+def apply_sampling_constraints(
+    logits: torch.Tensor,              # [num_tokens, vocab_size]
+    cu_num_draft_tokens: torch.Tensor, # [batch_size] 累积draft token数量
+    sampling_metadata: SamplingMetadata,
+) -> torch.Tensor:
+    """
+    对target logits应用采样约束。
+
+    处理流程:
+    1. 温度缩放: logits / temperature
+    2. Top-K 过滤: 只保留概率最高的k个token
+    3. Top-P 过滤: 只保留累积概率达到p的最小token集合
+
+    特殊情况:
+    - 贪心采样(temperature=0): 直接返回原始logits，不做任何处理
+    """
+    # 检查是否全部贪心采样（temperature=0）
+    if sampling_metadata.all_greedy:
+        return logits  # 贪心不需要任何处理
+
+    # 扩展temperature到token级别
+    temperature = sampling_metadata.temperature  # [batch_size]
+    expanded_temperature = temperature[cu_num_draft_tokens]  # [num_tokens]
+
+    # 步骤1: 温度缩放
+    logits = logits / expanded_temperature.unsqueeze(dim=1)
+
+    # 步骤2: Top-K / Top-P 过滤
+    k = sampling_metadata.top_k  # [batch_size]
+    p = sampling_metadata.top_p  # [batch_size]
+
+    # 扩展到token级别
+    expanded_k = k[cu_num_draft_tokens]  # [num_tokens]
+    expanded_p = p[cu_num_draft_tokens]  # [num_tokens]
+
+    # 调用Ascend优化的TopK/TopP算子
+    logits = apply_top_k_top_p(logits, expanded_k, expanded_p)
+
+    return logits
+```
+
+#### 3.5.5 处理流程图
+
+```
+logits [num_tokens + batch_size, vocab_size]
+    │
+    └── target_logits_indices ──▶ raw_target_logits [num_tokens, vocab_size]
+                                      │
+                                      ▼
+                               to(torch.float32)
+                                      │
+                                      ▼
+                               克隆 (保留原始值)
+                                      │
+                                      ▼
+                               apply_logits_processors()
+                                      │
+                                      ▼
+                               apply_sampling_constraints()
+                               ├── 温度缩放
+                               ├── Top-K 过滤
+                               └── Top-P 过滤
+                                      │
+                                      ▼
+                               target_logits [num_tokens, vocab_size]
+                                      │
+                                      ▼
+                               rejection_sample() 进行拒绝验证
+```
+
+#### 3.5.6 Target Logits 与 Bonus Logits 的区别
+
+| 特性 | Target Logits | Bonus Logits |
+|-----|--------------|--------------|
+| **位置** | draft 位置 | 非 draft 位置 |
+| **数量** | num_tokens 个 | batch_size 个 |
+| **用途** | 与 draft tokens 比较验证 | 生成 bonus token |
+| **处理** | 需要应用完整的采样约束 | 只需要基础采样 |
+| **输出位置** | 输出数组的前 max_spec_len 列 | 输出数组的第 max_spec_len+1 列 |
+
+---
+
 ## 4. 功能流程
 
 ### 4.1 拒绝采样核心算法
@@ -549,7 +827,7 @@ rejection_sample()
     │   ├── max_spec_len < 3 → 逐个验证
     │   └── max_spec_len >= 3 → Block Verify（累积乘积）
     │
-    ├── 贪婪采样路径:
+    ├── 贪心采样路径:
     │   ├── 比较 draft_token vs target_argmax
     │   ├── 从第一个不匹配位置开始拒绝
     │   └── 全部匹配时追加bonus token
@@ -568,7 +846,7 @@ rejection_sample()
             └── 无效位置: PLACEHOLDER_TOKEN_ID (-1)
 ```
 
-### 4.2 贪婪采样拒绝采样
+### 4.2 贪心采样拒绝采样
 
 **文件位置**: `vllm_ascend/sample/rejection_sampler.py:641-803`
 
@@ -688,7 +966,7 @@ def sample_recovered_tokens(...):
 def apply_sampling_constraints(logits, cu_num_draft_tokens, sampling_metadata):
     """对logits进行温度缩放、top-k、top-p处理"""
 
-    # 贪婪采样直接返回
+    # 贪心采样直接返回
     if sampling_metadata.all_greedy:
         return logits
 
@@ -798,7 +1076,7 @@ logits: [num_tokens + batch_size, vocab_size]  # 包含bonus位置
 | 常量 | 值 | 说明 |
 |------|-----|------|
 | `PLACEHOLDER_TOKEN_ID` | -1 | 占位符，表示无效位置 |
-| `GREEDY_TEMPERATURE` | 0 | 贪婪采样温度 |
+| `GREEDY_TEMPERATURE` | 0 | 贪心采样温度 |
 | `MAX_SPEC_LEN` | 128 | 最大投机长度 |
 
 ---
