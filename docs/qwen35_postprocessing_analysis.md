@@ -177,33 +177,455 @@ sample_tokens() [model_runner_v1.py:1397]
 
 > **注意**: 步骤 4-7 为可选步骤，根据配置和条件触发
 
-### 3.3 Sampler.forward() 详细流程
+### 3.3 AscendSampler.forward() 详细流程
+
+> **继承关系**: `AscendSampler` 继承自 `Sampler`（`vllm/v1/sample/sampler.py`），`forward` 方法直接复用父类实现。`AscendSampler` 主要覆写了 `TopKTopPSampler` 为 `AscendTopKTopPSampler`，以及添加异步指数分布计算。
 
 **文件位置**: `vllm/v1/sample/sampler.py:67-129`
 
+#### 3.3.1 整体流程概览
+
+```
+forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
+    │
+    ├── Step 1: 计算原始 logprobs（可选）
+    │   ├── raw_logprobs 模式: logits.log_softmax(dim=-1)
+    │   └── raw_logits 模式: logits.clone() 或 logits.to(float32)
+    │
+    ├── Step 2: 类型转换 → float32
+    │
+    ├── Step 3: apply_logits_processors()
+    │   ├── 3a. allowed_token_ids 白名单过滤
+    │   ├── 3b. bad_words 排除
+    │   ├── 3c. non_argmax_invariant 处理器（min_tokens, logit_bias）
+    │   └── 3d. apply_penalties（repetition/frequency/presence）
+    │
+    ├── Step 4: sample()
+    │   ├── 4a. 贪心采样: argmax（如果需要）
+    │   ├── 4b. 温度缩放: logits / temperature
+    │   ├── 4c. argmax_invariant 处理器（min_p）
+    │   ├── 4d. AscendTopKTopPSampler.forward_native()
+    │   │   ├── apply_top_k_top_p()（昇腾原生/PyTorch）
+    │   │   ├── softmax → probs
+    │   │   └── Gumbel-Max采样 或 random_sample()
+    │   └── 4e. torch.where 合并贪心/随机结果
+    │
+    ├── Step 5: 类型转换 sampled → int64 → int32
+    │
+    ├── Step 6: gather_logprobs()（可选）
+    │   ├── topk(raw_logprobs, num_logprobs) → topk_indices, topk_logprobs
+    │   ├── gather sampled token logprob
+    │   ├── batched_count_greater_than → ranks
+    │   └── 拼接 → LogprobsTensors
+    │
+    └── Step 7: 返回 SamplerOutput
+            ├── sampled_token_ids: [num_reqs, 1]
+            └── logprobs_tensors: LogprobsTensors | None
+```
+
+#### 3.3.2 Step 1: 计算原始 Logprobs
+
 ```python
-def forward(self, logits, sampling_metadata, ...):
-    # 1. 计算原始logprobs（如果需要）
-    if num_logprobs is not None:
+# vllm/v1/sample/sampler.py:79-87
+num_logprobs = sampling_metadata.max_num_logprobs
+if num_logprobs is not None:
+    if logprobs_mode == "raw_logprobs":
+        # 对原始logits做log_softmax，保留未经任何处理的概率分布
         raw_logprobs = self.compute_logprobs(logits)
+        # compute_logprobs: logits.log_softmax(dim=-1, dtype=torch.float32)
+    elif logprobs_mode == "raw_logits":
+        # 直接克隆原始logits
+        if logits.dtype == torch.float32:
+            raw_logprobs = logits.clone()
+        else:
+            raw_logprobs = logits.to(torch.float32)
+```
 
-    # 2. 转换为float32
-    logits = logits.to(torch.float32)
+| 模式 | 计算方式 | 说明 |
+|------|---------|------|
+| `raw_logprobs` | `log_softmax(logits)` | 默认模式，返回原始概率的对数 |
+| `raw_logits` | `logits.clone()` | 返回原始logits值 |
+| `processed_logprobs` | 在 TopKTopP 阶段计算 | 返回处理后的概率对数 |
+| `processed_logits` | 在 TopKTopP 阶段计算 | 返回处理后的logits |
 
-    # 3. 应用logits处理器
-    logits = self.apply_logits_processors(logits, sampling_metadata)
+> **关键点**: raw_logprobs 在应用惩罚和温度缩放**之前**计算，这与 V0 Sampler 不同（V0 使用处理后的 logits）。
+
+#### 3.3.3 Step 2: 类型转换
+
+```python
+# vllm/v1/sample/sampler.py:90
+logits = logits.to(torch.float32)
+```
+
+将 logits 从模型输出的精度（通常为 float16/bfloat16）转换为 float32，避免后续处理中的精度损失。
+
+#### 3.3.4 Step 3: apply_logits_processors()
+
+**文件位置**: `vllm/v1/sample/sampler.py:266-300`
+
+```python
+def apply_logits_processors(self, logits, sampling_metadata, predict_bonus_token):
+    # 3a. 应用 allowed_token_ids 白名单
+    # 将不在白名单中的 token 概率设为 -inf
+    if sampling_metadata.allowed_token_ids_mask is not None:
+        logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
+
+    # 3b. 应用 bad_words 排除
+    # 检查上下文是否匹配 bad_words 前缀，如果匹配则将对应 token 设为 -inf
+    if bad_words_token_ids:
+        apply_bad_words(logits, bad_words_token_ids, output_token_ids)
+
+    # 3c. 应用非 argmax 不变处理器
+    # 这些处理器可能影响贪心采样结果（如 min_tokens, logit_bias）
+    for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+        logits = processor.apply(logits)
+
+    # 3d. 应用惩罚项
+    logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)
+    return logits
+```
+
+**apply_penalties 详细说明**:
+
+```python
+# vllm/v1/sample/sampler.py:302-319
+def apply_penalties(logits, sampling_metadata, output_token_ids):
+    if sampling_metadata.no_penalties:
+        return logits  # 无惩罚直接返回
+
+    return apply_all_penalties(
+        logits,
+        sampling_metadata.prompt_token_ids,      # 提示词token IDs
+        sampling_metadata.presence_penalties,      # 存在惩罚
+        sampling_metadata.frequency_penalties,     # 频率惩罚
+        sampling_metadata.repetition_penalties,    # 重复惩罚
+        output_token_ids,                          # 已输出的token IDs
+    )
+```
+
+| 惩罚类型 | 计算方式 | 效果 |
+|---------|---------|------|
+| `repetition_penalty` | `logit = logit / penalty` (正值) 或 `logit * penalty` (负值) | 降低已出现token的概率 |
+| `frequency_penalty` | `logit -= frequency * count` | 按出现次数线性惩罚 |
+| `presence_penalty` | `logit -= presence * (count > 0)` | 只要出现过就惩罚 |
+
+#### 3.3.5 Step 4: sample()
+
+**文件位置**: `vllm/v1/sample/sampler.py:147-203`
+
+```python
+def sample(self, logits, sampling_metadata, logprobs_mode_override=None):
+    # ======== 4a. 贪心采样 ========
+    if sampling_metadata.all_random:
+        greedy_sampled = None  # 全部随机，跳过贪心
+    else:
+        greedy_sampled = self.greedy_sample(logits)  # argmax(dim=-1)
+        if sampling_metadata.all_greedy:
+            # 全部贪心，直接返回（可选计算 processed_logprobs）
+            return greedy_sampled, processed_logprobs
+
+    # ======== 4b. 温度缩放 ========
+    # logits = logits / temperature
+    # 对 temperature < EPS 的位置用 1.0 替换，避免除以0
+    logits = self.apply_temperature(
+        logits, sampling_metadata.temperature, sampling_metadata.all_random
+    )
+
+    # ======== 4c. argmax 不变处理器 ========
+    # 如 min_p 处理器，只影响随机采样
+    for processor in sampling_metadata.logitsprocs.argmax_invariant:
+        logits = processor.apply(logits)
+
+    # ======== 4d. TopK/TopP + 采样 ========
+    # 调用 AscendTopKTopPSampler.forward_native()
+    random_sampled, processed_logprobs = self.topk_topp_sampler(
+        logits, sampling_metadata.generators,
+        sampling_metadata.top_k, sampling_metadata.top_p,
+    )
+
+    # ======== 4e. 合并贪心/随机结果 ========
+    if greedy_sampled is None:
+        return random_sampled, processed_logprobs
+    # temperature < EPS 的请求使用贪心结果，否则使用随机结果
+    sampled = torch.where(
+        sampling_metadata.temperature < _SAMPLING_EPS,
+        greedy_sampled, random_sampled,
+        out=greedy_sampled,  # 复用张量减少内存分配
+    )
+    return sampled, processed_logprobs
+```
+
+#### 3.3.6 Step 4d 详解: AscendTopKTopPSampler.forward_native()
+
+**文件位置**: `vllm_ascend/sample/sampler.py:74-88`
+
+> **继承关系**: `AscendTopKTopPSampler` 继承自 `TopKTopPSampler`，覆写 `forward_native` 方法。
+
+```python
+def forward_native(self, logits, generators, k, p):
+    """Override pytorch native implementation to torch_npu"""
+    # 1. 应用 Top-K/Top-P 过滤
+    # A2/A3 使用昇腾原生算子 npu_apply_top_k_top_p
+    # 其他设备使用 PyTorch 实现（sort + mask）
+    logits = self.apply_top_k_top_p(logits, k, p)
+
+    # 2. 可选: 保存处理后的 logprobs/logits
+    logits_to_return = None
+    if self.logprobs_mode == "processed_logits":
+        logits_to_return = logits
+    elif self.logprobs_mode == "processed_logprobs":
+        logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
+
+    # 3. 计算概率分布
+    probs = logits.softmax(dim=-1, dtype=torch.float32)
 
     # 4. 采样
-    sampled, processed_logprobs = self.sample(logits, sampling_metadata)
+    if get_ascend_config().enable_async_exponential:
+        # 异步 Gumbel-Max 采样（随机数已提前生成）
+        self.async_event.synchronize()  # 等待异步指数随机数完成
+        return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return
+    # 同步采样
+    return random_sample(probs, generators), logits_to_return
+```
 
-    # 5. 收集logprobs
-    logprobs_tensors = self.gather_logprobs(raw_logprobs, num_logprobs, sampled)
+**与基类 TopKTopPSampler.forward_native() 的差异**:
 
-    # 6. 返回结果
-    return SamplerOutput(
-        sampled_token_ids=sampled.unsqueeze(-1),
-        logprobs_tensors=logprobs_tensors,
+| 特性 | 基类 (TopKTopPSampler) | AscendTopKTopPSampler |
+|------|----------------------|----------------------|
+| Top-K/Top-P 实现 | PyTorch sort/mask 或 Triton | 昇腾原生算子 `npu_apply_top_k_top_p` |
+| 随机采样 | `random_sample()` (同步) | 异步 Gumbel-Max (可选) 或 `random_sample()` |
+| 异步优化 | 无 | 支持 `enable_async_exponential` |
+
+**random_sample() 采样原理** (Gumbel-Max Trick):
+
+```python
+# vllm_ascend/sample/sampler.py:11-34
+def random_sample(probs, generators):
+    q = torch.empty_like(probs)
+    # 生成指数分布随机数 q ~ Exp(1)
+    if len(generators) != probs.shape[0]:
+        q.exponential_()  # 批量生成
+    if generators:
+        for i, generator in generators.items():
+            q[i].exponential_(generator=generator)  # 按请求生成
+    # probs / q 等价于 Gumbel-Max 采样
+    # 数学等价于 multinomial(probs)，但避免CPU-NPU同步
+    return probs.div_(q).argmax(dim=-1).view(-1)
+```
+
+> **数学原理**: 若 $q_i \sim \text{Exp}(1)$，则 $\arg\max_i \frac{p_i}{q_i}$ 等价于从分类分布 $\text{Cat}(p_1, \ldots, p_n)$ 中采样。
+
+**random_sample() 详细流程分析**:
+
+`random_sample` 存在两个版本：**vLLM 基类版本**（GPU）和 **vllm-ascend 昇腾版本**（NPU），核心算法一致，但昇腾版本增加了**流切换**机制。
+
+**1. 输入参数**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `probs` | `torch.Tensor` shape `[batch_size, vocab_size]` | 经过 softmax 归一化后的概率分布 |
+| `generators` | `dict[int, torch.Generator]` | 按请求索引映射的随机数生成器，用于可复现采样（seed 场景） |
+
+**2. 执行流程（逐步拆解）**
+
+```
+步骤 1: 流切换（仅昇腾版本）
+  ├── npu_stream_switch(global_stream()) 将后续操作切换到全局辅助流
+  ├── 目的: 将随机数生成与主计算流解耦，实现流水线并行
+  └── global_stream() 返回一个独立的 torch.npu.Stream 实例
+
+步骤 2: 分配随机数张量
+  └── q = torch.empty_like(probs)   # shape 与 probs 相同 [batch_size, vocab_size]
+      # 仅分配内存，不初始化（性能优化）
+
+步骤 3: 生成指数分布随机数 q ~ Exp(1)
+  ├── 情况 A: len(generators) != probs.shape[0]（大多数请求无自定义 seed）
+  │   └── q.exponential_()           # 批量原地生成，所有行一次完成
+  ├── 情况 B: generators 非空（部分请求有自定义 seed）
+  │   └── for i, generator in generators.items():
+  │       └── q[i].exponential_(generator=generator)  # 逐行覆盖特定请求的随机数
+  └── 设计要点:
+      ├── 先批量生成（快），再逐个覆盖有 seed 的行（慢但少量）
+      ├── 两个 if 不是互斥的，而是顺序执行:
+      │   • 当部分请求有 seed 时，先全量生成，再覆盖特定行
+      │   • 当所有请求都有 seed 时（len == shape[0]），跳过批量生成
+      └── 当 generators 为空时，仅执行批量生成
+
+步骤 4: 流同步（仅昇腾版本）
+  └── torch.npu.current_stream().wait_stream(global_stream())
+      # 主流等待辅助流完成随机数生成，确保 q 数据就绪
+
+步骤 5: Gumbel-Max 采样
+  └── probs.div_(q)                  # 原地除法: probs[i][j] /= q[i][j]
+      .argmax(dim=-1)                # 沿 vocab 维度取最大值索引 → shape [batch_size]
+      .view(-1)                      # 展平为一维 → 最终 token IDs
+```
+
+**3. 为什么不用 `torch.multinomial`？**
+
+| 对比项 | `torch.multinomial` | `random_sample` (Gumbel-Max) |
+|--------|-------------------|------------------------------|
+| CPU-设备同步 | **需要**（内部有 CPU-GPU/NPU 同步点） | **不需要**（纯设备端计算） |
+| 数学等价性 | 直接多项式采样 | 通过指数分布间接实现，统计等价 |
+| 异步友好性 | 差（同步点阻塞流水线） | 好（可完全在设备端异步执行） |
+| 性能瓶颈 | 同步开销在高吞吐场景显著 | `argmax` 计算量大但无同步开销 |
+
+**4. 昇腾版本 vs 基类版本差异**
+
+```python
+# 基类版本 (vllm/v1/sample/ops/topk_topp_sampler.py:325-346)
+def random_sample(probs, generators):
+    q = torch.empty_like(probs)
+    if len(generators) != probs.shape[0]:
+        q.exponential_()
+    if generators:
+        for i, generator in generators.items():
+            q[i].exponential_(generator=generator)
+    return probs.div_(q).argmax(dim=-1).view(-1)
+
+# 昇腾版本 (vllm_ascend/sample/sampler.py:11-34)
+def random_sample(probs, generators):
+    with npu_stream_switch(global_stream()):  # ← 额外: 切换到辅助流
+        q = torch.empty_like(probs)
+        if len(generators) != probs.shape[0]:
+            q.exponential_()
+        if generators:
+            for i, generator in generators.items():
+                q[i].exponential_(generator=generator)
+    torch.npu.current_stream().wait_stream(global_stream())  # ← 额外: 流同步
+    return probs.div_(q).argmax(dim=-1).view(-1)
+```
+
+昇腾版本的关键改进：将**指数分布随机数生成**放到 `global_stream()` 辅助流中执行，使其可以与主流上的其他计算（如 Top-K/Top-P 过滤后的 softmax）并行，减少端到端延迟。
+
+**5. 异步预计算优化 (`do_async_exponential`)**
+
+当 `enable_async_exponential=True` 时，`AscendSampler` 会在模型前向推理期间**提前**生成指数随机数：
+
+```python
+# AscendSampler.do_async_exponential() - 在模型执行期间调用
+def do_async_exponential(self, b_s, head_dim, generators):
+    with torch.npu.stream(global_stream()):
+        global_stream().wait_stream(torch.npu.current_stream())
+        q = torch.empty((b_s, head_dim), device="npu", dtype=torch.float32)
+        if len(generators) != q.shape[0]:
+            q.exponential_()
+        if generators:
+            for i, generator in generators.items():
+                q[i].exponential_(generator=generator)
+        self.async_exponential_event.record()  # 记录事件
+    self.set_q_event(q, self.async_exponential_event)  # 传递给采样器
+
+# AscendTopKTopPSampler.forward_native() - 采样时使用预计算的 q
+if get_ascend_config().enable_async_exponential:
+    self.async_event.synchronize()  # 等待预计算完成
+    return probs.div_(self.q).argmax(dim=-1).view(-1), logits_to_return
+```
+
+这样指数随机数的生成与模型前向推理**完全重叠**，采样阶段仅需执行 `div_` + `argmax`，进一步降低采样延迟。
+
+#### 3.3.7 Step 5-6: 类型转换与 Logprobs 收集
+
+```python
+# vllm/v1/sample/sampler.py:99-116
+
+# Step 5: 类型转换
+sampled = sampled.long()    # → int64 (兼容后续索引操作)
+
+# Step 6: 收集 logprobs
+if num_logprobs is None:
+    logprobs_tensors = None
+elif num_logprobs == -1:
+    # 返回完整的未排序 logprobs（用于拒绝采样的 bonus token）
+    logprobs_tensors = LogprobsTensors(
+        torch.empty(0), raw_logprobs, torch.empty(0)
     )
+else:
+    # 收集 top-k logprobs + sampled token 的 logprob
+    logprobs_tensors = self.gather_logprobs(
+        raw_logprobs, num_logprobs, token_ids=sampled
+    )
+```
+
+**gather_logprobs 详细流程**:
+
+```python
+# vllm/v1/sample/sampler.py:209-251
+def gather_logprobs(logprobs, num_logprobs, token_ids):
+    # 1. 获取 top-k logprobs 及其索引
+    topk_logprobs, topk_indices = torch.topk(logprobs, num_logprobs, dim=-1)
+    # topk_logprobs: [num_reqs, num_logprobs]
+    # topk_indices:  [num_reqs, num_logprobs]
+
+    # 2. 获取采样 token 的 logprob
+    token_ids = token_ids.unsqueeze(-1)  # [num_reqs, 1]
+    token_logprobs = logprobs.gather(-1, token_ids)  # [num_reqs, 1]
+
+    # 3. 计算采样 token 的排名
+    token_ranks = batched_count_greater_than(logprobs, token_logprobs)
+
+    # 4. 拼接结果
+    indices = torch.cat((token_ids, topk_indices), dim=1)   # [num_reqs, num_logprobs+1]
+    logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
+
+    return LogprobsTensors(indices.to(int32), logprobs, token_ranks)
+```
+
+#### 3.3.8 Step 7: 返回 SamplerOutput
+
+```python
+# vllm/v1/sample/sampler.py:118-129
+sampled = sampled.to(torch.int32)  # 减小张量大小
+
+sampler_output = SamplerOutput(
+    sampled_token_ids=sampled.unsqueeze(-1),  # [num_reqs] → [num_reqs, 1]
+    logprobs_tensors=logprobs_tensors,         # LogprobsTensors | None
+)
+return sampler_output
+```
+
+**SamplerOutput 数据结构**:
+
+```python
+@dataclass
+class SamplerOutput:
+    sampled_token_ids: torch.Tensor       # [num_reqs, 1] int32
+    logprobs_tensors: LogprobsTensors | None
+
+class LogprobsTensors(NamedTuple):
+    logprob_token_ids: torch.Tensor       # [num_reqs, num_logprobs+1] int32
+    logprobs: torch.Tensor                # [num_reqs, num_logprobs+1] float32
+    selected_token_ranks: torch.Tensor    # [num_reqs] int64
+```
+
+#### 3.3.9 执行路径总结
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ AscendSampler.forward() 执行路径                                      │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  路径 A: 全部贪心 (all_greedy=True, temperature=0)                    │
+│  ─────────────────────────────────────────────────                   │
+│  logits → float32 → apply_logits_processors → argmax → 返回         │
+│  特点: 不需要温度缩放、Top-K/Top-P、随机采样                           │
+│                                                                      │
+│  路径 B: 全部随机 (all_random=True)                                   │
+│  ─────────────────────────────────────────────────                   │
+│  logits → float32 → apply_logits_processors                         │
+│        → temperature → argmax_invariant处理器                        │
+│        → Top-K/Top-P → softmax → Gumbel-Max → 返回                  │
+│  特点: 不需要贪心采样、不需要 torch.where 合并                        │
+│                                                                      │
+│  路径 C: 混合模式 (部分贪心 + 部分随机)                               │
+│  ─────────────────────────────────────────────────                   │
+│  logits → float32 → apply_logits_processors                         │
+│        → argmax(贪心) → temperature → argmax_invariant处理器         │
+│        → Top-K/Top-P → softmax → Gumbel-Max(随机)                   │
+│        → torch.where(温度判断合并) → 返回                             │
+│  特点: 同时执行贪心和随机，按 temperature 选择结果                     │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
