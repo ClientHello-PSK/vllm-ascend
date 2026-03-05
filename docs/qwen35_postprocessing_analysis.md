@@ -628,6 +628,268 @@ class LogprobsTensors(NamedTuple):
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
+### 3.4 AscendSampler.forward() 全流程算子分析（Triton改造参考）
+
+> **目标**: 对 `AscendSampler.forward()` 中每一步操作进行 **API/算子级拆解**、**运行位置标注**（CPU / NPU-Vector / NPU-Cube / AI-CPU）、**数据流形状追踪**，为 Triton 算子融合改造提供依据。
+
+#### 3.4.1 算子全景总表
+
+| 序号 | 步骤 | PyTorch API / 算子 | 底层算子(NPU) | 运行位置 | 输入形状 | 输出形状 | 是否可Triton化 | 备注 |
+|------|------|-------------------|--------------|---------|---------|---------|--------------|------|
+| 1 | log_softmax | `logits.log_softmax(dim=-1, dtype=fp32)` | LogSoftmaxV2 | NPU-Vector | `[B, V]` fp16/bf16 | `[B, V]` fp32 | ✅ | 可与cast融合 |
+| 2 | dtype cast | `logits.to(torch.float32)` | Cast | NPU-Vector | `[B, V]` fp16/bf16 | `[B, V]` fp32 | ✅ | 可融合到前后算子 |
+| 3a | masked_fill_ | `logits.masked_fill_(mask, -inf)` | MaskedFill | NPU-Vector | `[B, V]` fp32 + mask `[B, V]` bool | `[B, V]` fp32 | ✅ | allowed_token_ids白名单 |
+| 3b | bad_words | `logits[i][token_id] = -inf` | 逐元素索引赋值 | **CPU→NPU** | 逐请求处理 | 同输入 | ⚠️ | CPU循环+NPU索引写,瓶颈点 |
+| 3c | logit_bias | `logits += bias` | Add | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | non_argmax_invariant处理器 |
+| 3d-i | scatter_add_ | `bin_counts.scatter_add_(1, tokens, ones)` | ScatterAdd | NPU-Vector | `[B, V+1]` + `[B, seq_len]` | `[B, V+1]` | ✅ | 统计token出现频次 |
+| 3d-ii | repetition_penalty | `logits *= where(logits>0, 1/pen, pen)` | Where+Mul | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | apply_repetition_penalties |
+| 3d-iii | frequency_penalty | `logits -= freq_pen * bin_counts` | Mul+Sub | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 可与repetition融合 |
+| 3d-iv | presence_penalty | `logits -= pres_pen * output_mask` | Mul+Sub | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 可与上两项融合 |
+| 4a | argmax | `logits.argmax(dim=-1)` | ArgMaxWithValue | NPU-Vector | `[B, V]` fp32 | `[B]` int64 | ✅ | 贪心采样 |
+| 4b | temperature div | `logits.div_(temp.unsqueeze(1))` | Div(broadcast) | NPU-Vector | `[B, V]` fp32 / `[B,1]` fp32 | `[B, V]` fp32 | ✅ | 可融合到softmax |
+| 4c | min_p | 自定义处理器 | Where+Mul+Mask | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | argmax_invariant处理器 |
+| 4d-i | top_k_top_p | `npu_apply_top_k_top_p(logits, k, p)` | **AscendC自定义算子** | NPU-Vector | `[B, V]` fp32 + `[B]` k,p | `[B, V]` fp32 | ⚠️ | A2/A3专用;其他走PyTorch sort |
+| 4d-i' | top_k_top_p(fallback) | `sort→gather→mask→scatter_` | Sort+Gather+MaskedFill+Scatter | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | PyTorch fallback路径,可Triton替代 |
+| 4d-ii | softmax | `logits.softmax(dim=-1, dtype=fp32)` | SoftmaxV2 | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 计算概率分布 |
+| 4d-iii | exponential_ | `q.exponential_()` | Exponential | **AI-CPU** | `[B, V]` fp32 | `[B, V]` fp32 | ⚠️ | 随机数生成,AI-CPU执行 |
+| 4d-iv | div+argmax | `probs.div_(q).argmax(dim=-1)` | Div+ArgMaxWithValue | NPU-Vector | `[B, V]` fp32 | `[B]` int64 | ✅ | Gumbel-Max采样核心 |
+| 4e | where | `torch.where(temp<EPS, greedy, random)` | Where | NPU-Vector | `[B]` bool + `[B]` int64 ×2 | `[B]` int64 | ✅ | 合并贪心/随机结果 |
+| 5 | dtype cast | `sampled.long()` → `.to(int32)` | Cast ×2 | NPU-Vector | `[B]` → int64 → int32 | `[B]` int32 | ✅ | 类型转换 |
+| 6a | topk | `torch.topk(logprobs, num_logprobs)` | TopKV2 | NPU-Vector | `[B, V]` fp32 | `[B, K]` fp32 + `[B, K]` int64 | ✅ | logprobs收集 |
+| 6b | gather | `logprobs.gather(-1, token_ids)` | GatherV2 | NPU-Vector | `[B, V]` fp32 + `[B, 1]` int64 | `[B, 1]` fp32 | ✅ | 采样token logprob |
+| 6c | count_greater | `(x >= values).sum(-1)` | GreaterEqual+ReduceSum | NPU-Vector | `[B, V]` fp32 + `[B, 1]` fp32 | `[B]` int64 | ✅ | torch.compile生成 |
+| 6d | cat | `torch.cat([token_ids, topk_indices])` | ConcatD | NPU-Vector | `[B,1]` + `[B,K]` | `[B, K+1]` | ✅ | 拼接结果 |
+| 7 | unsqueeze | `sampled.unsqueeze(-1)` | Reshape(view) | NPU-Vector | `[B]` int32 | `[B, 1]` int32 | - | 仅形状变换,零开销 |
+
+> **图例**: B=batch_size(num_reqs), V=vocab_size(152064 for Qwen), K=num_logprobs
+
+#### 3.4.2 数据流详细追踪
+
+```
+输入: logits [B, V] fp16/bf16  (来自 compute_logits, 即 lm_head 线性层输出)
+ │
+ ├─[可选] log_softmax ──→ raw_logprobs [B, V] fp32  (保存副本, 后续Step6使用)
+ │   算子: LogSoftmaxV2          位置: NPU-Vector
+ │   数据流: logits[B,V] fp16 → raw_logprobs[B,V] fp32 (含类型提升)
+ │
+ ├─ Cast fp32 ──→ logits [B, V] fp32
+ │   算子: Cast                  位置: NPU-Vector
+ │   注: 若上一步已执行log_softmax(dtype=fp32), 此处仍需对原始logits做cast
+ │
+ ├─ masked_fill_(allowed_mask, -inf) ──→ logits [B, V] fp32  (原地)
+ │   算子: MaskedFill             位置: NPU-Vector
+ │   数据流: logits[B,V] ⊕ mask[B,V] bool → logits[B,V] (in-place)
+ │
+ ├─ apply_bad_words ──→ logits [B, V] fp32  (原地, 逐请求CPU循环)
+ │   算子: Python循环 + 索引赋值  位置: CPU(循环) + NPU(索引写)
+ │   数据流: 逐行 logits[i][token_id] = -inf
+ │   ⚠️ 性能瓶颈: CPU-NPU交互, 无法批量化
+ │
+ ├─ non_argmax_invariant处理器 ──→ logits [B, V] fp32
+ │   算子: 取决于具体处理器(Add/Where等)  位置: NPU-Vector
+ │
+ ├─ apply_penalties ──→ logits [B, V] fp32  (原地)
+ │   │
+ │   ├─ _convert_to_tensors: list[list[int]] → output_tokens_t [B, max_seq] int64
+ │   │   算子: make_tensor_with_pad    位置: CPU(构造) → NPU(传输)
+ │   │   数据流: CPU list → CPU tensor(pin_memory) → NPU tensor
+ │   │   ⚠️ CPU-NPU数据传输(H2D), 每步都执行
+ │   │
+ │   ├─ get_token_bin_counts_and_mask:
+ │   │   算子: zeros + scatter_add_ + (>0)  位置: NPU-Vector
+ │   │   数据流: tokens[B, max_seq] → bin_counts[B, V+1] → bin_counts[B, V] + mask[B, V]
+ │   │
+ │   ├─ apply_repetition_penalties:  (torch版本, NPU走此路径)
+ │   │   算子: unsqueeze+repeat + where + where + mul_  位置: NPU-Vector
+ │   │   数据流: logits[B,V] ⊕ penalties[B] → logits[B,V] (in-place)
+ │   │
+ │   ├─ frequency: logits -= freq_pen.unsqueeze(1) * bin_counts
+ │   │   算子: Mul + Sub_             位置: NPU-Vector
+ │   │
+ │   └─ presence: logits -= pres_pen.unsqueeze(1) * output_mask
+ │       算子: Mul + Sub_             位置: NPU-Vector
+ │
+ ├─[分支] sample()
+ │   │
+ │   ├─ argmax ──→ greedy_sampled [B] int64  (若非all_random)
+ │   │   算子: ArgMaxWithValue        位置: NPU-Vector
+ │   │   数据流: logits[B,V] fp32 → indices[B] int64
+ │   │
+ │   ├─ temperature div ──→ logits [B, V] fp32  (原地)
+ │   │   算子: Where(temp<EPS→1.0) + Div_  位置: NPU-Vector
+ │   │   数据流: logits[B,V] ÷ temp[B,1] → logits[B,V]
+ │   │
+ │   ├─ argmax_invariant处理器(如min_p) ──→ logits [B, V] fp32
+ │   │   算子: 自定义                 位置: NPU-Vector
+ │   │
+ │   ├─ AscendTopKTopPSampler.forward_native():
+ │   │   │
+ │   │   ├─ apply_top_k_top_p ──→ logits [B, V] fp32  (原地, 被mask的位置=-inf)
+ │   │   │   A2/A3路径:
+ │   │   │     算子: npu_apply_top_k_top_p (AscendC自定义)  位置: NPU-Vector
+ │   │   │     数据流: logits[B,V] + k[B] + p[B] → logits[B,V] (filtered)
+ │   │   │   其他设备路径:
+ │   │   │     算子: softmax→sort→gather→masked_fill_→cumsum→scatter_  位置: NPU-Vector
+ │   │   │     数据流: logits[B,V] → probs[B,V] → sorted → filtered → scatter回原序
+ │   │   │
+ │   │   ├─ softmax ──→ probs [B, V] fp32
+ │   │   │   算子: SoftmaxV2            位置: NPU-Vector
+ │   │   │   数据流: logits[B,V] fp32 → probs[B,V] fp32
+ │   │   │
+ │   │   ├─[异步路径] enable_async_exponential=True:
+ │   │   │   │ event.synchronize()  ← 等待预计算的q就绪
+ │   │   │   │ 算子: EventSynchronize   位置: Host(CPU)同步
+ │   │   │   │
+ │   │   │   └─ probs.div_(q).argmax(dim=-1).view(-1)
+ │   │   │       算子: Div_ + ArgMaxWithValue  位置: NPU-Vector
+ │   │   │       数据流: probs[B,V] ÷ q[B,V] → ratios[B,V] → indices[B] int64
+ │   │   │
+ │   │   └─[同步路径] enable_async_exponential=False:
+ │   │       │ random_sample(probs, generators):
+ │   │       │
+ │   │       ├─ npu_stream_switch(global_stream())  位置: Host(CPU)
+ │   │       ├─ empty_like ──→ q [B, V] fp32
+ │   │       │   算子: Empty              位置: NPU(内存分配)
+ │   │       ├─ q.exponential_()
+ │   │       │   算子: Exponential         位置: **AI-CPU**
+ │   │       │   ⚠️ AI-CPU执行,速度较慢,是Triton改造重点
+ │   │       ├─ [可选] q[i].exponential_(generator=gen)
+ │   │       │   算子: Exponential(per-row) 位置: **AI-CPU**
+ │   │       ├─ wait_stream同步            位置: Host(CPU)
+ │   │       └─ probs.div_(q).argmax(dim=-1).view(-1)
+ │   │           算子: Div_ + ArgMaxWithValue  位置: NPU-Vector
+ │   │
+ │   └─ torch.where(temp<EPS, greedy, random) ──→ sampled [B] int64
+ │       算子: Where                  位置: NPU-Vector
+ │
+ ├─ Cast int64→int32 ──→ sampled [B] int32
+ │   算子: Cast                      位置: NPU-Vector
+ │
+ ├─[可选] gather_logprobs:
+ │   ├─ topk(raw_logprobs, K) ──→ topk_logprobs [B, K] fp32, topk_indices [B, K] int64
+ │   │   算子: TopKV2                 位置: NPU-Vector
+ │   │   数据流: raw_logprobs[B,V] → topk_values[B,K] + topk_indices[B,K]
+ │   │
+ │   ├─ gather(logprobs, token_ids) ──→ token_logprobs [B, 1] fp32
+ │   │   算子: GatherV2               位置: NPU-Vector
+ │   │
+ │   ├─ batched_count_greater_than ──→ token_ranks [B] int64
+ │   │   算子: GreaterEqual + ReduceSum  位置: NPU-Vector (torch.compile)
+ │   │   数据流: logprobs[B,V] ≥ token_logprobs[B,1] → bool[B,V] → sum → [B]
+ │   │
+ │   ├─ cat([token_ids, topk_indices]) ──→ indices [B, K+1] int64→int32
+ │   │   算子: ConcatD + Cast         位置: NPU-Vector
+ │   │
+ │   └─ cat([token_logprobs, topk_logprobs]) ──→ logprobs [B, K+1] fp32
+ │       算子: ConcatD                位置: NPU-Vector
+ │
+ └─ unsqueeze(-1) ──→ sampled_token_ids [B, 1] int32
+     算子: Reshape(view)             位置: NPU-Vector (零开销)
+```
+
+#### 3.4.3 运行位置分布统计
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    算子运行位置分布                                    │
+├─────────────┬───────────────────────────────────────────────────────┤
+│  NPU-Vector │ ████████████████████████████████████████  ~85%        │
+│             │ log_softmax, cast, masked_fill, softmax,             │
+│             │ argmax, div, where, topk, gather, scatter,           │
+│             │ sort, cumsum, cat, reduce_sum, mul, sub              │
+├─────────────┼───────────────────────────────────────────────────────┤
+│  AI-CPU     │ ██████  ~8%                                          │
+│             │ exponential_(随机数生成)                               │
+│             │ ⚠️ 单算子但vocab_size大(152064)时耗时显著              │
+├─────────────┼───────────────────────────────────────────────────────┤
+│  Host CPU   │ ████  ~5%                                            │
+│             │ apply_bad_words(Python循环), _convert_to_tensors      │
+│             │ (list→tensor), 流切换/同步控制                         │
+├─────────────┼───────────────────────────────────────────────────────┤
+│  NPU-Cube   │ ▏ ~0%                                                │
+│             │ 采样阶段无矩阵乘算子, Cube单元空闲                     │
+├─────────────┼───────────────────────────────────────────────────────┤
+│  H2D传输    │ ██  ~2%                                              │
+│             │ output_tokens CPU→NPU (apply_penalties每步传输)        │
+└─────────────┴───────────────────────────────────────────────────────┘
+```
+
+#### 3.4.4 Triton 改造机会分析
+
+**融合机会 1: logits预处理融合**（优先级：★★★★★）
+
+```
+当前: Cast(fp16→fp32) → masked_fill_ → logit_bias(Add) → penalties(scatter+where+mul+sub×2)
+目标: 单个 Triton kernel 完成全部 logits 预处理
+收益: 减少 5~8 次 kernel launch + 消除中间张量 [B,V] 多次读写
+输入: logits[B,V] fp16, mask[B,V], bias, penalties参数
+输出: logits[B,V] fp32 (processed)
+位置: NPU-Vector → Triton(Vector)
+```
+
+**融合机会 2: temperature + top_k_top_p + softmax + sampling 融合**（优先级：★★★★★）
+
+```
+当前: div_(temp) → [min_p] → sort/mask(top_k_top_p) → softmax → exponential_ → div_ → argmax
+目标: 单个 Triton kernel: temp_scale → top_k_top_p_filter → softmax → gumbel_argmax
+收益: 这是采样热路径, 融合后消除 sort 的 O(V·logV) 中间结果写回
+      exponential 从 AI-CPU 迁移到 Triton(Vector), 消除 AI-CPU 调度开销
+输入: logits[B,V] fp32, temp[B], k[B], p[B]
+输出: sampled[B] int64
+位置: NPU-Vector + AI-CPU → Triton(Vector)
+关键难点: top_k_top_p 涉及排序, Triton 中需用近似排序或分桶策略
+```
+
+**融合机会 3: logprobs 收集融合**（优先级：★★★☆☆）
+
+```
+当前: topk → gather → count_greater_than → cat ×2 → cast
+目标: 单个 Triton kernel 同时完成 topk + gather + rank计算 + 拼接
+收益: 减少 5 次 kernel launch, topk 和 count_greater 都需全量扫描 logprobs[B,V]
+      融合后只需一次扫描
+输入: raw_logprobs[B,V] fp32, sampled[B] int64, K
+输出: indices[B,K+1] int32, logprobs[B,K+1] fp32, ranks[B] int64
+位置: NPU-Vector → Triton(Vector)
+```
+
+**融合机会 4: log_softmax 与 Cast 融合**（优先级：★★☆☆☆）
+
+```
+当前: logits.log_softmax(dim=-1, dtype=fp32) 单独执行 + logits.to(fp32) 单独执行
+目标: 一次读取 logits fp16, 同时输出 raw_logprobs fp32 和 logits fp32
+收益: 减少一次 [B,V] 的全量读取
+位置: NPU-Vector → Triton(Vector)
+```
+
+#### 3.4.5 关键性能瓶颈标注
+
+| 瓶颈点 | 原因 | 影响程度 | Triton改造方案 |
+|--------|------|---------|---------------|
+| `exponential_()` 在 AI-CPU 执行 | AI-CPU 调度开销大, 无法利用 Vector 单元 | ★★★★★ | Triton 内使用 `tl.rand` + 变换生成指数分布 |
+| `apply_bad_words` CPU循环 | Python for循环逐请求处理, CPU-NPU交互 | ★★★★☆ | 构造batch mask后一次masked_fill_, 或Triton kernel |
+| `_convert_to_tensors` H2D传输 | 每步将output_token_ids从CPU传到NPU | ★★★★☆ | 在NPU侧维护token_ids缓存,避免重复传输 |
+| `sort` in top_k_top_p (非A2/A3) | 全词表排序 O(V·logV), V=152064 | ★★★★☆ | Triton partial sort / 分桶 top-k |
+| 多次 kernel launch | 单步多算子串行执行, launch开销累积 | ★★★☆☆ | Triton算子融合减少launch次数 |
+| `scatter_add_` in penalties | 构造bin_counts需scatter操作 | ★★☆☆☆ | 与penalties计算融合到同一Triton kernel |
+
+#### 3.4.6 Triton改造优先级路线图
+
+```
+Phase 1 (高收益,低难度):
+  ├── exponential_ → tl.rand + 变换 (消除AI-CPU依赖)
+  ├── cast + log_softmax 融合
+  └── logprobs收集融合 (topk+gather+rank)
+
+Phase 2 (高收益,中难度):
+  ├── penalties全融合 (scatter_add + repetition + frequency + presence)
+  ├── temperature + softmax + gumbel_argmax 融合
+  └── bad_words batch化改造
+
+Phase 3 (最高收益,高难度):
+  ├── temperature + top_k_top_p + softmax + sampling 端到端融合
+  └── 全流程单kernel: logits_preprocess + sample + logprobs_gather
+```
+
 ---
 
 ## 4. 功能流程
