@@ -671,8 +671,19 @@ class LogprobsTensors(NamedTuple):
 >
 > **特殊分支说明**:
 > - `all_greedy=True`: 走快速路径, 在4a后直接返回, 跳过4b-4e
+> - `all_random=True`: 完全跳过贪心采样(4a), 直接走随机采样流程
 > - `num_logprobs=None`: 跳过6a-6g所有logprobs收集步骤
 > - `num_logprobs=-1`: 返回完整logprobs, 不做topk/gather/rank计算
+>
+> **返回结构**:
+> ```
+> SamplerOutput:
+>   ├─ sampled_token_ids: [B, 1] int32         # 采样的token ID
+>   └─ logprobs_tensors: LogprobsTensors | None
+>         ├─ indices: [B, K+1] int32            # token索引 (采样token + topk)
+>         ├─ logprobs: [B, K+1] fp32            # logprob值
+>         └─ token_ranks: [B] int64             # 每个采样token的排名
+> ```
 
 #### 3.4.2 数据流详细追踪
 
