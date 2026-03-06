@@ -644,17 +644,18 @@ class LogprobsTensors(NamedTuple):
 | 3a | masked_fill_ | `logits.masked_fill_(mask, -inf)` | MaskedFill | NPU-Vector | `[B, V]` fp32 + mask `[B, V]` bool | `[B, V]` fp32 | ✅ | allowed_token_ids白名单 |
 | 3b | bad_words | `logits[i][token_id] = -inf` | 逐元素索引赋值 | **CPU→NPU** | 逐请求处理 | 同输入 | ⚠️ | CPU循环+NPU索引写,瓶颈点 |
 | 3c | logit_bias | `logits += bias` | Add | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | non_argmax_invariant处理器 |
+| 3d-H2D | _convert_to_tensors | `make_tensor_with_pad(output_token_ids) + .to(device)` | PadAndStack(CPU)+H2DTransfer | **CPU→NPU** | `list[list[int]]` | `[B, max_seq]` int64 | ⚠️ | CPU构造pin_memory张量→NPU传输(non_blocking); 每步执行,3.4.5性能瓶颈之一 |
 | 3d-0 | masked_fill_ (-1替换) | `output_tokens_t.masked_fill_(output_tokens_t == -1, vocab_size)` | Compare+MaskedFill | NPU-Vector | `[B, max_seq]` int64 | `[B, max_seq]` int64 | ✅ | 替换异步调度的-1占位符为vocab_size |
-| 3d-i | get_token_bin_counts (prompt) | `zeros + scatter_add_ + (>0)` | Zeros+ScatterAdd+GT | NPU-Vector | `[B, V+1]` + `[B, seq_len]` | `[B, V]` mask bool | ✅ | 统计prompt token频次,生成prompt_mask |
-| 3d-i' | get_token_bin_counts (output) | `zeros + scatter_add_ + (>0)` | Zeros+OnesLike+ScatterAdd+GT | NPU-Vector | `[B, V+1]` + `[B, seq_len]` | `[B, V]` counts + mask bool | ✅ | 统计output token频次,生成output_bin_counts和output_mask |
-| 3d-ii | repetition_penalty | `unsqueeze+repeat+where(mask)+where(logits>0)+mul_` | Unsqueeze+Repeat+Or+Where+Where+Mul_ | NPU-Vector | `[B, V]` fp32 + `[B]` penalties | `[B, V]` fp32 | ✅ | apply_repetition_penalties_torch |
-| 3d-iii | frequency_penalty | `logits -= freq_pen * bin_counts` | Mul+Sub | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 可与repetition融合 |
-| 3d-iv | presence_penalty | `logits -= pres_pen * output_mask` | Mul+Sub | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 可与上两项融合 |
+| 3d-i | get_token_bin_counts (prompt) | `zeros + ones_like + scatter_add_ + slice + (>0)` | Zeros+OnesLike+ScatterAdd+Slice+GT | NPU-Vector | `[B, V+1]` + `[B, seq_len]` | `[B, V]` mask bool | ✅ | 统计prompt token频次,生成prompt_mask; slice为`[:,:vocab_size]`截断 |
+| 3d-i' | get_token_bin_counts (output) | `zeros + ones_like + scatter_add_ + slice + (>0)` | Zeros+OnesLike+ScatterAdd+Slice+GT | NPU-Vector | `[B, V+1]` + `[B, seq_len]` | `[B, V]` counts + mask bool | ✅ | 统计output token频次,生成output_bin_counts和output_mask; slice为`[:,:vocab_size]`截断 |
+| 3d-ii | repetition_penalty | `unsqueeze+repeat+where(mask)+where(logits>0,1/pen,pen)+mul_` | Unsqueeze+Repeat+Or+Where+Reciprocal+Where+Mul_ | NPU-Vector | `[B, V]` fp32 + `[B]` penalties | `[B, V]` fp32 | ✅ | apply_repetition_penalties_torch; `1.0/penalties`产生Reciprocal |
+| 3d-iii | frequency_penalty | `logits -= freq_pen.unsqueeze(1) * bin_counts` | Unsqueeze+Mul+Sub_ | NPU-Vector | `[B, V]` fp32 + `[B]` penalties | `[B, V]` fp32 | ✅ | 可与repetition融合; unsqueeze将`[B]→[B,1]`广播 |
+| 3d-iv | presence_penalty | `logits -= pres_pen.unsqueeze(1) * output_mask` | Unsqueeze+Mul+Sub_ | NPU-Vector | `[B, V]` fp32 + `[B]` penalties | `[B, V]` fp32 | ✅ | 可与上两项融合; unsqueeze将`[B]→[B,1]`广播 |
 | 4a | argmax (贪心) | `logits.argmax(dim=-1)` | ArgMaxWithValue | NPU-Vector | `[B, V]` fp32 | `[B]` int64 | ✅ | 贪心采样, all_greedy时直接返回 |
-| 4b | temperature div | `logits.div_(temp.unsqueeze(1))` | Div(broadcast) | NPU-Vector | `[B, V]` fp32 / `[B,1]` fp32 | `[B, V]` fp32 | ✅ | 可融合到softmax |
+| 4b | temperature div | `where(temp<EPS,1.0,temp) + logits.div_(temp.unsqueeze(1))` | Compare(LT)+Where+Unsqueeze+Div_ | NPU-Vector | `[B, V]` fp32 / `[B]` fp32 | `[B, V]` fp32 | ✅ | all_random=False时先Compare+Where避免除零,再Unsqueeze+Div_; 可融合到softmax |
 | 4c | min_p | 自定义处理器 | Where+Mul+Mask | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | argmax_invariant处理器 |
 | 4d-i | top_k_top_p | `npu_apply_top_k_top_p(logits, k, p)` | **AscendC自定义算子** | NPU-Vector | `[B, V]` fp32 + `[B]` k,p | `[B, V]` fp32 | ⚠️ | A2/A3专用;其他走PyTorch sort |
-| 4d-i' | top_k_top_p(fallback) | `softmax→sort→gather→compare→masked_fill_(+cumsum for top_p)` | Softmax+Sort+Gather+Compare+MaskedFill(+Cumsum) | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | PyTorch fallback路径(无scatter_),含no_top_k_mask额外处理 |
+| 4d-i' | top_k_top_p(fallback) | `softmax→sort→sub+cast+unsqueeze+gather→compare(EQ)+unsqueeze+masked_fill_→compare(LT)+masked_fill_(+cumsum+sum+unsqueeze+gather for top_p)` | Softmax+Sort+Sub+Cast+Unsqueeze+Gather+Compare(EQ)+Unsqueeze+MaskedFill_+Compare(LT)+MaskedFill_(+Cumsum+Unsqueeze+ReduceSum+Unsqueeze+Gather+Compare(LT)+MaskedFill_) | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | PyTorch fallback路径; top_k含Sub+Cast(int64)+no_top_k_mask处理; top_p含Cumsum+ReduceSum |
 | 4d-ii | logits_to_return (processed模式) | 条件分支,见备注 | - | - | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | processed_logits直接赋值;processed_logprobs需额外log_softmax |
 | 4d-iii | softmax | `logits.softmax(dim=-1, dtype=fp32)` | SoftmaxV2 | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 计算概率分布 |
 | 4d-iv | exponential_ | `q.exponential_()` | Exponential | **AI-CPU** | `[B, V]` fp32 | `[B, V]` fp32 | ⚠️ | 随机数生成,AI-CPU执行 |
@@ -665,7 +666,7 @@ class LogprobsTensors(NamedTuple):
 | 6a | unsqueeze | `token_ids.unsqueeze(-1)` | Reshape(view) | NPU-Vector | `[B]` int64 | `[B, 1]` int64 | - | 为gather准备形状 |
 | 6b | topk | `torch.topk(logprobs, num_logprobs)` | TopKV2 | NPU-Vector | `[B, V]` fp32 | `[B, K]` fp32 + `[B, K]` int64 | ✅ | logprobs收集 |
 | 6c | gather | `logprobs.gather(-1, token_ids)` | GatherV2 | NPU-Vector | `[B, V]` fp32 + `[B, 1]` int64 | `[B, 1]` fp32 | ✅ | 采样token logprob |
-| 6d | count_greater | `(x >= values).sum(-1)` | GreaterEqual+ReduceSum | NPU-Vector | `[B, V]` fp32 + `[B, 1]` fp32 | `[B]` int64 | ✅ | torch.compile生成 |
+| 6d | count_greater | `(x >= values).sum(-1)` | GreaterEqual+ReduceSum | NPU-Vector | `[B, V]` fp32 + `[B, 1]` fp32 | `[B]` int64 | ✅ | `@torch.compile(backend=simple_compile_backend)`生成; NPU上backend可能非默认inductor |
 | 6e | cat(indices) | `torch.cat([token_ids, topk_indices])` | ConcatD | NPU-Vector | `[B,1]` + `[B,K]` | `[B, K+1]` int64 | ✅ | 拼接token索引 |
 | 6f | cast(indices) | `indices.to(torch.int32)` | Cast | NPU-Vector | `[B, K+1]` int64 | `[B, K+1]` int32 | ✅ | 独立步骤,减少张量大小 |
 | 6g | cat(logprobs) | `torch.cat([token_logprobs, topk_logprobs])` | ConcatD | NPU-Vector | `[B,1]` + `[B,K]` | `[B, K+1]` fp32 | ✅ | 拼接logprob值 |
@@ -747,28 +748,31 @@ class LogprobsTensors(NamedTuple):
  │       │   注: 异步调度场景下output_tokens中可能有-1占位符,需先替换
  │       │
  │       ├─ get_token_bin_counts_and_mask (prompt):  ← 第1次调用
- │       │   算子: zeros + scatter_add_ + (>0)  位置: NPU-Vector
- │       │   数据流: prompt_tokens[B, seq_len] → zeros[B, V+1] → scatter_add_ → (>0) → prompt_mask[B, V] bool
- │       │   注: 仅返回mask,不需要bin_counts
+ │       │   算子: Zeros+OnesLike+ScatterAdd+Slice+GT  位置: NPU-Vector
+ │       │   数据流: prompt_tokens[B, seq_len] → zeros[B, V+1] → scatter_add_(ones_like(tokens)) → slice[:,:V] → [B,V] → (>0) → prompt_mask[B, V] bool
+ │       │   注: ones_like生成与tokens同形状的全1张量; slice从[B,V+1]截断为[B,V]; 仅返回mask
  │       │
  │       ├─ get_token_bin_counts_and_mask (output):  ← 第2次独立调用
- │       │   算子: zeros + ones_like + scatter_add_ + (>0)  位置: NPU-Vector
- │       │   数据流: output_tokens[B, max_seq] → zeros[B, V+1] → scatter_add_(ones_like) → output_bin_counts[B, V] + output_mask[B, V] bool
- │       │   注: 同时返回bin_counts(用于frequency_penalty)和mask(用于presence_penalty)
+ │       │   算子: Zeros+OnesLike+ScatterAdd+Slice+GT  位置: NPU-Vector
+ │       │   数据流: output_tokens[B, max_seq] → zeros[B, V+1] → scatter_add_(ones_like(tokens)) → slice[:,:V] → [B,V] → output_bin_counts[B, V] + (>0) → output_mask[B, V] bool
+ │       │   注: 与prompt调用相同函数; 同时返回bin_counts(用于frequency_penalty)和mask(用于presence_penalty)
  │       │
  │       ├─ apply_repetition_penalties:  (torch版本, NPU走此路径)
- │       │   算子: Unsqueeze+Repeat+Or+Where+Where+Mul_  位置: NPU-Vector
+ │       │   算子: Unsqueeze+Repeat+Or+Where+Reciprocal+Where+Mul_  位置: NPU-Vector
  │       │   数据流: penalties[B] → unsqueeze+repeat → [B,V]
  │       │           prompt_mask | output_mask → combined_mask[B,V]
  │       │           where(combined_mask, penalties, 1.0) → applied_penalties[B,V]
- │       │           where(logits>0, 1/applied_penalties, applied_penalties) → scaling[B,V]
+ │       │           1.0/applied_penalties → reciprocal[B,V] (Reciprocal算子)
+ │       │           where(logits>0, reciprocal, applied_penalties) → scaling[B,V]
  │       │           logits *= scaling (in-place)
  │       │
  │       ├─ frequency: logits -= freq_pen.unsqueeze(1) * bin_counts
- │       │   算子: Mul + Sub_             位置: NPU-Vector
+ │       │   算子: Unsqueeze + Mul + Sub_  位置: NPU-Vector
+ │       │   数据流: freq_pen[B] → unsqueeze → [B,1] → broadcast mul → sub_
  │       │
  │       └─ presence: logits -= pres_pen.unsqueeze(1) * output_mask
- │           算子: Mul + Sub_             位置: NPU-Vector
+ │           算子: Unsqueeze + Mul + Sub_  位置: NPU-Vector
+ │           数据流: pres_pen[B] → unsqueeze → [B,1] → broadcast mul → sub_
  │
  ├─[分支] sample() ──→ (sampled, processed_logprobs)
  │   │
@@ -805,9 +809,10 @@ class LogprobsTensors(NamedTuple):
  │       │   └─ 继续执行后续温度缩放和随机采样流程
  │       │
  │       ├─ apply_temperature ──→ logits [B, V] fp32  (原地)
- │       │   算子: Where(temp<EPS→1.0) + Div_  位置: NPU-Vector
- │       │   数据流: logits[B,V] ÷ temp[B,1] → logits[B,V]
- │       │   注: 若all_random=False, temp<EPS的行会被替换为1.0避免除零
+ │       │   算子: Compare(LT) + Where + Unsqueeze + Div_  位置: NPU-Vector
+ │       │   数据流: temp[B] → Compare(temp<EPS) → Where(mask,1.0,temp) → temp[B]
+ │       │           → Unsqueeze → temp[B,1] → logits[B,V] ÷ temp[B,1] → logits[B,V]
+ │       │   注: 若all_random=True则跳过Compare+Where; Unsqueeze将[B]→[B,1]用于广播除法
  │       │
  │       ├─ argmax_invariant处理器(如min_p) ──→ logits [B, V] fp32
  │       │   条件: sampling_metadata.logitsprocs.argmax_invariant非空
@@ -820,11 +825,26 @@ class LogprobsTensors(NamedTuple):
  │       │   │     算子: npu_apply_top_k_top_p (AscendC自定义)  位置: NPU-Vector
  │       │   │     数据流: logits[B,V] + k[B] + p[B] → logits[B,V] (filtered)
  │       │   │   其他设备路径 (PyTorch fallback):
- │       │   │     算子: softmax→sort→gather→compare→masked_fill_(+cumsum for top_p)  位置: NPU-Vector
+ │       │   │     算子: Softmax+Sort+Sub+Cast(int64)+Unsqueeze+Gather+Compare(EQ)+Unsqueeze+MaskedFill_
+ │       │   │           +Compare(LT)+MaskedFill_(+Cumsum+Unsqueeze+ReduceSum+Unsqueeze+Gather+Compare(LT)+MaskedFill_)
+ │       │   │     位置: NPU-Vector
  │       │   │     数据流: logits[B,V] → probs=softmax(logits) → probs_sort=sort(probs, descending=False)
- │       │   │             → top_k: gather cutoff → compare(probs < cutoff) → masked_fill_(logits, -inf)
- │       │   │             → top_p: cumsum(probs_sort) → gather cutoff → compare → masked_fill_(logits, -inf)
- │       │   │     注: 直接修改原始logits,无scatter_操作;含no_top_k_mask处理(k==vocab_size时no-op)
+ │       │   │       top_k路径:
+ │       │   │         → top_k_count = probs_sort.size(1) - k.to(int64)  (Sub+Cast)
+ │       │   │         → top_k_count.unsqueeze(1) (Unsqueeze)
+ │       │   │         → probs_sort.gather(-1, top_k_count) → top_k_cutoff (Gather)
+ │       │   │         → no_top_k_mask = (k==V).unsqueeze(1) (Compare(EQ)+Unsqueeze)
+ │       │   │         → top_k_cutoff.masked_fill_(no_top_k_mask, -inf) (MaskedFill_)
+ │       │   │         → elements_to_discard = probs < top_k_cutoff (Compare(LT))
+ │       │   │         → logits.masked_fill_(elements_to_discard, -inf) (MaskedFill_)
+ │       │   │       top_p路径:
+ │       │   │         → cumprob = cumsum(probs_sort) (Cumsum)
+ │       │   │         → top_p_mask = cumprob <= 1-p.unsqueeze(1) (Unsqueeze+Compare)
+ │       │   │         → top_p_count = top_p_mask.sum(-1).unsqueeze(1) (ReduceSum+Unsqueeze)
+ │       │   │         → top_p_cutoff = probs_sort.gather(-1, top_p_count) (Gather)
+ │       │   │         → elements_to_discard = probs < top_p_cutoff (Compare(LT))
+ │       │   │         → logits.masked_fill_(elements_to_discard, -inf) (MaskedFill_)
+ │       │   │     注: 直接修改原始logits,无scatter_操作
  │       │   │
  │       │   ├─ logits_to_return 处理 (processed模式):
  │       │   │   ├─ if logprobs_mode == "processed_logits":
