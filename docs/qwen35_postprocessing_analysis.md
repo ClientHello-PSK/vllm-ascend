@@ -47,6 +47,7 @@ class SamplingMetadata:
     top_k: torch.Tensor | None            # top-k参数 [batch_size]
     generators: dict[int, torch.Generator] # 随机数生成器
     max_num_logprobs: int | None          # 最大logprobs数量
+    prompt_token_ids: torch.Tensor | None # 提示词token IDs (penalties计算使用)
     no_penalties: bool                    # 是否不需要惩罚
     frequency_penalties: torch.Tensor     # 频率惩罚
     presence_penalties: torch.Tensor      # 存在惩罚
@@ -596,6 +597,7 @@ class LogprobsTensors(NamedTuple):
     logprob_token_ids: torch.Tensor       # [num_reqs, num_logprobs+1] int32
     logprobs: torch.Tensor                # [num_reqs, num_logprobs+1] float32
     selected_token_ranks: torch.Tensor    # [num_reqs] int64
+    cu_num_generated_tokens: list[int] | None = None  # [num_reqs] 累积生成token数
 ```
 
 #### 3.3.9 执行路径总结
@@ -642,15 +644,17 @@ class LogprobsTensors(NamedTuple):
 | 3a | masked_fill_ | `logits.masked_fill_(mask, -inf)` | MaskedFill | NPU-Vector | `[B, V]` fp32 + mask `[B, V]` bool | `[B, V]` fp32 | ✅ | allowed_token_ids白名单 |
 | 3b | bad_words | `logits[i][token_id] = -inf` | 逐元素索引赋值 | **CPU→NPU** | 逐请求处理 | 同输入 | ⚠️ | CPU循环+NPU索引写,瓶颈点 |
 | 3c | logit_bias | `logits += bias` | Add | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | non_argmax_invariant处理器 |
-| 3d-i | scatter_add_ | `bin_counts.scatter_add_(1, tokens, ones)` | ScatterAdd | NPU-Vector | `[B, V+1]` + `[B, seq_len]` | `[B, V+1]` | ✅ | 统计token出现频次 |
-| 3d-ii | repetition_penalty | `logits *= where(logits>0, 1/pen, pen)` | Where+Mul | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | apply_repetition_penalties |
+| 3d-0 | masked_fill_ (-1替换) | `output_tokens_t.masked_fill_(output_tokens_t == -1, vocab_size)` | Compare+MaskedFill | NPU-Vector | `[B, max_seq]` int64 | `[B, max_seq]` int64 | ✅ | 替换异步调度的-1占位符为vocab_size |
+| 3d-i | get_token_bin_counts (prompt) | `zeros + scatter_add_ + (>0)` | Zeros+ScatterAdd+GT | NPU-Vector | `[B, V+1]` + `[B, seq_len]` | `[B, V]` mask bool | ✅ | 统计prompt token频次,生成prompt_mask |
+| 3d-i' | get_token_bin_counts (output) | `zeros + scatter_add_ + (>0)` | Zeros+OnesLike+ScatterAdd+GT | NPU-Vector | `[B, V+1]` + `[B, seq_len]` | `[B, V]` counts + mask bool | ✅ | 统计output token频次,生成output_bin_counts和output_mask |
+| 3d-ii | repetition_penalty | `unsqueeze+repeat+where(mask)+where(logits>0)+mul_` | Unsqueeze+Repeat+Or+Where+Where+Mul_ | NPU-Vector | `[B, V]` fp32 + `[B]` penalties | `[B, V]` fp32 | ✅ | apply_repetition_penalties_torch |
 | 3d-iii | frequency_penalty | `logits -= freq_pen * bin_counts` | Mul+Sub | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 可与repetition融合 |
 | 3d-iv | presence_penalty | `logits -= pres_pen * output_mask` | Mul+Sub | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 可与上两项融合 |
 | 4a | argmax (贪心) | `logits.argmax(dim=-1)` | ArgMaxWithValue | NPU-Vector | `[B, V]` fp32 | `[B]` int64 | ✅ | 贪心采样, all_greedy时直接返回 |
 | 4b | temperature div | `logits.div_(temp.unsqueeze(1))` | Div(broadcast) | NPU-Vector | `[B, V]` fp32 / `[B,1]` fp32 | `[B, V]` fp32 | ✅ | 可融合到softmax |
 | 4c | min_p | 自定义处理器 | Where+Mul+Mask | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | argmax_invariant处理器 |
 | 4d-i | top_k_top_p | `npu_apply_top_k_top_p(logits, k, p)` | **AscendC自定义算子** | NPU-Vector | `[B, V]` fp32 + `[B]` k,p | `[B, V]` fp32 | ⚠️ | A2/A3专用;其他走PyTorch sort |
-| 4d-i' | top_k_top_p(fallback) | `sort→gather→mask→scatter_` | Sort+Gather+MaskedFill+Scatter | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | PyTorch fallback路径,可Triton替代 |
+| 4d-i' | top_k_top_p(fallback) | `softmax→sort→gather→compare→masked_fill_(+cumsum for top_p)` | Softmax+Sort+Gather+Compare+MaskedFill(+Cumsum) | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | PyTorch fallback路径(无scatter_),含no_top_k_mask额外处理 |
 | 4d-ii | logits_to_return (processed模式) | 条件分支,见备注 | - | - | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | processed_logits直接赋值;processed_logprobs需额外log_softmax |
 | 4d-iii | softmax | `logits.softmax(dim=-1, dtype=fp32)` | SoftmaxV2 | NPU-Vector | `[B, V]` fp32 | `[B, V]` fp32 | ✅ | 计算概率分布 |
 | 4d-iv | exponential_ | `q.exponential_()` | Exponential | **AI-CPU** | `[B, V]` fp32 | `[B, V]` fp32 | ⚠️ | 随机数生成,AI-CPU执行 |
@@ -682,7 +686,8 @@ class LogprobsTensors(NamedTuple):
 >   └─ logprobs_tensors: LogprobsTensors | None
 >         ├─ indices: [B, K+1] int32            # token索引 (采样token + topk)
 >         ├─ logprobs: [B, K+1] fp32            # logprob值
->         └─ token_ranks: [B] int64             # 每个采样token的排名
+>         ├─ token_ranks: [B] int64             # 每个采样token的排名
+>         └─ cu_num_generated_tokens: list[int] | None  # [num_reqs] 累积生成token数(可选)
 > ```
 
 #### 3.4.2 数据流详细追踪
@@ -736,13 +741,28 @@ class LogprobsTensors(NamedTuple):
  │       │   数据流: CPU list → CPU tensor(pin_memory) → NPU tensor
  │       │   ⚠️ CPU-NPU数据传输(H2D), 每步都执行
  │       │
- │       ├─ get_token_bin_counts_and_mask (prompt + output):
+ │       ├─ masked_fill_ (-1占位符替换):
+ │       │   算子: Compare + MaskedFill     位置: NPU-Vector
+ │       │   数据流: output_tokens_t[B, max_seq] → 将-1替换为vocab_size
+ │       │   注: 异步调度场景下output_tokens中可能有-1占位符,需先替换
+ │       │
+ │       ├─ get_token_bin_counts_and_mask (prompt):  ← 第1次调用
  │       │   算子: zeros + scatter_add_ + (>0)  位置: NPU-Vector
- │       │   数据流: tokens[B, max_seq] → bin_counts[B, V+1] → bin_counts[B, V] + mask[B, V]
+ │       │   数据流: prompt_tokens[B, seq_len] → zeros[B, V+1] → scatter_add_ → (>0) → prompt_mask[B, V] bool
+ │       │   注: 仅返回mask,不需要bin_counts
+ │       │
+ │       ├─ get_token_bin_counts_and_mask (output):  ← 第2次独立调用
+ │       │   算子: zeros + ones_like + scatter_add_ + (>0)  位置: NPU-Vector
+ │       │   数据流: output_tokens[B, max_seq] → zeros[B, V+1] → scatter_add_(ones_like) → output_bin_counts[B, V] + output_mask[B, V] bool
+ │       │   注: 同时返回bin_counts(用于frequency_penalty)和mask(用于presence_penalty)
  │       │
  │       ├─ apply_repetition_penalties:  (torch版本, NPU走此路径)
- │       │   算子: unsqueeze+repeat + where + where + mul_  位置: NPU-Vector
- │       │   数据流: logits[B,V] ⊕ penalties[B] → logits[B,V] (in-place)
+ │       │   算子: Unsqueeze+Repeat+Or+Where+Where+Mul_  位置: NPU-Vector
+ │       │   数据流: penalties[B] → unsqueeze+repeat → [B,V]
+ │       │           prompt_mask | output_mask → combined_mask[B,V]
+ │       │           where(combined_mask, penalties, 1.0) → applied_penalties[B,V]
+ │       │           where(logits>0, 1/applied_penalties, applied_penalties) → scaling[B,V]
+ │       │           logits *= scaling (in-place)
  │       │
  │       ├─ frequency: logits -= freq_pen.unsqueeze(1) * bin_counts
  │       │   算子: Mul + Sub_             位置: NPU-Vector
@@ -799,9 +819,12 @@ class LogprobsTensors(NamedTuple):
  │       │   │   A2/A3路径:
  │       │   │     算子: npu_apply_top_k_top_p (AscendC自定义)  位置: NPU-Vector
  │       │   │     数据流: logits[B,V] + k[B] + p[B] → logits[B,V] (filtered)
- │       │   │   其他设备路径:
- │       │   │     算子: softmax→sort→gather→masked_fill_→cumsum→scatter_  位置: NPU-Vector
- │       │   │     数据流: logits[B,V] → probs[B,V] → sorted → filtered → scatter回原序
+ │       │   │   其他设备路径 (PyTorch fallback):
+ │       │   │     算子: softmax→sort→gather→compare→masked_fill_(+cumsum for top_p)  位置: NPU-Vector
+ │       │   │     数据流: logits[B,V] → probs=softmax(logits) → probs_sort=sort(probs, descending=False)
+ │       │   │             → top_k: gather cutoff → compare(probs < cutoff) → masked_fill_(logits, -inf)
+ │       │   │             → top_p: cumsum(probs_sort) → gather cutoff → compare → masked_fill_(logits, -inf)
+ │       │   │     注: 直接修改原始logits,无scatter_操作;含no_top_k_mask处理(k==vocab_size时no-op)
  │       │   │
  │       │   ├─ logits_to_return 处理 (processed模式):
  │       │   │   ├─ if logprobs_mode == "processed_logits":
@@ -920,7 +943,7 @@ class LogprobsTensors(NamedTuple):
 ├─────────────┬───────────────────────────────────────────────────────┤
 │  NPU-Vector │ ████████████████████████████████████████  ~85%        │
 │             │ log_softmax, cast, masked_fill, softmax,             │
-│             │ argmax, div, where, topk, gather, scatter,           │
+│             │ argmax, div, where, topk, gather, scatter_add,       │
 │             │ sort, cumsum, cat, reduce_sum, mul, sub              │
 ├─────────────┼───────────────────────────────────────────────────────┤
 │  AI-CPU     │ ██████  ~8%                                          │
