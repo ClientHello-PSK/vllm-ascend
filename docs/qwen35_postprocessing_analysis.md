@@ -1279,33 +1279,355 @@ class SpecDecodeMetadata:
 
 **文件位置**: `vllm_ascend/worker/model_runner_v1.py:856-932`
 
-```python
-def _calc_spec_decode_metadata(self, num_draft_tokens, cu_num_scheduled_tokens, ...):
-    # 计算采样token数量
-    num_sampled_tokens = num_draft_tokens + 1
-    cu_num_sampled_tokens = np.cumsum(num_sampled_tokens, dtype=np.int32)
+> **与社区GPU版本差异**: vllm-ascend版本额外支持 `num_pcp_pads` 参数（PCP并行计算填充），当 `pcp_size > 1` 时需修正 `logits_indices` 以跳过padding位置。GPU版本（`vllm/v1/worker/gpu_model_runner.py:2209-2286`）无此逻辑，且使用 `_get_cumsum_and_arange` 辅助函数替代手动计算。
 
-    # 计算bonus logits索引（每个请求的最后一个位置）
-    bonus_logits_indices = cu_num_sampled_tokens - 1
+#### 2.3.1 整体流程概览
 
-    # 计算target logits索引
-    cu_num_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)
-    target_logits_indices = ...  # 每个draft token对应的位置
-
-    # 获取draft token IDs
-    draft_token_ids = self.input_ids.gpu[logits_indices]
-    draft_token_ids = draft_token_ids[target_logits_indices + 1]
-
-    return SpecDecodeMetadata(
-        draft_token_ids=draft_token_ids,
-        num_draft_tokens=num_draft_tokens.tolist(),
-        cu_num_draft_tokens=cu_num_draft_tokens,
-        cu_num_sampled_tokens=cu_num_sampled_tokens,
-        target_logits_indices=target_logits_indices,
-        bonus_logits_indices=bonus_logits_indices,
-        logits_indices=logits_indices,
-    )
 ```
+_calc_spec_decode_metadata(num_draft_tokens, cu_num_scheduled_tokens, num_pcp_pads)
+    │
+    ├── Step 1: 计算 num_sampled_tokens 和 cu_num_sampled_tokens
+    │   └── num_sampled_tokens = num_draft_tokens + 1
+    │   └── cu_num_sampled_tokens = cumsum(num_sampled_tokens)
+    │
+    ├── Step 2: 构建 logits_indices（CPU numpy计算）
+    │   ├── cumsums_offsets = repeat(cu_num_sampled - num_sampled, num_sampled)
+    │   ├── arange = arange_np[:total] - cumsums_offsets
+    │   ├── logits_indices = repeat(cu_num_scheduled - num_sampled, num_sampled)
+    │   └── logits_indices += arange
+    │
+    ├── Step 3: 【PCP分支】修正 logits_indices（pcp_size > 1）
+    │   └── cu_num_scheduled = cu_num_scheduled * pcp_size - num_pcp_pads
+    │   └── 重算 logits_indices_pcp
+    │
+    ├── Step 4: 计算 bonus_logits_indices
+    │   └── bonus_logits_indices = cu_num_sampled_tokens - 1
+    │
+    ├── Step 5: 构建 target_logits_indices（CPU numpy计算）
+    │   ├── cu_num_draft_tokens = cumsum(num_draft_tokens)
+    │   ├── cumsums_offsets = repeat(cu_num_draft - num_draft, num_draft)
+    │   ├── arange = arange_np[:total_draft] - cumsums_offsets
+    │   ├── target_logits_indices = repeat(cu_num_sampled - num_sampled, num_draft)
+    │   └── target_logits_indices += arange
+    │
+    ├── Step 6: CPU→NPU数据传输（5个张量 pin_memory + to(device)）
+    │
+    ├── Step 7: 计算 draft_token_ids（NPU上执行）
+    │   ├── draft_token_ids = input_ids.gpu[logits_indices]
+    │   └── draft_token_ids = draft_token_ids[target_logits_indices + 1]
+    │
+    └── Step 8: 构建并返回 SpecDecodeMetadata
+```
+
+#### 2.3.2 数值示例详解
+
+以5个请求为例，展示完整的索引计算过程：
+
+```
+输入:
+  cu_num_scheduled_tokens: [  4, 104, 107, 207, 209]  ← 累积调度token数
+  num_draft_tokens:        [  3,   0,   2,   0,   1]  ← 每个请求的draft数
+
+Step 1: 计算采样token数量
+  num_sampled_tokens     = num_draft_tokens + 1
+                         = [  4,   1,   3,   1,   2]
+  cu_num_sampled_tokens  = cumsum([4, 1, 3, 1, 2])
+                         = [  4,   5,   8,   9,  11]
+  total_num_sampled_tokens = 11
+
+Step 2: 构建 logits_indices（将连续索引映射到实际模型输出位置）
+  2a. cumsums_offsets = repeat(cu_num_sampled - num_sampled, num_sampled)
+      cu_num_sampled - num_sampled = [0, 4, 5, 8, 9]  ← 每组的起始偏移
+      repeat展开:                  = [0, 0, 0, 0, 4, 5, 5, 5, 8, 9, 9]
+  2b. arange = arange_np[:11] - cumsums_offsets
+      arange_np[:11]               = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      arange                       = [0, 1, 2, 3, 0, 0, 1, 2, 0, 0,  1]
+                                      ← 每组内的局部索引
+  2c. logits_indices = repeat(cu_num_scheduled - num_sampled, num_sampled)
+      cu_num_scheduled - num_sampled = [0, 103, 104, 206, 207]  ← 每组在模型输出中的起始位置
+      repeat展开:                    = [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]
+  2d. logits_indices += arange
+      logits_indices                 = [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]
+                                        ← 最终的模型输出位置索引
+
+Step 4: bonus_logits_indices（每个请求最后一个采样位置）
+  bonus_logits_indices = cu_num_sampled_tokens - 1
+                       = [  3,   4,   7,   8,  10]
+
+Step 5: 构建 target_logits_indices（draft token在采样空间中的位置）
+  5a. cu_num_draft_tokens = cumsum([3, 0, 2, 0, 1]) = [3, 3, 5, 5, 6]
+      total_num_draft_tokens = 6
+  5b. cumsums_offsets = repeat(cu_num_draft - num_draft, num_draft)
+      cu_num_draft - num_draft = [0, 3, 3, 5, 5]
+      repeat展开(按num_draft): = [0, 0, 0, 3, 3, 5]
+                                  (req0有3个draft, req1有0个, req2有2个, req3有0个, req4有1个)
+  5c. arange = arange_np[:6] - cumsums_offsets
+      arange_np[:6]            = [0, 1, 2, 3, 4, 5]
+      arange                   = [0, 1, 2, 0, 1, 0]  ← 每组内的局部索引
+  5d. target_logits_indices = repeat(cu_num_sampled - num_sampled, num_draft)
+      cu_num_sampled - num_sampled = [0, 4, 5, 8, 9]
+      repeat展开(按num_draft):     = [0, 0, 0, 5, 5, 9]
+  5e. target_logits_indices += arange
+      target_logits_indices        = [0, 1, 2, 5, 6, 9]
+
+Step 7: 获取 draft_token_ids（NPU）
+  draft_token_ids = input_ids.gpu[logits_indices]
+    ← 从GPU上的input_ids按logits_indices索引取值，得到 [11] 个token
+  draft_token_ids = draft_token_ids[target_logits_indices + 1]
+    ← 按 [1, 2, 3, 6, 7, 10] 索引取值，得到 [6] 个draft token ID
+```
+
+#### 2.3.3 源码逐段分析
+
+**Step 1-2: 计算 logits_indices**
+
+```python
+# vllm_ascend/worker/model_runner_v1.py:874-885
+num_sampled_tokens = num_draft_tokens + 1                    # numpy向量加法
+cu_num_sampled_tokens = np.cumsum(num_sampled_tokens, dtype=np.int32)  # 前缀和
+total_num_sampled_tokens = cu_num_sampled_tokens[-1]
+
+# 构建每组内的局部索引
+cumsums_offsets = np.repeat(cu_num_sampled_tokens - num_sampled_tokens, num_sampled_tokens)
+arange = self.arange_np[:total_num_sampled_tokens] - cumsums_offsets
+
+# 构建模型输出中的起始位置，加上局部索引得到最终位置
+logits_indices = np.repeat(cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens)
+logits_indices += arange
+```
+
+**Step 3: PCP修正（pcp_size > 1时执行）**
+
+```python
+# vllm_ascend/worker/model_runner_v1.py:889-893
+if self.pcp_size > 1:
+    cu_num_scheduled_tokens = cu_num_scheduled_tokens * self.pcp_size - num_pcp_pads
+    logits_indices_pcp = np.repeat(cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens)
+    logits_indices_pcp += arange
+    logits_indices_pcp = torch.from_numpy(logits_indices_pcp).pin_memory().to(self.device, non_blocking=True)
+```
+
+> **PCP说明**: PCP(Parallel Context Processing)在多卡并行时，all-gather后可能引入padding。此处用原始 `logits_indices` 获取 `draft_token_ids`（padding前的正确位置），再用修正后的 `logits_indices_pcp` 替换作为最终返回值。
+
+**Step 4-5: 计算 bonus 和 target logits索引**
+
+```python
+# vllm_ascend/worker/model_runner_v1.py:896-909
+bonus_logits_indices = cu_num_sampled_tokens - 1  # 每个请求最后一个位置
+
+cu_num_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)
+total_num_draft_tokens = cu_num_draft_tokens[-1]
+cumsums_offsets = np.repeat(cu_num_draft_tokens - num_draft_tokens, num_draft_tokens)
+arange = self.arange_np[:total_num_draft_tokens] - cumsums_offsets
+target_logits_indices = np.repeat(cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens)
+target_logits_indices += arange
+```
+
+**Step 6: CPU→NPU传输**
+
+```python
+# vllm_ascend/worker/model_runner_v1.py:912-916
+cu_num_draft_tokens    = torch.from_numpy(cu_num_draft_tokens).pin_memory().to(self.device, non_blocking=True)
+cu_num_sampled_tokens  = torch.from_numpy(cu_num_sampled_tokens).pin_memory().to(self.device, non_blocking=True)
+logits_indices         = torch.from_numpy(logits_indices).pin_memory().to(self.device, non_blocking=True)
+target_logits_indices  = torch.from_numpy(target_logits_indices).pin_memory().to(self.device, non_blocking=True)
+bonus_logits_indices   = torch.from_numpy(bonus_logits_indices).pin_memory().to(self.device, non_blocking=True)
+```
+
+> **与GPU版本差异**: vllm-ascend使用 `pin_memory()` + `to(device, non_blocking=True)` 两步传输，GPU版本直接 `to(device, non_blocking=True)`（CUDA张量无需显式pin_memory）。
+
+**Step 7: 获取draft token IDs（NPU上执行）**
+
+```python
+# vllm_ascend/worker/model_runner_v1.py:920-923
+draft_token_ids = self.input_ids.gpu[logits_indices]          # 高级索引取值
+draft_token_ids = draft_token_ids[target_logits_indices + 1]  # 二次索引取draft位置
+if self.pcp_size > 1:
+    logits_indices = logits_indices_pcp  # PCP场景替换为修正后的索引
+```
+
+#### 2.3.4 算子全景总表
+
+| 序号 | 步骤 | API / 算子 | 运行位置 | 输入形状 | 输出形状 | 备注 |
+|------|------|-----------|---------|---------|---------|------|
+| 1 | num_sampled_tokens | `num_draft_tokens + 1` (numpy) | **CPU** | `[B]` int32 | `[B]` int32 | numpy向量加法 |
+| 2 | cu_num_sampled_tokens | `np.cumsum(num_sampled_tokens)` | **CPU** | `[B]` int32 | `[B]` int32 | numpy前缀和 |
+| 3 | cumsums_offsets(sampled) | `np.repeat(arr, num_sampled_tokens)` | **CPU** | `[B]` int32 + `[B]` int32 | `[T_s]` int32 | T_s=total_num_sampled_tokens |
+| 4 | arange(sampled) | `arange_np[:T_s] - cumsums_offsets` | **CPU** | `[T_s]` int64 - `[T_s]` int32 | `[T_s]` int64 | 预分配arange_np切片减法 |
+| 5 | logits_indices(base) | `np.repeat(arr, num_sampled_tokens)` | **CPU** | `[B]` int32 + `[B]` int32 | `[T_s]` int32 | 起始位置展开 |
+| 6 | logits_indices(final) | `logits_indices += arange` | **CPU** | `[T_s]` int32 + `[T_s]` int64 | `[T_s]` int64 | numpy原地加法 |
+| 7 | 【PCP】cu_num_scheduled修正 | `cu * pcp_size - pads` (numpy) | **CPU** | `[B]` int32 | `[B]` int32 | 仅pcp_size>1 |
+| 8 | 【PCP】logits_indices_pcp | `repeat + arange` (numpy) | **CPU** | `[B]` int32 | `[T_s]` int64 | 仅pcp_size>1 |
+| 9 | 【PCP】H2D传输 | `from_numpy().pin_memory().to(device)` | **CPU→NPU** | `[T_s]` int64 | `[T_s]` int64 | non_blocking=True |
+| 10 | bonus_logits_indices | `cu_num_sampled_tokens - 1` (numpy) | **CPU** | `[B]` int32 | `[B]` int32 | numpy向量减法 |
+| 11 | cu_num_draft_tokens | `np.cumsum(num_draft_tokens)` | **CPU** | `[B]` int32 | `[B]` int32 | numpy前缀和 |
+| 12 | cumsums_offsets(draft) | `np.repeat(arr, num_draft_tokens)` | **CPU** | `[B]` int32 + `[B]` int32 | `[T_d]` int32 | T_d=total_num_draft_tokens |
+| 13 | arange(draft) | `arange_np[:T_d] - cumsums_offsets` | **CPU** | `[T_d]` int64 - `[T_d]` int32 | `[T_d]` int64 | 预分配arange_np切片减法 |
+| 14 | target_logits_indices(base) | `np.repeat(arr, num_draft_tokens)` | **CPU** | `[B]` int32 + `[B]` int32 | `[T_d]` int32 | 起始位置展开 |
+| 15 | target_logits_indices(final) | `target_logits_indices += arange` | **CPU** | `[T_d]` int32 + `[T_d]` int64 | `[T_d]` int64 | numpy原地加法 |
+| 16a | H2D: cu_num_draft_tokens | `from_numpy().pin_memory().to(device)` | **CPU→NPU** | `[B]` int32 | `[B]` int32 NPU | non_blocking |
+| 16b | H2D: cu_num_sampled_tokens | `from_numpy().pin_memory().to(device)` | **CPU→NPU** | `[B]` int32 | `[B]` int32 NPU | non_blocking |
+| 16c | H2D: logits_indices | `from_numpy().pin_memory().to(device)` | **CPU→NPU** | `[T_s]` int64 | `[T_s]` int64 NPU | non_blocking |
+| 16d | H2D: target_logits_indices | `from_numpy().pin_memory().to(device)` | **CPU→NPU** | `[T_d]` int64 | `[T_d]` int64 NPU | non_blocking |
+| 16e | H2D: bonus_logits_indices | `from_numpy().pin_memory().to(device)` | **CPU→NPU** | `[B]` int32 | `[B]` int32 NPU | non_blocking |
+| 17 | draft_token_ids(索引1) | `input_ids.gpu[logits_indices]` | **NPU** IndexSelect | `[max_tokens]` int64 + `[T_s]` int64 | `[T_s]` int64 | 高级索引(fancy indexing) |
+| 18 | target+1 | `target_logits_indices + 1` | **NPU** Add | `[T_d]` int64 | `[T_d]` int64 | 张量标量加法 |
+| 19 | draft_token_ids(索引2) | `draft_token_ids[target_logits_indices + 1]` | **NPU** IndexSelect | `[T_s]` int64 + `[T_d]` int64 | `[T_d]` int64 | 高级索引(fancy indexing) |
+| 20 | 【PCP】logits_indices替换 | `logits_indices = logits_indices_pcp` | - | - | - | Python引用赋值,零开销 |
+
+> **图例**: B=batch_size(num_reqs), T_s=total_num_sampled_tokens, T_d=total_num_draft_tokens
+
+#### 2.3.5 数据流详细追踪
+
+```
+输入: num_draft_tokens [B] np.int32  (来自scheduler的每请求draft token数)
+      cu_num_scheduled_tokens [B] np.int32  (累积调度token数,来自_prepare_inputs)
+      num_pcp_pads [B] np.int32 | None  (PCP填充数,仅pcp_size>1)
+ │
+ ├─ Step 1: 计算采样token数量 (CPU numpy)
+ │   ├─ num_sampled_tokens = num_draft_tokens + 1  ──→ [B] np.int32
+ │   │   运算: numpy向量加标量             位置: CPU
+ │   │   语义: 每个请求的采样数 = draft数 + 1(验证token)
+ │   │
+ │   ├─ cu_num_sampled_tokens = np.cumsum(num_sampled_tokens, dtype=np.int32)  ──→ [B] np.int32
+ │   │   运算: numpy前缀和                 位置: CPU
+ │   │
+ │   └─ total_num_sampled_tokens = cu_num_sampled_tokens[-1]  ──→ scalar
+ │
+ ├─ Step 2: 构建 logits_indices (CPU numpy, 核心索引映射)
+ │   │   目标: 将扁平化的采样位置映射到模型输出中的实际位置
+ │   │
+ │   ├─ cumsums_offsets = np.repeat(cu_num_sampled - num_sampled, num_sampled)  ──→ [T_s] np.int32
+ │   │   运算: numpy repeat               位置: CPU
+ │   │   语义: 每组的起始偏移,按组大小展开
+ │   │
+ │   ├─ arange = arange_np[:T_s] - cumsums_offsets  ──→ [T_s] np.int64
+ │   │   运算: numpy切片 + 向量减法         位置: CPU
+ │   │   语义: 每组内的局部递增索引 (0,1,2,...,n_i-1)
+ │   │
+ │   ├─ logits_indices = np.repeat(cu_num_scheduled - num_sampled, num_sampled)  ──→ [T_s] np.int32
+ │   │   运算: numpy repeat               位置: CPU
+ │   │   语义: 每组在模型输出中的起始位置,按组大小展开
+ │   │
+ │   └─ logits_indices += arange  ──→ [T_s] np.int64  (in-place)
+ │       运算: numpy原地加法               位置: CPU
+ │       语义: 起始位置 + 局部索引 = 最终模型输出位置
+ │
+ ├─ 【PCP分支】Step 3: 修正 logits_indices (pcp_size > 1)
+ │   ├─ cu_num_scheduled = cu_num_scheduled * pcp_size - num_pcp_pads  ──→ [B] np.int32
+ │   │   运算: numpy乘法 + 减法            位置: CPU
+ │   │   语义: 扣除all-gather引入的padding后的实际位置
+ │   │
+ │   ├─ logits_indices_pcp = np.repeat(...) + arange  ──→ [T_s] np.int64
+ │   │   运算: 同Step 2                    位置: CPU
+ │   │
+ │   └─ logits_indices_pcp = torch.from_numpy().pin_memory().to(device)  ──→ [T_s] NPU tensor
+ │       运算: H2D传输                     位置: CPU→NPU (non_blocking)
+ │
+ ├─ Step 4: bonus_logits_indices (CPU numpy)
+ │   └─ bonus_logits_indices = cu_num_sampled_tokens - 1  ──→ [B] np.int32
+ │       运算: numpy向量减标量              位置: CPU
+ │       语义: 每个请求的最后一个采样位置(用于bonus token logits)
+ │
+ ├─ Step 5: 构建 target_logits_indices (CPU numpy)
+ │   │   目标: 将draft token位置映射到采样空间中的位置
+ │   │
+ │   ├─ cu_num_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)  ──→ [B] np.int32
+ │   │   运算: numpy前缀和                 位置: CPU
+ │   │
+ │   ├─ total_num_draft_tokens = cu_num_draft_tokens[-1]  ──→ scalar
+ │   │
+ │   ├─ cumsums_offsets = np.repeat(cu_num_draft - num_draft, num_draft)  ──→ [T_d] np.int32
+ │   │   运算: numpy repeat               位置: CPU
+ │   │
+ │   ├─ arange = arange_np[:T_d] - cumsums_offsets  ──→ [T_d] np.int64
+ │   │   运算: numpy切片 + 向量减法         位置: CPU
+ │   │
+ │   ├─ target_logits_indices = np.repeat(cu_num_sampled - num_sampled, num_draft)  ──→ [T_d] np.int32
+ │   │   运算: numpy repeat               位置: CPU
+ │   │   注意: 这里按 num_draft_tokens 展开(非 num_sampled_tokens)
+ │   │
+ │   └─ target_logits_indices += arange  ──→ [T_d] np.int64  (in-place)
+ │       运算: numpy原地加法               位置: CPU
+ │
+ ├─ Step 6: CPU→NPU批量传输 (5个张量)
+ │   ├─ cu_num_draft_tokens:    [B] int32     ──pin_memory()──→ NPU
+ │   ├─ cu_num_sampled_tokens:  [B] int32     ──pin_memory()──→ NPU
+ │   ├─ logits_indices:         [T_s] int64   ──pin_memory()──→ NPU
+ │   ├─ target_logits_indices:  [T_d] int64   ──pin_memory()──→ NPU
+ │   └─ bonus_logits_indices:   [B] int32     ──pin_memory()──→ NPU
+ │   全部使用 non_blocking=True, 与后续NPU计算重叠
+ │
+ ├─ Step 7: 计算 draft_token_ids (NPU)
+ │   ├─ draft_token_ids = input_ids.gpu[logits_indices]  ──→ [T_s] int64
+ │   │   算子: IndexSelect (fancy indexing) 位置: NPU
+ │   │   数据流: input_ids[max_tokens] ⊕ logits_indices[T_s] → [T_s]
+ │   │   语义: 按logits_indices从GPU端input_ids中取出对应token
+ │   │
+ │   └─ draft_token_ids = draft_token_ids[target_logits_indices + 1]  ──→ [T_d] int64
+ │       算子: Add(标量) + IndexSelect     位置: NPU
+ │       数据流: target_logits_indices[T_d] + 1 → indices[T_d]
+ │               draft_token_ids[T_s][indices] → [T_d]
+ │       语义: target位置+1即为对应draft token位置, 取出draft token IDs
+ │
+ ├─ 【PCP分支】替换 logits_indices
+ │   └─ logits_indices = logits_indices_pcp  (Python引用赋值)
+ │
+ └─ 构建 SpecDecodeMetadata 并返回:
+     │
+     └─ return SpecDecodeMetadata(
+           draft_token_ids:        [T_d] int64 NPU,     # draft token IDs
+           num_draft_tokens:       list[int] len=B CPU,  # 每请求draft数(list)
+           cu_num_draft_tokens:    [B] int32 NPU,        # 累积draft数
+           cu_num_sampled_tokens:  [B] int32 NPU,        # 累积采样数
+           target_logits_indices:  [T_d] int64 NPU,      # target logits位置
+           bonus_logits_indices:   [B] int32 NPU,        # bonus logits位置
+           logits_indices:         [T_s] int64 NPU,      # 全部logits位置
+         )
+```
+
+#### 2.3.6 运行位置分布统计
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│              _calc_spec_decode_metadata 算子运行位置分布               │
+├─────────────┬───────────────────────────────────────────────────────┤
+│  Host CPU   │ ████████████████████████████████████████  ~80%        │
+│  (numpy)    │ cumsum, repeat, arange切片, 向量加减法                 │
+│             │ 全部索引构建逻辑在CPU端完成                              │
+├─────────────┼───────────────────────────────────────────────────────┤
+│  H2D传输    │ ██████████  ~12%                                      │
+│             │ 5个张量 pin_memory() → to(device, non_blocking)       │
+│             │ 传输数据量: 2×[B]×4B + [T_s]×8B + [T_d]×8B + [B]×4B  │
+├─────────────┼───────────────────────────────────────────────────────┤
+│  NPU        │ ██████  ~8%                                           │
+│             │ IndexSelect×2 + Add(标量)                              │
+│             │ 仅draft_token_ids获取在NPU上执行                       │
+├─────────────┼───────────────────────────────────────────────────────┤
+│  NPU-Cube   │ ▏ ~0%                                                │
+│             │ 无矩阵乘算子                                           │
+└─────────────┴───────────────────────────────────────────────────────┘
+```
+
+#### 2.3.7 关键性能瓶颈与优化分析
+
+| 瓶颈点 | 原因 | 影响程度 | 优化方向 |
+|--------|------|---------|---------|
+| `np.repeat` 多次调用 | 4次repeat操作,每次分配新numpy数组 | ★★★☆☆ | 预分配buffer复用,或迁移到NPU |
+| `pin_memory()` + H2D传输 | 5个张量逐个pin_memory+传输,增加CPU开销 | ★★★★☆ | 合并为单个buffer一次传输;或将索引计算迁移到NPU |
+| CPU端索引计算 | 所有cumsum/repeat/arange在CPU执行,无法利用NPU并行 | ★★★☆☆ | 将索引计算迁移到NPU端(torch实现替代numpy) |
+| `input_ids.gpu[logits_indices]` fancy indexing | 非连续内存访问,NPU端随机读取效率较低 | ★★☆☆☆ | 如果input_ids已排布好,可用连续slice替代 |
+| `num_draft_tokens.tolist()` | numpy→Python list转换,GIL+内存分配 | ★☆☆☆☆ | 数据量小(B级别),影响有限 |
+
+#### 2.3.8 与GPU社区版本差异对比
+
+| 特性 | vllm-ascend版本 | GPU社区版本 |
+|------|----------------|------------|
+| 文件位置 | `vllm_ascend/worker/model_runner_v1.py:856-932` | `vllm/v1/worker/gpu_model_runner.py:2209-2286` |
+| PCP支持 | ✅ `num_pcp_pads` 参数,修正logits_indices | ❌ 无PCP逻辑 |
+| cumsum+arange实现 | 手动计算(repeat+arange_np切片) | `_get_cumsum_and_arange` 辅助函数 |
+| H2D传输 | `from_numpy().pin_memory().to(device)` | `from_numpy().to(device)` |
+| draft_token_ids获取 | 相同逻辑 | 相同逻辑 |
 
 ---
 
@@ -1660,181 +1982,503 @@ logits [num_tokens + batch_size, vocab_size]
 
 ---
 
-## 4. 功能流程
+## 4. 功能流程与算子分析（HAS_TRITON=true 路径）
 
-### 4.1 拒绝采样核心算法
+> **说明**: 本节参照第一部分 3.3/3.4 的文档结构，对投机推理后处理 `RejectionSampler.forward()` 及核心函数 `rejection_sample()` 在 **HAS_TRITON=true** 路径下进行逐步拆解和算子级分析。
 
-**文件位置**: `vllm_ascend/sample/rejection_sampler.py:120-387`
+### 4.1 RejectionSampler.forward() 详细流程（HAS_TRITON=true）
+
+**文件位置**: `vllm/v1/sample/rejection_sampler.py:24-120`（vLLM 官方）+ `vllm_ascend/sample/rejection_sampler.py`（昇腾 patch）
+
+#### 4.1.1 整体流程概览
 
 ```
-rejection_sample()
+forward(metadata, draft_probs, logits, sampling_metadata)
     │
-    ├── 输入:
-    │   ├── draft_token_ids: [num_tokens] 展平的draft tokens
-    │   ├── num_draft_tokens: [batch_size] 每个请求的draft数量
-    │   ├── target_logits: [num_tokens, vocab_size]
-    │   └── bonus_token_ids: [batch_size, 1]
+    ├── Step 1: 提取 Bonus Logits 并采样 Bonus Token
+    │   ├── bonus_logits = logits[metadata.bonus_logits_indices]        # 索引提取
+    │   ├── replace(sampling_metadata, max_num_logprobs=-1)             # 元数据替换
+    │   └── bonus_token_ids = self.sampler(bonus_logits, ...)           # 完整 AscendSampler.forward()
     │
-    ├── 验证模式选择:
-    │   ├── max_spec_len < 3 → 逐个验证
-    │   └── max_spec_len >= 3 → Block Verify（累积乘积）
+    ├── Step 2: 提取 Target Logits
+    │   ├── raw_target_logits = logits[metadata.target_logits_indices]  # 索引提取
+    │   ├── raw_target_logits = raw_target_logits.to(float32)           # 类型转换
+    │   └── target_logits = raw_target_logits.clone()                   # 克隆（保留原始值用于logprobs）
     │
-    ├── 贪心采样路径:
-    │   ├── 比较 draft_token vs target_argmax
-    │   ├── 从第一个不匹配位置开始拒绝
-    │   └── 全部匹配时追加bonus token
+    ├── Step 3: 应用 Logits Processors
+    │   ├── allowed_token_ids_mask → masked_fill_(-inf)
+    │   ├── bad_words → 逐请求设为 -inf
+    │   ├── non_argmax_invariant 处理器
+    │   └── apply_penalties (repetition/frequency/presence)
     │
-    ├── 随机采样路径:
-    │   ├── 预计算recovered tokens（修正分布采样）
-    │   ├── 计算接受概率: accept_prob = min(1, p_target/p_draft)
-    │   ├── 生成均匀随机数判断接受/拒绝
-    │   └── 拒绝时使用recovered token
+    ├── Step 4: apply_sampling_constraints()  [昇腾 patch]
+    │   ├── expand_batch_to_tokens(temperature) → expand_kernel (Triton)
+    │   ├── logits.div_(temperature.unsqueeze(-1))
+    │   ├── expand_batch_to_tokens(top_k) → expand_kernel (Triton)
+    │   ├── expand_batch_to_tokens(top_p) → expand_kernel (Triton)
+    │   └── apply_top_k_top_p(logits, top_k, top_p) → npu_apply_top_k_top_p (A2/A3)
     │
-    └── 输出:
-        └── output_token_ids: [batch_size, max_spec_len+1]
-            ├── 被接受位置: draft token
-            ├── 第一个拒绝位置: recovered token
-            ├── 全部接受时: bonus token在末尾
-            └── 无效位置: PLACEHOLDER_TOKEN_ID (-1)
+    ├── Step 5: rejection_sample()  [昇腾 patch, 核心拒绝采样]
+    │   ├── 5a. 创建输出缓冲区 [B, S+1], fill_(PLACEHOLDER)
+    │   ├── 5b. cal_grid_and_block_size(batch_size) → (grid, block_size)
+    │   ├── 5c. 贪心路径: argmax → rejection_greedy_sample_with_triton()
+    │   │   ├── spec_len=1 且 all_greedy: rejection_greedy_sample_spec_len_1_triton
+    │   │   └── 通用: rejection_greedy_sample_triton (含 bonus_renew)
+    │   ├── 5d. target_probs = target_logits.softmax(dim=-1, fp32)
+    │   ├── 5e. uniform_probs = generate_uniform_probs()
+    │   ├── 5f. recovered_token_ids = sample_recovered_tokens()
+    │   │   ├── q.exponential_() (AI-CPU)
+    │   │   └── sample_recovered_tokens_kernel[(B, S)] (Triton)
+    │   └── 5g. 随机路径:
+    │       ├── max_spec_len < 3: rejection_random_sample_kernel (Triton)
+    │       └── max_spec_len >= 3: rejection_random_sample_block_verify_kernel (Triton)
+    │
+    ├── Step 6: 计算 logprobs（可选）
+    │   └── _get_logprobs_tensors(...)
+    │
+    └── Step 7: 返回 SamplerOutput
+            ├── sampled_token_ids: [B, S+1] int32
+            └── logprobs_tensors: LogprobsTensors | None
 ```
 
-### 4.2 贪心采样拒绝采样
+> **符号说明**: B=batch_size, N=num_draft_tokens(展平总数), S=max_spec_len, V=vocab_size
 
-**文件位置**: `vllm_ascend/sample/rejection_sampler.py:641-803`
+#### 4.1.2 Step 1: Bonus Token 采样
 
 ```python
-def rejection_greedy_sample_pytorch(...):
-    # 1. 计算target argmax
-    target_argmax = target_logits.argmax(dim=-1)
-
-    # 2. 比较draft和target
-    mismatch_global = draft_token_ids != target_argmax
-
-    # 3. 找到每个请求的第一个不匹配位置
-    first_mismatch_pos_per_req = ...
-
-    # 4. 复制匹配的tokens到输出
-    copy_len = min(first_mismatch_pos + 1, draft_tokens_per_req)
-    output_token_ids[...] = target_argmax[...]
-
-    # 5. 如果全部匹配，填充bonus token
-    if first_mismatch_pos >= draft_tokens_per_req:
-        output_token_ids[req_idx, draft_tokens] = bonus_token_ids[req_idx]
+# vllm/v1/sample/rejection_sampler.py:93-102
+bonus_logits = logits[metadata.bonus_logits_indices]  # [B, V]
+bonus_sampler_output = self.sampler(
+    logits=bonus_logits,
+    sampling_metadata=replace(sampling_metadata, max_num_logprobs=-1),
+    predict_bonus_token=True,
+    logprobs_mode_override="processed_logits" if self.is_processed_logprobs_mode else "raw_logits"
+)
+bonus_token_ids = bonus_sampler_output.sampled_token_ids  # [B, 1]
 ```
 
-### 4.3 随机采样拒绝采样
+> **关键**: 此步调用完整的 `AscendSampler.forward()` 流程（详见第一部分 3.3），包含 logits 预处理、温度缩放、Top-K/Top-P、Gumbel-Max 采样等全部步骤。
 
-**文件位置**: `vllm_ascend/sample/rejection_sampler.py:805-996`
+#### 4.1.3 Step 2-3: Target Logits 提取与 Logits Processors
 
 ```python
-def rejection_random_sample_pytorch(...):
-    # 1. 计算接受条件
-    acceptance_condition = (draft_token_probs > 0) & (
-        target_token_probs / draft_token_probs >= uniform_token_probs
-    )
+# vllm/v1/sample/rejection_sampler.py:104-127
+raw_target_logits = logits[metadata.target_logits_indices]  # [N, V]
+raw_target_logits = raw_target_logits.to(torch.float32)
+if not self.is_processed_logprobs_mode:
+    target_logits = raw_target_logits.clone()  # 保留原始值
 
-    # 2. 找到第一个拒绝位置
-    first_rejection = (~acceptance_condition) & valid_mask
-    first_reject_pos = first_rejection.float().argmax(dim=1)
-
-    # 3. 创建跳过掩码（第一个拒绝位置之后的都跳过）
-    pos_mask = pos_indices >= first_reject_pos
-    should_skip = pos_mask & valid_mask
-
-    # 4. 选择最终tokens
-    final_tokens = torch.where(
-        first_reject_mask, recovered_tokens,
-        torch.where(final_acceptance, draft_tokens, output_token_ids)
-    )
-
-    # 5. 填充bonus tokens（如果没有拒绝）
-    no_rejection = first_reject_pos >= num_draft_per_batch
-    should_add_bonus = non_greedy_mask & no_rejection
+# 应用 logits processors（同传统路径 Step 3）
+target_logits = self.apply_logits_processors(target_logits, sampling_metadata, metadata)
 ```
 
-### 4.4 Block Verify模式
-
-**文件位置**: `vllm_ascend/sample/rejection_sampler.py:1231-1383`
-
-```python
-def rejection_random_sample_block_verify_pytorch(...):
-    # Block Verify使用累积乘积提高接受率
-    # 数学原理: ∏(p_target/p_draft) >= ∏uniform
-
-    # 1. 计算π = p_target / p_draft
-    pi = target_token_probs / draft_token_probs
-    pi = pi.clamp(max=1.0)
-
-    # 2. 计算累积乘积
-    pi = torch.cumprod(pi, dim=-1)
-    uniform_token_probs = torch.cumprod(uniform_token_probs, dim=-1)
-
-    # 3. 判断合法性
-    legal_mask = (draft_token_probs > 0) & (pi >= uniform_token_probs)
-
-    # 4. 找到最后一个接受位置
-    last_accept_pos = max_spec_len - legal_mask.flip(dims=[-1]).float().argmax(dim=-1) - 1
-
-    # 5. 填充输出
-    accept_mask = (pos_indices <= last_accept_pos) & valid_mask
-    reject_mask = (pos_indices == last_accept_pos + 1) & valid_mask
-```
-
-### 4.5 Recovered Token采样
-
-**文件位置**: `vllm_ascend/sample/rejection_sampler.py:456-574`
-
-```python
-def sample_recovered_tokens(...):
-    """
-    当draft token被拒绝时，从修正分布中采样恢复token。
-    修正分布: P_recover(x) = max(0, p_target(x) - p_draft(x)) / Z
-    使用Gumbel-max技巧进行高效采样。
-    """
-    # 1. 生成指数分布随机数 q ~ Exp(1)
-    q = torch.empty((batch_size, vocab_size), device=device)
-    q.exponential_()
-
-    # 2. 使用请求专属的随机生成器
-    for i, generator in sampling_metadata.generators.items():
-        q[i].exponential_(generator=generator)
-
-    # 3. 调用kernel计算recovered tokens
-    # 修正概率 = max(0, target_probs - draft_probs)
-    # scores = prob / q
-    # recovered_id = argmax(scores)
-    sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
-        recovered_token_ids, cu_num_draft_tokens, draft_token_ids,
-        draft_probs, target_probs, q, vocab_size,
-        NO_DRAFT_PROBS=draft_probs is None,  # N-gram模式
-    )
-```
-
-### 4.6 apply_sampling_constraints
+#### 4.1.4 Step 4: apply_sampling_constraints()（昇腾 Triton 路径）
 
 **文件位置**: `vllm_ascend/sample/rejection_sampler.py:24-117`
 
 ```python
 def apply_sampling_constraints(logits, cu_num_draft_tokens, sampling_metadata):
-    """对logits进行温度缩放、top-k、top-p处理"""
-
-    # 贪心采样直接返回
     if sampling_metadata.all_greedy:
-        return logits
+        return logits  # 贪心快速路径
 
-    # 温度缩放
+    # Triton expand_kernel 将 batch 参数扩展到 token 级别
     temperature = expand_batch_to_tokens(
         sampling_metadata.temperature, cu_num_draft_tokens, num_tokens,
         replace_from=GREEDY_TEMPERATURE, replace_to=1,
     )
     logits.div_(temperature.unsqueeze(-1))
 
-    # Top-k和Top-p扩展
-    top_k = expand_batch_to_tokens(sampling_metadata.top_k, ...)
-    top_p = expand_batch_to_tokens(sampling_metadata.top_p, ...)
-
-    return apply_top_k_top_p(logits, top_k, top_p)
+    top_k = expand_batch_to_tokens(sampling_metadata.top_k, cu_num_draft_tokens, num_tokens)
+    top_p = expand_batch_to_tokens(sampling_metadata.top_p, cu_num_draft_tokens, num_tokens)
+    return apply_top_k_top_p(logits, top_k, top_p)  # A2/A3: npu_apply_top_k_top_p
 ```
+
+**expand_batch_to_tokens 的 Triton 路径**:
+
+```python
+# vllm_ascend/sample/rejection_sampler.py:439-441
+if HAS_TRITON:
+    expand_triton(batch_size, expanded_x, x, cu_num_tokens, replace_from, replace_to,
+                  max_num_tokens=MAX_SPEC_LEN)
+```
+
+```
+expand_kernel (Triton JIT):
+  输入: x[B], cu_num_tokens[B]
+  输出: expanded_x[N]
+  逻辑: 根据累积计数将 batch 级值复制到对应 token 位置
+  grid: cal_grid_and_block_size(batch_size)
+```
+
+#### 4.1.5 Step 5: rejection_sample() 核心流程（HAS_TRITON=true）
+
+**文件位置**: `vllm_ascend/sample/rejection_sampler.py:120-385`
+
+```
+rejection_sample(draft_token_ids, num_draft_tokens, max_spec_len,
+                 cu_num_draft_tokens, draft_probs, target_logits,
+                 bonus_token_ids, sampling_metadata)
+    │
+    ├── 5a. 创建输出缓冲区
+    │   output_token_ids = torch.empty([B, S+1], dtype=int32)
+    │   output_token_ids.fill_(PLACEHOLDER_TOKEN_ID)  # 填充 -1
+    │
+    ├── 5b. 确定验证模式与 grid 配置
+    │   using_block_verify = max_spec_len >= 3
+    │   grid, block_size = cal_grid_and_block_size(batch_size)
+    │   │
+    │   └── cal_grid_and_block_size:
+    │       ├── vectorcore_num = get_vectorcore_num()
+    │       ├── batch_size <= vectorcore_num: grid=batch_size, block=1
+    │       └── batch_size > vectorcore_num: grid=vectorcore_num, block=next_power_of_2(⌈B/grid⌉)
+    │
+    ├── 5c. 贪心采样路径 (if not all_random)
+    │   │
+    │   ├── target_argmax = target_logits.argmax(dim=-1)  # [N] int64
+    │   │
+    │   └── rejection_greedy_sample_with_triton():
+    │       │
+    │       ├── [条件A] spec_len=1 且 all_greedy:
+    │       │   rejection_greedy_sample_spec_len_1_triton[(grid,)](
+    │       │       output_token_ids, draft_token_ids, target_argmax,
+    │       │       bonus_token_ids, vec_len, BLOCK_SIZE=block_size)
+    │       │   逻辑: 向量化比较 draft vs target, 匹配时调用 bonus_renew_1
+    │       │
+    │       └── [条件B] 通用贪心:
+    │           rejection_greedy_sample_triton[(grid,)](
+    │               output_token_ids, cu_num_draft_tokens, draft_token_ids,
+    │               target_argmax, bonus_token_ids, is_greedy,
+    │               vec_len, max_spec_len, BLOCK_SIZE=block_size)
+    │           逻辑: 逐请求遍历 draft tokens, 首次不匹配即拒绝,
+    │                  全部匹配时调用 bonus_renew
+    │
+    │   └── if all_greedy: return output_token_ids  ◀─ 快速返回
+    │
+    ├── 5d. 计算 target 概率分布
+    │   target_probs = target_logits.softmax(dim=-1, dtype=fp32)  # [N, V]
+    │
+    ├── 5e. 生成均匀随机数
+    │   uniform_probs = generate_uniform_probs(num_tokens, num_draft_tokens,
+    │       generators, device)  # [N]
+    │
+    ├── 5f. 预计算恢复 tokens
+    │   sample_recovered_tokens():
+    │   │
+    │   ├── q = torch.empty([B, V], fp32).exponential_()   # AI-CPU
+    │   ├── for i, gen in generators.items():
+    │   │       q[i].exponential_(generator=gen)            # AI-CPU (per-request)
+    │   └── sample_recovered_tokens_kernel[(B, S)](
+    │           recovered_token_ids, cu_num_draft_tokens,
+    │           draft_token_ids, draft_probs, target_probs, q,
+    │           vocab_size, PADDED_VOCAB_SIZE, NO_DRAFT_PROBS, SUB_BLOCK=4096)
+    │       逻辑:
+    │         ├── N-gram模式: target_probs[draft_token_id]置0 → prob/q → argmax
+    │         └── 有draft_probs: max(0, target-draft)/q → argmax
+    │
+    └── 5g. 随机采样拒绝采样
+        │
+        ├── [max_spec_len < 3] 逐个验证:
+        │   rejection_random_sample_kernel[(grid,)](
+        │       output_token_ids, cu_num_draft_tokens, draft_token_ids,
+        │       draft_probs, target_probs, bonus_token_ids,
+        │       recovered_token_ids, uniform_probs.to(fp32), is_greedy,
+        │       max_spec_len, vocab_size, batch_size,
+        │       NO_DRAFT_PROBS, BLOCK_SIZE=block_size)
+        │   逻辑: 逐token判断 target_prob/draft_prob >= uniform_prob
+        │         接受→写入draft_token, 拒绝→写入recovered_token
+        │         全部接受→追加bonus_token
+        │
+        └── [max_spec_len >= 3] Block Verify:
+            rejection_random_sample_block_verify_kernel[(grid,)](
+                ...同上参数...)
+            逻辑: π = ∏min(target/draft, 1.0), u = ∏uniform
+                  π >= u → 接受, 找到 last_accepted_pos
+                  接受位置写入draft_token, 拒绝位置写入recovered_token
+                  全部接受→追加bonus_token
+```
+
+#### 4.1.6 执行路径总结
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ RejectionSampler.forward() + rejection_sample() 执行路径               │
+│ (HAS_TRITON=true)                                                       │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  路径 A: 全部贪心 (all_greedy=True)                                      │
+│  ─────────────────────────────────────                                   │
+│  bonus: AscendSampler.forward(bonus_logits)                              │
+│  target: logits[indices] → fp32 → apply_logits_processors               │
+│  rejection: argmax → rejection_greedy_sample_*_triton → 返回             │
+│  特点: 跳过 softmax/uniform/recovered, 无随机采样路径                     │
+│                                                                          │
+│  路径 B: 全部随机 (all_random=True)                                      │
+│  ─────────────────────────────────────                                   │
+│  bonus: AscendSampler.forward(bonus_logits)                              │
+│  target: logits[indices] → fp32 → apply_logits_processors               │
+│          → apply_sampling_constraints (Triton expand + TopKTopP)         │
+│  rejection: softmax → uniform → recovered (Triton kernel)                │
+│          → rejection_random_sample_*_kernel → 返回                       │
+│  特点: 跳过贪心 argmax 路径                                              │
+│                                                                          │
+│  路径 C: 混合模式 (部分贪心 + 部分随机)                                   │
+│  ─────────────────────────────────────                                   │
+│  bonus: AscendSampler.forward(bonus_logits)                              │
+│  target: logits[indices] → fp32 → apply_logits_processors               │
+│          → apply_sampling_constraints (Triton expand + TopKTopP)         │
+│  rejection:                                                              │
+│    贪心部分: argmax → rejection_greedy_sample_triton(is_greedy mask)     │
+│    随机部分: softmax → uniform → recovered (Triton kernel)               │
+│          → rejection_random_sample_*_kernel(is_greedy mask) → 返回      │
+│  特点: Triton kernel 内部通过 is_greedy 掩码区分贪心/随机请求            │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 全流程算子分析（HAS_TRITON=true, Triton 改造参考）
+
+> **目标**: 对 `RejectionSampler.forward()` → `rejection_sample()` 在 HAS_TRITON=true 路径下，每一步操作进行 **API/算子级拆解**、**运行位置标注**、**数据流形状追踪**。
+
+#### 4.2.1 算子全景总表
+
+| 序号 | 步骤 | PyTorch API / Triton Kernel | 底层算子(NPU) | 运行位置 | 输入形状 | 输出形状 | 备注 |
+|------|------|---------------------------|--------------|---------|---------|---------|------|
+| 1a | 提取 bonus logits | `logits[bonus_logits_indices]` | IndexSelect/GatherV2 | NPU-Vector | `[N+B, V]` + `[B]` | `[B, V]` | 高级索引 |
+| 1b | Bonus 采样 | `AscendSampler.forward()` | (见第一部分 3.4) | NPU-Vector | `[B, V]` fp16/bf16 | `[B, 1]` int32 | 完整传统采样流程 |
+| 2a | 提取 target logits | `logits[target_logits_indices]` | IndexSelect/GatherV2 | NPU-Vector | `[N+B, V]` + `[N]` | `[N, V]` | 高级索引 |
+| 2b | Cast fp32 | `raw_target_logits.to(fp32)` | Cast | NPU-Vector | `[N, V]` fp16/bf16 | `[N, V]` fp32 | |
+| 2c | Clone | `raw_target_logits.clone()` | Clone | NPU-Vector | `[N, V]` fp32 | `[N, V]` fp32 | 保留原始值给logprobs |
+| 3a | masked_fill_ | `logits.masked_fill_(mask, -inf)` | MaskedFill | NPU-Vector | `[N, V]` fp32 + `[N, V]` bool | `[N, V]` fp32 | allowed_token_ids白名单 |
+| 3b | bad_words | `logits[i][token_id] = -inf` | 索引赋值 | **CPU→NPU** | 逐请求 | 同输入 | CPU循环, ⚠️瓶颈 |
+| 3c | logit_bias | `logits += bias` | Add | NPU-Vector | `[N, V]` fp32 | `[N, V]` fp32 | non_argmax_invariant |
+| 3d | apply_penalties | (scatter_add + repetition + freq + pres) | 多算子 | NPU-Vector+CPU | `[N, V]` fp32 | `[N, V]` fp32 | 同传统路径 3.4 的 3d |
+| 4a | **expand temperature** | **`expand_kernel`** | **Triton JIT** | **NPU-Vector** | `[B]` fp32 + `[B]` int32 | `[N]` fp32 | batch→token 扩展 |
+| 4b | temp div | `logits.div_(temp.unsqueeze(-1))` | Unsqueeze + Div_ | NPU-Vector | `[N, V]` / `[N, 1]` | `[N, V]` fp32 | 原地温度缩放 |
+| 4c | **expand top_k** | **`expand_kernel`** | **Triton JIT** | **NPU-Vector** | `[B]` int32 + `[B]` int32 | `[N]` int32 | batch→token 扩展 |
+| 4d | **expand top_p** | **`expand_kernel`** | **Triton JIT** | **NPU-Vector** | `[B]` fp32 + `[B]` int32 | `[N]` fp32 | batch→token 扩展 |
+| 4e | top_k_top_p | `npu_apply_top_k_top_p` | **AscendC 自定义** | NPU-Vector | `[N, V]` + `[N]` + `[N]` | `[N, V]` fp32 | A2/A3; 其他走PyTorch sort |
+| 5a | 创建输出缓冲 | `torch.empty + fill_` | Empty + Fill_ | NPU-Vector | - | `[B, S+1]` int32 | PLACEHOLDER=-1 |
+| 5b | cal_grid_and_block | `get_vectorcore_num()` | Host 计算 | **Host CPU** | batch_size | (grid, block) | Triton launch 配置 |
+| 5c-i | argmax | `target_logits.argmax(dim=-1)` | ArgMaxWithValue | NPU-Vector | `[N, V]` fp32 | `[N]` int64 | 贪心路径 |
+| 5c-ii | **贪心拒绝(spec_len=1)** | **`rejection_greedy_sample_spec_len_1_triton`** | **Triton JIT** | **NPU-Vector** | `[N]` + `[N]` + `[B]` | `[B, 2]` int32 | 向量化比较 + bonus_renew_1 |
+| 5c-iii | **贪心拒绝(通用)** | **`rejection_greedy_sample_triton`** | **Triton JIT** | **NPU-Vector** | `[N]` + `[N]` + `[B]` + `[B]` | `[B, S+1]` int32 | 逐请求遍历 + bonus_renew |
+| 5d | softmax | `target_logits.softmax(dim=-1, fp32)` | SoftmaxV2 | NPU-Vector | `[N, V]` fp32 | `[N, V]` fp32 | 计算 target 概率 |
+| 5e-i | uniform_probs 分配 | `torch.empty + rand_()` | Empty + Rand | **AI-CPU** | - | `[N]` fp32 | 均匀随机数 |
+| 5e-ii | uniform per-gen | `q[i].uniform_(generator=gen)` | Rand(per-row) | **AI-CPU** | 逐请求 | `[N]` fp32 | 可复现 seed |
+| 5f-i | q 分配+exponential | `torch.empty + exponential_()` | Empty + Exponential | **AI-CPU** | - | `[B, V]` fp32 | ⚠️ AI-CPU, vocab大时慢 |
+| 5f-ii | q per-gen | `q[i].exponential_(generator=gen)` | Exponential(per-row) | **AI-CPU** | 逐请求 | `[B, V]` fp32 | 可复现 seed |
+| 5f-iii | **恢复token采样** | **`sample_recovered_tokens_kernel`** | **Triton JIT** | **NPU-Vector** | `[N,V]` + `[B,V]` + `[N]` | `[N]` int32 | grid=(B,S), SUB_BLOCK=4096 |
+| 5g-i | uniform cast | `uniform_probs.to(fp32)` | Cast | NPU-Vector | `[N]` | `[N]` fp32 | 确保 fp32 |
+| 5g-ii | **随机拒绝(逐个)** | **`rejection_random_sample_kernel`** | **Triton JIT** | **NPU-Vector** | 多输入 | `[B, S+1]` int32 | max_spec_len < 3 |
+| 5g-iii | **随机拒绝(块验证)** | **`rejection_random_sample_block_verify_kernel`** | **Triton JIT** | **NPU-Vector** | 多输入 | `[B, S+1]` int32 | max_spec_len >= 3 |
+
+> **图例**: B=batch_size, N=num_draft_tokens(展平总数), S=max_spec_len, V=vocab_size(152064 for Qwen)
+>
+> **加粗标识 Triton kernel**; 步骤 1b (Bonus采样) 内部算子详见第一部分 3.4
+>
+> **特殊分支说明**:
+> - `all_greedy=True`: 执行 5a→5c, 跳过 5d-5g
+> - `all_random=True`: 跳过 5c, 直接走 5d→5g
+> - `mixed`: 5c 和 5g 都执行, Triton kernel 通过 `is_greedy` 掩码区分请求
+
+#### 4.2.2 数据流详细追踪
+
+```
+输入: logits [N+B, V] fp16/bf16  (来自 compute_logits)
+      metadata.bonus_logits_indices [B], metadata.target_logits_indices [N]
+ │
+ ├─ 提取 Bonus Logits:
+ │   logits[bonus_logits_indices] → bonus_logits [B, V] fp16
+ │   算子: IndexSelect/GatherV2    位置: NPU-Vector
+ │   │
+ │   └─ AscendSampler.forward(bonus_logits) → bonus_token_ids [B, 1] int32
+ │       (完整传统采样流程, 详见第一部分 3.4)
+ │
+ ├─ 提取 Target Logits:
+ │   logits[target_logits_indices] → raw_target_logits [N, V] fp16
+ │   算子: IndexSelect/GatherV2    位置: NPU-Vector
+ │   │
+ │   ├─ .to(fp32) → [N, V] fp32
+ │   │   算子: Cast                 位置: NPU-Vector
+ │   │
+ │   └─ .clone() → target_logits [N, V] fp32 (新张量)
+ │       算子: Clone                位置: NPU-Vector
+ │
+ ├─ apply_logits_processors() → target_logits [N, V] fp32 (原地修改)
+ │   (同传统路径: masked_fill_ → bad_words → non_argmax → penalties)
+ │
+ ├─ apply_sampling_constraints():
+ │   │
+ │   ├─[贪心快速路径] all_greedy=True: 直接返回, 不处理
+ │   │
+ │   └─[需要约束处理]:
+ │       ├─ expand_kernel (Triton):
+ │       │   temperature[B] → expanded_temperature[N]
+ │       │   位置: NPU-Vector (Triton JIT)
+ │       │   数据流: x[B] + cu_num_draft_tokens[B] → expanded_x[N]
+ │       │   注: replace_from=0(GREEDY_TEMP) → replace_to=1
+ │       │
+ │       ├─ Div_: logits[N,V] / temperature[N,1] → logits[N,V] (原地)
+ │       │   算子: Unsqueeze + Div_   位置: NPU-Vector
+ │       │
+ │       ├─ expand_kernel (Triton): top_k[B] → expanded_top_k[N]
+ │       ├─ expand_kernel (Triton): top_p[B] → expanded_top_p[N]
+ │       │
+ │       └─ apply_top_k_top_p(logits[N,V], top_k[N], top_p[N])
+ │           A2/A3: npu_apply_top_k_top_p (AscendC)  位置: NPU-Vector
+ │           其他: PyTorch sort+mask 路径
+ │           数据流: logits[N,V] → filtered_logits[N,V] (被mask位=-inf)
+ │
+ ├─ rejection_sample():
+ │   │
+ │   ├─ Empty + Fill_: output_token_ids [B, S+1] int32 = PLACEHOLDER(-1)
+ │   │   算子: Empty + Fill_          位置: NPU-Vector
+ │   │
+ │   ├─ cal_grid_and_block_size(B): 计算 Triton launch 参数
+ │   │   位置: Host CPU
+ │   │
+ │   ├─[贪心路径] (not all_random):
+ │   │   │
+ │   │   ├─ ArgMax: target_logits[N,V] → target_argmax[N] int64
+ │   │   │   算子: ArgMaxWithValue     位置: NPU-Vector
+ │   │   │
+ │   │   ├─[spec_len=1 且 all_greedy]:
+ │   │   │   rejection_greedy_sample_spec_len_1_triton[(grid,)]:
+ │   │   │     向量化: store(target_argmax) → 逐元素比较 → bonus_renew_1
+ │   │   │     位置: NPU-Vector (Triton)
+ │   │   │     输出: output_token_ids[B, 2] 部分填充
+ │   │   │
+ │   │   └─[通用贪心]:
+ │   │       rejection_greedy_sample_triton[(grid,)]:
+ │   │         逐请求: load draft → load target_argmax → store target_argmax
+ │   │         → compare → reject时停止 → 不reject时 bonus_renew
+ │   │         位置: NPU-Vector (Triton)
+ │   │         输出: output_token_ids[B, S+1] 部分填充
+ │   │
+ │   │   └─ if all_greedy: return output_token_ids  ◀─ 快速返回
+ │   │
+ │   ├─ Softmax: target_logits[N,V] → target_probs[N,V] fp32
+ │   │   算子: SoftmaxV2              位置: NPU-Vector
+ │   │
+ │   ├─ generate_uniform_probs: → uniform_probs[N] fp32
+ │   │   算子: Empty + Rand_(uniform)  位置: **AI-CPU**
+ │   │   + 逐请求 generator 覆盖
+ │   │
+ │   ├─ sample_recovered_tokens:
+ │   │   │
+ │   │   ├─ q = Empty[B,V].exponential_()
+ │   │   │   算子: Empty + Exponential  位置: **AI-CPU**
+ │   │   │   ⚠️ AI-CPU 执行, V=152064 时耗时显著
+ │   │   │
+ │   │   ├─ 逐请求 generator 覆盖: q[i].exponential_(gen)
+ │   │   │   算子: Exponential(per-row) 位置: **AI-CPU**
+ │   │   │
+ │   │   └─ sample_recovered_tokens_kernel[(B, S)]:
+ │   │       位置: NPU-Vector (Triton JIT)
+ │   │       ├─ N-gram模式:
+ │   │       │   target_probs[pos][draft_token]=0 → 分块遍历vocab
+ │   │       │   → prob/q → argmax → 恢复原始值
+ │   │       └─ 有draft_probs:
+ │   │           max(0, target_prob - draft_prob) / q → argmax
+ │   │       输出: recovered_token_ids[N] int32
+ │   │
+ │   └─[随机路径]:
+ │       ├─ Cast: uniform_probs.to(fp32)
+ │       │   算子: Cast                位置: NPU-Vector
+ │       │
+ │       ├─[max_spec_len < 3] rejection_random_sample_kernel[(grid,)]:
+ │       │   位置: NPU-Vector (Triton JIT)
+ │       │   逻辑: 逐请求逐token:
+ │       │     load draft_token_id → load draft_prob, target_prob, uniform
+ │       │     → if draft_prob>0 && target_prob/draft_prob >= uniform: accept
+ │       │     → else: reject, 使用 recovered_token
+ │       │     → 全部accept: 追加 bonus_token
+ │       │   输出: output_token_ids[B, S+1] 完成填充
+ │       │
+ │       └─[max_spec_len >= 3] rejection_random_sample_block_verify_kernel[(grid,)]:
+ │           位置: NPU-Vector (Triton JIT)
+ │           逻辑: 逐请求:
+ │             π=1.0, u=1.0
+ │             for pos in range(num_draft):
+ │               π = min(π * target/draft, 1.0)
+ │               u = u * uniform[pos]
+ │               if draft_prob>0 && π>=u: last_accepted=pos
+ │             接受位置: store draft_token
+ │             拒绝位置: store recovered_token
+ │             全部接受: store bonus_token
+ │           输出: output_token_ids[B, S+1] 完成填充
+ │
+ └─ 返回 SamplerOutput:
+     ├─ sampled_token_ids: output_token_ids [B, S+1] int32
+     └─ logprobs_tensors: LogprobsTensors | None
+```
+
+#### 4.2.3 运行位置分布统计
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                投机推理后处理算子运行位置分布 (HAS_TRITON=true)                 │
+├──────────────┬──────────────────────────────────────────────────────────────┤
+│  NPU-Vector  │ ████████████████████████████████████████████  ~70%           │
+│  (PyTorch)   │ IndexSelect, Cast, Clone, MaskedFill, Div_, SoftmaxV2,     │
+│              │ ArgMaxWithValue, Fill_, Unsqueeze, penalties系列              │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│  NPU-Vector  │ ██████████████  ~18%                                        │
+│  (Triton)    │ expand_kernel ×3, rejection_greedy_sample_*_triton,         │
+│              │ sample_recovered_tokens_kernel,                              │
+│              │ rejection_random_sample_*_kernel                             │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│  AI-CPU      │ ██████  ~8%                                                 │
+│              │ exponential_(恢复token随机数), rand_(均匀随机数)               │
+│              │ ⚠️ B×V=152064 时单次 exponential_ 耗时显著                   │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│  Host CPU    │ ██  ~3%                                                     │
+│              │ cal_grid_and_block_size, bad_words循环,                      │
+│              │ _convert_to_tensors(H2D), pin_memory tensor构造             │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│  NPU-Cube    │ ▏ ~0%                                                       │
+│              │ 无矩阵乘算子, Cube单元空闲                                    │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│  AscendC     │ █  ~1%                                                      │
+│              │ npu_apply_top_k_top_p (A2/A3, apply_sampling_constraints)   │
+└──────────────┴──────────────────────────────────────────────────────────────┘
+```
+
+#### 4.2.4 Triton Kernel 详细说明
+
+| Kernel 名称 | grid 配置 | 功能 | 调用条件 | 核心逻辑 |
+|------------|----------|------|---------|---------|
+| `expand_kernel` | `(grid,)` | batch→token 参数扩展 | 温度/top_k/top_p 扩展 | 根据 cu_num_tokens 将 x[B] 复制到 expanded[N], 支持 replace_from→replace_to |
+| `rejection_greedy_sample_spec_len_1_triton` | `(grid,)` | spec_len=1 贪心采样 | all_greedy 且 min/max(num_draft)=1 | 向量化: store target_argmax → 逐元素比较 → 匹配时 bonus_renew_1 |
+| `rejection_greedy_sample_triton` | `(grid,)` | 通用贪心采样 | not all_random | 逐请求: 遍历 draft tokens, 首次不匹配停止, 全匹配时 bonus_renew |
+| `bonus_renew` / `bonus_renew_1` | (被调用) | 写入 bonus token | 贪心全匹配 | store bonus_token 到 output 的对应位置 |
+| `sample_recovered_tokens_kernel` | `(B, S)` | 恢复 token 采样 | 随机路径 | 分块(SUB_BLOCK=4096)遍历vocab, max(0,target-draft)/q → argmax |
+| `rejection_random_sample_kernel` | `(grid,)` | 随机逐个验证 | max_spec_len < 3 | 逐token: target/draft >= uniform → accept/reject |
+| `rejection_random_sample_block_verify_kernel` | `(grid,)` | 随机块验证 | max_spec_len >= 3 | 累积乘积: π=∏min(t/d,1), u=∏uniform, π>=u → accept |
+
+#### 4.2.5 关键性能瓶颈标注
+
+| 瓶颈点 | 原因 | 影响程度 | 优化方向 |
+|--------|------|---------|---------|
+| `exponential_()` 在 AI-CPU 执行 | [B, V] 尺寸大, AI-CPU 调度慢 | ★★★★★ | Triton 内 `tl.rand` + 变换, 或异步预计算 |
+| `generate_uniform_probs` 在 AI-CPU 执行 | rand_() 走 AI-CPU | ★★★☆☆ | Triton 内生成, 或与 rejection kernel 融合 |
+| `apply_logits_processors` 中 penalties H2D | 每步 CPU→NPU 传输 output_token_ids | ★★★★☆ | NPU 侧维护 token_ids 缓存 |
+| `apply_bad_words` CPU 循环 | Python for 循环逐请求 | ★★★★☆ | batch mask + masked_fill_ |
+| `sample_recovered_tokens_kernel` vocab 遍历 | V=152064, SUB_BLOCK=4096, 需 ~37 轮循环 | ★★★☆☆ | 增大 SUB_BLOCK 或多级 argmax |
+| Bonus 采样走完整 AscendSampler 流程 | 包含 penalties/logprobs 等不一定需要的步骤 | ★★☆☆☆ | 简化 bonus 采样专用路径 |
+
+#### 4.2.6 与传统后处理算子对比
+
+| 维度 | 传统后处理 (3.4) | 投机推理后处理 (4.2) |
+|------|-----------------|---------------------|
+| **主要算子类型** | PyTorch 原生 + 1 个 AscendC | PyTorch + AscendC + **8 个 Triton kernel** |
+| **随机数生成** | 1 次 `exponential_()` [B, V] | 1 次 `exponential_()` [B, V] + 1 次 `rand_()` [N] |
+| **Top-K/Top-P** | 1 次 (batch_size 行) | 1 次 (num_tokens 行, 通常 > batch_size) |
+| **索引操作** | 无 | 2 次高级索引 (bonus + target 提取) |
+| **batch→token 扩展** | 无 | 3 次 Triton expand_kernel |
+| **核心采样** | argmax + Gumbel-Max | argmax + Triton 拒绝采样 kernel |
+| **AI-CPU 依赖** | `exponential_()` | `exponential_()` + `rand_()` |
+| **输出形状** | `[B, 1]` | `[B, S+1]` (多 token 输出) |
 
 ---
 
@@ -2412,3 +3056,973 @@ probs.div_(q).argmax(dim=-1)  # Gumbel-Max 采样
 - 开发更多昇腾原生算子（如拒绝采样融合算子）
 - 优化 PyTorch 回退路径的性能
 - 增加更多 Triton kernel 覆盖场景
+
+---
+
+# 第六部分：GPU 投机推理后处理流程（v1 架构）
+
+> **说明**: 本部分整理 vLLM 社区 GPU 版本（v1 架构）中投机推理后处理的完整流程，结构参照第二部分（Ascend NPU 版本），便于对比。
+
+## 1. 初始化
+
+### 1.1 RejectionSampler 类定义
+
+**文件位置**: `vllm/v1/sample/rejection_sampler.py`
+
+```python
+class RejectionSampler(nn.Module):
+    def __init__(self, sampler: Sampler):
+        super().__init__()
+        self.sampler = sampler  # 复用传统采样器（GPU版Sampler）
+        logprobs_mode = self.sampler.logprobs_mode
+        self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
+        self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
+```
+
+### 1.2 RejectionSampler 在 GPUModelRunner 中的初始化
+
+**文件位置**: `vllm/v1/worker/gpu_model_runner.py:491-526`
+
+```python
+if self.speculative_config and get_pp_group().is_last_rank:
+    if self.speculative_config.method == "ngram":
+        self.drafter = NgramProposer(self.vllm_config)
+    elif self.speculative_config.uses_draft_model():
+        self.drafter = DraftModelProposer(vllm_config=self.vllm_config, device=self.device, runner=self)
+    elif self.speculative_config.method == "suffix":
+        self.drafter = SuffixDecodingProposer(self.vllm_config)
+    elif self.speculative_config.use_eagle():
+        self.drafter = EagleProposer(self.vllm_config, self.device, self)
+    elif self.speculative_config.method == "medusa":
+        self.drafter = MedusaProposer(vllm_config=self.vllm_config, device=self.device)
+    self.rejection_sampler = RejectionSampler(self.sampler)
+```
+
+### 1.3 SpecDecodeMetadata 数据结构
+
+**文件位置**: `vllm/v1/spec_decode/metadata.py`（GPU/Ascend 共用）
+
+```python
+@dataclass
+class SpecDecodeMetadata:
+    draft_token_ids: torch.Tensor       # [num_draft_tokens]
+    num_draft_tokens: list[int]         # [batch_size]
+    cu_num_draft_tokens: torch.Tensor   # [batch_size]
+    cu_num_sampled_tokens: torch.Tensor # [batch_size]
+    target_logits_indices: torch.Tensor # [num_draft_tokens]
+    bonus_logits_indices: torch.Tensor  # [batch_size]
+    logits_indices: torch.Tensor        # [total_tokens]
+
+    def __post_init__(self):
+        self.max_spec_len = max(self.num_draft_tokens)
+```
+
+---
+
+## 2. 配置
+
+### 2.1 Draft Proposer 类型（GPU）
+
+| Proposer | 文件位置 | 说明 |
+|----------|----------|------|
+| NgramProposer | `vllm/v1/spec_decode/ngram_proposer.py` | N-gram 匹配，无概率分布 |
+| EagleProposer | `vllm/v1/spec_decode/eagle.py` | EAGLE/EAGLE3 模型预测 |
+| MedusaProposer | `vllm/v1/spec_decode/medusa.py` | Medusa 多头预测 |
+| DraftModelProposer | `vllm/v1/spec_decode/draft_model.py` | 独立 Draft 模型 |
+| SuffixDecodingProposer | `vllm/v1/spec_decode/suffix_decoding.py` | 后缀解码 |
+
+### 2.2 SpecDecodeMetadata 构建（GPU 版本）
+
+**文件位置**: `vllm/v1/worker/gpu_model_runner.py:2209-2286`
+
+> **与 Ascend 版本关键差异**:
+> 1. 使用 `_get_cumsum_and_arange` 辅助函数替代手动 repeat+arange 计算
+> 2. 无 PCP 相关逻辑
+> 3. H2D 传输直接 `from_numpy().to(device)`，无需 `pin_memory()`
+
+#### 2.2.1 整体流程概览
+
+```
+_calc_spec_decode_metadata(num_draft_tokens, cu_num_scheduled_tokens)
+    │
+    ├── Step 1: 计算 num_sampled_tokens 和 cu_num_sampled_tokens + arange
+    │   └── num_sampled_tokens = num_draft_tokens + 1
+    │   └── cu_num_sampled_tokens, arange = _get_cumsum_and_arange(num_sampled_tokens)
+    │
+    ├── Step 2: 构建 logits_indices（CPU numpy 计算）
+    │   ├── logits_indices = repeat(cu_num_scheduled - num_sampled, num_sampled)
+    │   └── logits_indices += arange
+    │
+    ├── Step 3: 计算 bonus_logits_indices
+    │   └── bonus_logits_indices = cu_num_sampled_tokens - 1
+    │
+    ├── Step 4: 构建 target_logits_indices（CPU numpy 计算）
+    │   ├── cu_num_draft_tokens, arange = _get_cumsum_and_arange(num_draft_tokens)
+    │   ├── target_logits_indices = repeat(cu_num_sampled - num_sampled, num_draft)
+    │   └── target_logits_indices += arange
+    │
+    ├── Step 5: CPU→GPU 数据传输（5个张量 from_numpy + to(device)）
+    │
+    ├── Step 6: 计算 draft_token_ids（GPU 上执行）
+    │   ├── draft_token_ids = input_ids.gpu[logits_indices]
+    │   └── draft_token_ids = draft_token_ids[target_logits_indices + 1]
+    │
+    └── Step 7: 构建并返回 SpecDecodeMetadata
+```
+
+#### 2.2.2 `_get_cumsum_and_arange` 辅助函数
+
+**文件位置**: `vllm/v1/worker/gpu_model_runner.py:1329-1347`
+
+```python
+def _get_cumsum_and_arange(self, num_tokens, cumsum_dtype=None):
+    """
+    例: [2, 5, 3] -> ([2, 7, 10], [0, 1, 0, 1, 2, 3, 4, 0, 1, 2])
+    """
+    cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
+    total_num_tokens = cu_num_tokens[-1]
+    cumsums_offsets = np.repeat(cu_num_tokens - num_tokens, num_tokens)
+    arange = self.arange_np[:total_num_tokens] - cumsums_offsets
+    return cu_num_tokens, arange
+```
+
+> **对比 Ascend**: Ascend 版本在 `_calc_spec_decode_metadata` 中手动执行 repeat+arange 逻辑，GPU 版本将其封装为可复用的 `_get_cumsum_and_arange` 方法。两者数学计算完全一致。
+
+#### 2.2.3 数值示例
+
+与 Ascend 版本完全一致（参见 2.3.2），此处省略。
+
+#### 2.2.4 源码逐段分析
+
+**Step 1-2: 计算 logits_indices**
+
+```python
+# vllm/v1/worker/gpu_model_runner.py:2226-2238
+num_sampled_tokens = num_draft_tokens + 1
+cu_num_sampled_tokens, arange = self._get_cumsum_and_arange(
+    num_sampled_tokens, cumsum_dtype=np.int32
+)
+logits_indices = np.repeat(
+    cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
+)
+logits_indices += arange
+```
+
+**Step 3-4: 计算 bonus 和 target logits 索引**
+
+```python
+# vllm/v1/worker/gpu_model_runner.py:2241-2254
+bonus_logits_indices = cu_num_sampled_tokens - 1
+
+cu_num_draft_tokens, arange = self._get_cumsum_and_arange(
+    num_draft_tokens, cumsum_dtype=np.int32
+)
+target_logits_indices = np.repeat(
+    cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens
+)
+target_logits_indices += arange
+```
+
+**Step 5: CPU→GPU 传输**
+
+```python
+# vllm/v1/worker/gpu_model_runner.py:2257-2271
+cu_num_draft_tokens   = torch.from_numpy(cu_num_draft_tokens).to(self.device, non_blocking=True)
+cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(self.device, non_blocking=True)
+logits_indices        = torch.from_numpy(logits_indices).to(self.device, non_blocking=True)
+target_logits_indices = torch.from_numpy(target_logits_indices).to(self.device, non_blocking=True)
+bonus_logits_indices  = torch.from_numpy(bonus_logits_indices).to(self.device, non_blocking=True)
+```
+
+> **与 Ascend 差异**: GPU 版本直接 `from_numpy().to(device)`，CUDA 自动使用 pinned memory 路径进行异步传输。Ascend 版本需要显式 `pin_memory()` + `to(device)`。
+
+**Step 6: 获取 draft token IDs（GPU 上执行）**
+
+```python
+# vllm/v1/worker/gpu_model_runner.py:2275-2276
+draft_token_ids = self.input_ids.gpu[logits_indices]
+draft_token_ids = draft_token_ids[target_logits_indices + 1]
+```
+
+#### 2.2.5 算子全景总表
+
+| 序号 | 步骤 | API / 算子 | 运行位置 | 输入形状 | 输出形状 | 备注 |
+|------|------|-----------|---------|---------|---------|------|
+| 1 | num_sampled_tokens | `num_draft_tokens + 1` (numpy) | **CPU** | `[B]` int32 | `[B]` int32 | |
+| 2 | cu_num_sampled + arange | `_get_cumsum_and_arange()` | **CPU** | `[B]` int32 | `[B]` + `[T_s]` | 封装 cumsum+repeat+arange |
+| 3 | logits_indices(base) | `np.repeat(arr, num_sampled)` | **CPU** | `[B]` + `[B]` | `[T_s]` int32 | |
+| 4 | logits_indices(final) | `logits_indices += arange` | **CPU** | `[T_s]` + `[T_s]` | `[T_s]` int64 | |
+| 5 | bonus_logits_indices | `cu_num_sampled - 1` | **CPU** | `[B]` | `[B]` int32 | |
+| 6 | cu_num_draft + arange | `_get_cumsum_and_arange()` | **CPU** | `[B]` int32 | `[B]` + `[T_d]` | |
+| 7 | target_logits_indices | `repeat + arange` | **CPU** | `[B]` + `[T_d]` | `[T_d]` int64 | |
+| 8a-e | H2D 传输 ×5 | `from_numpy().to(device)` | **CPU→GPU** | 各不同 | 各不同 GPU tensor | non_blocking |
+| 9 | draft_token_ids(索引1) | `input_ids.gpu[logits_indices]` | **GPU** | `[max_tokens]` + `[T_s]` | `[T_s]` | IndexSelect |
+| 10 | draft_token_ids(索引2) | `[target_logits_indices + 1]` | **GPU** | `[T_s]` + `[T_d]` | `[T_d]` | Add + IndexSelect |
+
+> **图例**: B=batch_size, T_s=total_num_sampled_tokens, T_d=total_num_draft_tokens
+
+---
+
+## 3. 入口函数和执行流程
+
+### 3.1 入口函数
+
+**文件位置**: `vllm/v1/worker/gpu_model_runner.py:2927-2955`
+
+```python
+def _sample(self, logits, spec_decode_metadata):
+    sampling_metadata = self.input_batch.sampling_metadata
+    # 异步调度时用上轮采样结果更新 output_token_ids（供惩罚项计算使用）
+    self.input_batch.update_async_output_token_ids()
+    if spec_decode_metadata is None:
+        return self.sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+    # 异步调度时用上轮 draft token IDs 更新 spec_token_ids
+    # 仅在需要 output_token_ids 时执行（penalties 或 bad_words 在使用中）
+    if self.use_async_scheduling and self._draft_token_req_ids is not None:
+        draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+        self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+
+    # 投机推理后处理路径
+    sampler_output = self.rejection_sampler(
+        spec_decode_metadata,
+        None,  # draft_probs（当前 GPU 实现中始终为 None，所有 proposer 类型均不传递 draft 概率）
+        logits,
+        sampling_metadata,
+    )
+    return sampler_output
+```
+
+### 3.2 完整执行流程
+
+```
+sample_tokens() [gpu_model_runner.py:3693]
+    │
+    ├── 0. kv_connector_output 处理
+    │       ├── 非最后PP rank 时提前返回
+    │       └── PP+KV transfer 场景处理
+    │
+    ├── 1. 解包 execute_model_state（10个字段）
+    │       └── scheduler_output, logits, spec_decode_metadata,
+    │           spec_decode_common_attn_metadata, hidden_states,
+    │           sample_hidden_states, aux_hidden_states,
+    │           ec_connector_output, cudagraph_stats, slot_mappings
+    │
+    ├── 2. 应用 grammar bitmask（如有结构化输出）
+    │
+    ├── 3. 调用 _sample(logits, spec_decode_metadata)
+    │       │
+    │       ├── 3.0a update_async_output_token_ids()
+    │       │       └── 异步调度时用上轮采样结果更新 output_token_ids
+    │       │
+    │       ├── 3.0b update_async_spec_token_ids()
+    │       │       └── 异步调度时用上轮 draft token IDs 更新 spec_token_ids
+    │       │           （供惩罚项/坏词计算使用）
+    │       │
+    │       └── RejectionSampler.forward()
+    │               ├── 3.1 采样 bonus tokens
+    │               ├── 3.2 处理 target logits
+    │               ├── 3.3 rejection_sample()
+    │               └── 3.4 返回 SamplerOutput
+    │
+    ├── 4. _update_states_after_model_execute()
+    │       └── Hybrid模型（Mamba）状态更新，计算accepted tokens数
+    │
+    ├── 5. PP 异步广播 sampled_token_ids
+    │       └── _pp_broadcast_prev_sampled_token_ids()
+    │
+    ├── 6. 清理 draft token 状态
+    │       └── _draft_token_ids = None, prev_sampled_token_ids = None
+    │
+    ├── 7. Draft 提案策略分支
+    │       ├── 路径A (EAGLE/DraftModel + fit):
+    │       │       └── 在bookkeeping前直接用GPU tokens提案
+    │       ├── 路径B (EAGLE/DraftModel + 不fit):
+    │       │       ├── prepare_next_token_ids_padded()
+    │       │       └── zeros fallback + _copy_draft_token_ids_to_cpu()
+    │       └── 路径C (Ngram/Suffix):
+    │               └── 标记 propose_drafts_after_bookkeeping = True
+    │
+    ├── 8. _bookkeeping_sync()
+    │       ├── 8.1 NaN 检测 _get_nans_in_logits(logits)
+    │       ├── 8.2 丢弃请求 generator offset 回退
+    │       ├── 8.3 拷贝 req_ids（防异步修改）
+    │       ├── 8.4 同步路径: parse_output() → valid_sampled_token_ids
+    │       ├── 8.5 异步路径: 缓存 GPU tokens，延迟拷贝
+    │       ├── 8.6 更新 token_ids_cpu + num_tokens_no_spec + req_state
+    │       └── 8.7 计算 prompt_logprobs
+    │
+    ├── 9. 延迟 draft 提案（路径C: ngram等）
+    │       └── propose_draft_token_ids(valid_sampled_token_ids)
+    │
+    ├── 10. clear_kv_connector_metadata()
+    │       └── 延迟到 draft model 运行后再清理 KV 元数据
+    │
+    ├── 11. eplb_step()
+    │       └── Expert Load Balancing 步进
+    │
+    ├── 12. 构建 ModelRunnerOutput（含完整字段）
+    │       └── req_ids, req_id_to_index, sampled_token_ids,
+    │           logprobs, prompt_logprobs_dict, kv_connector_output,
+    │           ec_connector_output, num_nans_in_logits, cudagraph_stats
+    │
+    └── 13. 异步调度返回路径
+            ├── 同步: 直接返回 ModelRunnerOutput
+            └── 异步: AsyncGPUModelRunnerOutput 构建
+                    └── set_async_sampled_token_ids()（保存异步拷贝引用）
+```
+
+### 3.3 RejectionSampler.forward() 详细流程
+
+**文件位置**: `vllm/v1/sample/rejection_sampler.py:60-166`（GPU/Ascend 共用）
+
+```python
+def forward(self, metadata, draft_probs, logits, sampling_metadata):
+    # 1. 提取 bonus logits 并采样 bonus tokens
+    bonus_logits = logits[metadata.bonus_logits_indices]
+    bonus_sampler_output = self.sampler(
+        logits=bonus_logits,
+        sampling_metadata=replace(sampling_metadata, max_num_logprobs=-1),
+        predict_bonus_token=True,
+        # 覆盖 logprobs 模式，后续需要 logits 来计算 accepted token logprobs
+        logprobs_mode_override="processed_logits"
+            if self.is_processed_logprobs_mode else "raw_logits",
+    )
+    bonus_token_ids = bonus_sampler_output.sampled_token_ids
+
+    # 2. 提取并处理 target logits
+    raw_target_logits = logits[metadata.target_logits_indices]
+    raw_target_logits = raw_target_logits.to(torch.float32)
+    target_logits = raw_target_logits
+    if not self.is_processed_logprobs_mode:
+        # 仅在非 processed logprobs 模式下 clone，保留原始 raw_target_logits
+        # 用于后续 logprobs 计算（因为 apply_logits_processors 会原地修改）
+        target_logits = target_logits.clone()
+    target_logits = self.apply_logits_processors(target_logits, sampling_metadata, metadata)
+    target_logits = apply_sampling_constraints(
+        target_logits, metadata.cu_num_draft_tokens, sampling_metadata
+    )
+
+    # 3. 执行拒绝采样
+    output_token_ids = rejection_sample(...)
+
+    # 4. 计算 logprobs（如果需要）
+    if sampling_metadata.max_num_logprobs is not None:
+        logprobs_tensors = self._get_logprobs_tensors(
+            ...,
+            # 关键：根据 logprobs 模式选择传入 processed 或 raw target logits
+            target_logits if self.is_processed_logprobs_mode else raw_target_logits,
+            bonus_sampler_output.logprobs_tensors.logprobs,
+            output_token_ids,
+        )
+
+    return SamplerOutput(sampled_token_ids=output_token_ids, logprobs_tensors=logprobs_tensors)
+```
+
+---
+
+## 4. 功能流程与算子分析
+
+### 4.1 RejectionSampler.forward() + rejection_sample() 详细流程
+
+#### 4.1.1 整体流程概览
+
+```
+forward(metadata, draft_probs, logits, sampling_metadata)
+    │
+    ├── Step 1: 提取 Bonus Logits 并采样 Bonus Token
+    │   ├── bonus_logits = logits[metadata.bonus_logits_indices]        # IndexSelect
+    │   ├── replace(sampling_metadata, max_num_logprobs=-1)
+    │   ├── logprobs_mode_override="processed_logits"/"raw_logits"     # 覆盖logprobs模式
+    │   └── bonus_token_ids = self.sampler(bonus_logits, ...)           # 完整 Sampler.forward()
+    │
+    ├── Step 2: 提取 Target Logits
+    │   ├── raw_target_logits = logits[metadata.target_logits_indices]  # IndexSelect
+    │   ├── raw_target_logits = raw_target_logits.to(float32)           # Cast
+    │   ├── target_logits = raw_target_logits                           # 默认共享引用
+    │   └── if not is_processed_logprobs_mode:                          # 条件 Clone
+    │       └── target_logits = target_logits.clone()                   # 保留raw用于logprobs
+    │
+    ├── Step 3: 应用 Logits Processors (apply_logits_processors)
+    │   ├── 3a. _combine_outputs_with_spec_tokens()                    # 合并历史+draft tokens
+    │   ├── 3b. 计算 repeat_indices (batch→token 索引映射)
+    │   │   └── original_indices.repeat_interleave(num_draft_tokens)   # CPU→GPU
+    │   ├── 3c. apply_penalties(repeat_indices) → apply_all_penalties  # repetition/freq/pres
+    │   ├── 3d. allowed_token_ids_mask[repeat_indices] → masked_fill_(-inf)
+    │   ├── 3e. apply_bad_words_with_drafts()
+    │   └── 3f. non_argmax_invariant: MinTokensLogitsProcessor.apply_with_spec_decode()
+    │
+    ├── Step 4: apply_sampling_constraints()
+    │   ├── expand_batch_to_tokens(temperature) → expand_kernel (Triton)
+    │   ├── logits.div_(temperature.unsqueeze(-1))
+    │   ├── expand_batch_to_tokens(top_k) → expand_kernel (Triton)
+    │   ├── expand_batch_to_tokens(top_p) → expand_kernel (Triton)
+    │   └── apply_top_k_top_p(logits, top_k, top_p)
+    │       ├── batch >= 8: apply_top_k_top_p_triton (Triton kernel)
+    │       └── batch < 8: apply_top_k_top_p_pytorch (sort+mask)
+    │
+    ├── Step 5: rejection_sample()  [核心拒绝采样]
+    │   ├── 5a. 创建输出缓冲区 [B, S+1], fill_(PLACEHOLDER)
+    │   │
+    │   ├── 5b. 贪心路径 (if not all_random):
+    │   │   ├── target_argmax = target_logits.argmax(dim=-1)
+    │   │   └── rejection_greedy_sample_kernel[(batch_size,)]  (Triton)
+    │   │       逻辑: 逐请求遍历 draft tokens, 首次不匹配即拒绝
+    │   │              全部匹配时追加 bonus token
+    │   │   └── if all_greedy: return  ◀─ 快速返回
+    │   │
+    │   ├── 5c. target_probs = target_logits.softmax(dim=-1, fp32)
+    │   │
+    │   ├── 5d. uniform_probs = generate_uniform_probs()
+    │   │   └── torch.rand([N], dtype=float64, device=cuda)
+    │   │
+    │   ├── 5e. recovered_token_ids = sample_recovered_tokens()
+    │   │   ├── q = torch.empty([B, V], fp32).exponential_()
+    │   │   ├── inv_q = q.reciprocal()  ◀─ GPU特有：预计算倒数
+    │   │   └── sample_recovered_tokens_kernel[(B, S)]  (Triton)
+    │   │       逻辑: 分块遍历 vocab, prob * inv_q → argmax
+    │   │
+    │   └── 5f. rejection_random_sample_kernel[(batch_size,)]  (Triton)
+    │       逻辑: 逐请求逐 token:
+    │         target_prob / draft_prob >= uniform → accept
+    │         else → reject, 使用 recovered_token
+    │         全部 accept → 追加 bonus_token
+    │
+    ├── Step 6: 计算 logprobs（可选）
+    │   └── _get_logprobs_tensors(...)
+    │
+    └── Step 7: 返回 SamplerOutput
+            ├── sampled_token_ids: [B, S+1] int32
+            └── logprobs_tensors: LogprobsTensors | None
+```
+
+> **符号说明**: B=batch_size, N=num_draft_tokens(展平总数), S=max_spec_len, V=vocab_size
+
+#### 4.1.2 Step 1: Bonus Token 采样
+
+```python
+# vllm/v1/sample/rejection_sampler.py:93-115
+bonus_logits = logits[metadata.bonus_logits_indices]  # [B, V]
+bonus_sampler_output = self.sampler(
+    logits=bonus_logits,
+    sampling_metadata=replace(sampling_metadata, max_num_logprobs=-1),
+    predict_bonus_token=True,
+    logprobs_mode_override="processed_logits" if ... else "raw_logits"
+)
+bonus_token_ids = bonus_sampler_output.sampled_token_ids  # [B, 1]
+```
+
+> **GPU Sampler.forward() 完整流程**:
+> 1. compute_logprobs(logits) — 如需 logprobs
+> 2. logits.to(float32) — 精度转换
+> 3. apply_logits_processors() — 白名单/坏词/惩罚项
+> 4. sample() — 贪心 argmax 或温度+Top-K/Top-P+Gumbel-Max
+> 5. gather_logprobs() — 收集 top-k logprobs
+
+#### 4.1.3 Step 4: apply_sampling_constraints()（GPU 版本）
+
+**文件位置**: `vllm/v1/sample/rejection_sampler.py:451-506`
+
+```python
+def apply_sampling_constraints(logits, cu_num_draft_tokens, sampling_metadata):
+    if sampling_metadata.all_greedy:
+        return logits  # 贪心快速路径
+
+    # Triton expand_kernel 将 batch 参数扩展到 token 级别
+    temperature = expand_batch_to_tokens(
+        sampling_metadata.temperature, cu_num_draft_tokens, num_tokens,
+        replace_from=GREEDY_TEMPERATURE, replace_to=1,
+    )
+    logits.div_(temperature.unsqueeze(-1))  # 原地温度缩放
+
+    top_k = expand_batch_to_tokens(sampling_metadata.top_k, ...) if top_k else None
+    top_p = expand_batch_to_tokens(sampling_metadata.top_p, ...) if top_p else None
+
+    return apply_top_k_top_p(logits, top_k, top_p)
+```
+
+**apply_top_k_top_p 的 GPU 路径选择**:
+
+```python
+# vllm/v1/sample/ops/topk_topp_sampler.py:245-255
+def apply_top_k_top_p(logits, k, p):
+    if p is None and k is None:
+        return logits
+    if HAS_TRITON and logits.shape[0] >= 8:
+        return apply_top_k_top_p_triton(logits, k, p)  # Triton 高性能路径
+    return apply_top_k_top_p_pytorch(logits, k, p)      # PyTorch sort+mask 回退
+```
+
+> **与 Ascend 差异**: GPU 版 `apply_top_k_top_p` 在 batch≥8 时使用 Triton kernel (`topk_topp_triton.py`)，小 batch 使用 PyTorch `sort+mask`。Ascend 版在 A2/A3 上使用 `npu_apply_top_k_top_p` 昇腾原生算子。
+
+#### 4.1.4 Step 5: rejection_sample() 核心流程
+
+**文件位置**: `vllm/v1/sample/rejection_sampler.py:350-448`
+
+```python
+def rejection_sample(draft_token_ids, num_draft_tokens, max_spec_len,
+                     cu_num_draft_tokens, draft_probs, target_logits,
+                     bonus_token_ids, sampling_metadata):
+    # 5a. 创建输出缓冲区
+    output_token_ids = torch.full(
+        (batch_size, max_spec_len + 1), PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32, device=device)
+
+    # 5b. 贪心路径
+    if not sampling_metadata.all_random:
+        target_argmax = target_logits.argmax(dim=-1)
+        rejection_greedy_sample_kernel[(batch_size,)](
+            output_token_ids, cu_num_draft_tokens, draft_token_ids,
+            target_argmax, bonus_token_ids, is_greedy, max_spec_len)
+        if sampling_metadata.all_greedy:
+            return output_token_ids  # 快速返回
+
+    # 5c. 计算 target 概率分布
+    target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+
+    # 5d. 生成均匀随机数
+    uniform_probs = generate_uniform_probs(...)  # [N] float64
+
+    # 5e. 预计算恢复 tokens
+    recovered_token_ids = sample_recovered_tokens(...)
+
+    # 5f. 随机拒绝采样
+    rejection_random_sample_kernel[(batch_size,)](
+        output_token_ids, cu_num_draft_tokens, draft_token_ids,
+        draft_probs, target_probs, bonus_token_ids,
+        recovered_token_ids, uniform_probs, is_greedy,
+        max_spec_len, vocab_size, NO_DRAFT_PROBS=draft_probs is None)
+    return output_token_ids
+```
+
+#### 4.1.5 sample_recovered_tokens()（GPU 版本）
+
+**文件位置**: `vllm/v1/sample/rejection_sampler.py:604-648`
+
+```python
+def sample_recovered_tokens(max_spec_len, num_draft_tokens, cu_num_draft_tokens,
+                            draft_token_ids, draft_probs, target_probs,
+                            sampling_metadata, device):
+    batch_size = len(num_draft_tokens)
+    vocab_size = target_probs.shape[-1]
+    q = torch.empty((batch_size, vocab_size), dtype=torch.float32, device=device)
+    q.exponential_()
+    for i, generator in sampling_metadata.generators.items():
+        if num_draft_tokens[i] > 0:
+            q[i].exponential_(generator=generator)
+
+    inv_q = q.reciprocal()  # ◀─ GPU特有：预计算倒数，避免kernel内除法
+
+    recovered_token_ids = torch.empty_like(draft_token_ids)
+    BLOCK_SIZE = 8192
+    sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
+        recovered_token_ids, cu_num_draft_tokens, draft_token_ids,
+        draft_probs, target_probs, inv_q,
+        vocab_size, BLOCK_SIZE, NO_DRAFT_PROBS=draft_probs is None)
+    return recovered_token_ids
+```
+
+> **与 Ascend 差异**:
+> - GPU 使用 `q.reciprocal()` 预计算 `inv_q`，kernel 内执行 `prob * inv_q`（乘法）
+> - Ascend 传入原始 `q`，kernel 内执行 `prob / q`（除法）
+> - GPU `BLOCK_SIZE=8192`，Ascend `SUB_BLOCK=4096`
+> - GPU 的 `exponential_()` 在 CUDA 上高效执行；Ascend 走 AI-CPU，是性能瓶颈
+
+#### 4.1.6 执行路径总结
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ RejectionSampler.forward() + rejection_sample() 执行路径 (GPU v1)       │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  路径 A: 全部贪心 (all_greedy=True)                                      │
+│  ─────────────────────────────────────                                   │
+│  bonus: Sampler.forward(bonus_logits)                                    │
+│  target: logits[indices] → fp32 → apply_logits_processors               │
+│  rejection: argmax → rejection_greedy_sample_kernel → 返回               │
+│  特点: 跳过 softmax/uniform/recovered, 无随机采样路径                     │
+│                                                                          │
+│  路径 B: 全部随机 (all_random=True)                                      │
+│  ─────────────────────────────────────                                   │
+│  bonus: Sampler.forward(bonus_logits)                                    │
+│  target: logits[indices] → fp32 → apply_logits_processors               │
+│          → apply_sampling_constraints (Triton expand + TopK/TopP)        │
+│  rejection: softmax → uniform → recovered (Triton kernel)                │
+│          → rejection_random_sample_kernel → 返回                         │
+│  特点: 跳过贪心 argmax 路径                                              │
+│                                                                          │
+│  路径 C: 混合模式 (部分贪心 + 部分随机)                                   │
+│  ─────────────────────────────────────                                   │
+│  bonus: Sampler.forward(bonus_logits)                                    │
+│  target: logits[indices] → fp32 → apply_logits_processors               │
+│          → apply_sampling_constraints (Triton expand + TopK/TopP)        │
+│  rejection:                                                              │
+│    贪心部分: argmax → rejection_greedy_sample_kernel(is_greedy mask)     │
+│    随机部分: softmax → uniform → recovered (Triton kernel)               │
+│          → rejection_random_sample_kernel(is_greedy mask) → 返回        │
+│  特点: Triton kernel 内部通过 is_greedy 掩码区分贪心/随机请求            │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 全流程算子分析
+
+#### 4.2.1 算子全景总表
+
+| 序号 | 步骤 | PyTorch API / Triton Kernel | 运行位置 | 输入形状 | 输出形状 | 备注 |
+|------|------|---------------------------|---------|---------|---------|------|
+| 1a | 提取 bonus logits | `logits[bonus_logits_indices]` | **GPU** | `[N+B, V]` + `[B]` | `[B, V]` | IndexSelect |
+| 1b | Bonus 采样 | `Sampler.forward()` | **GPU** | `[B, V]` | `[B, 1]` int32 | 完整传统采样流程 |
+| 2a | 提取 target logits | `logits[target_logits_indices]` | **GPU** | `[N+B, V]` + `[N]` | `[N, V]` | IndexSelect |
+| 2b | Cast fp32 | `.to(fp32)` | **GPU** | `[N, V]` fp16/bf16 | `[N, V]` fp32 | |
+| 2c | 条件 Clone | `.clone()` (仅 `not is_processed_logprobs_mode`) | **GPU** | `[N, V]` fp32 | `[N, V]` fp32 | 保留 raw logits 用于 logprobs |
+| 3a | _combine_outputs | `_combine_outputs_with_spec_tokens()` | **CPU** | `list[list[int]]` ×2 | `list[list[int]]` | 合并历史+draft tokens |
+| 3b | repeat_indices | `repeat_interleave(num_draft_tokens)` | **CPU→GPU** | `[B]` int64 | `[N]` int64 | batch→token 索引映射 |
+| 3c | apply_penalties | `apply_all_penalties(repeat_indices)` | **GPU** | `[N, V]` fp32 | `[N, V]` fp32 | repetition/freq/pres |
+| 3d | masked_fill_ | `mask[repeat_indices] → masked_fill_(-inf)` | **GPU** | `[N, V]` fp32 | `[N, V]` fp32 | allowed_token_ids |
+| 3e | bad_words | `apply_bad_words_with_drafts()` | **GPU** | 逐请求 | 同输入 | |
+| 3f | non_argmax_invariant | `MinTokensLogitsProcessor.apply_with_spec_decode()` | **GPU** | `[N, V]` fp32 | `[N, V]` fp32 | spec_decode 专用接口 |
+| 4a | **expand temperature** | **`expand_kernel`** | **GPU (Triton)** | `[B]` fp32 + `[B]` int32 | `[N]` fp32 | batch→token |
+| 4b | temp div | `logits.div_(temp.unsqueeze(-1))` | **GPU** | `[N, V]` / `[N, 1]` | `[N, V]` fp32 | 原地 |
+| 4c | **expand top_k** | **`expand_kernel`** | **GPU (Triton)** | `[B]` + `[B]` | `[N]` | 可选 |
+| 4d | **expand top_p** | **`expand_kernel`** | **GPU (Triton)** | `[B]` + `[B]` | `[N]` | 可选 |
+| 4e | top_k_top_p | `apply_top_k_top_p_triton` 或 `_pytorch` | **GPU (Triton/CUDA)** | `[N, V]` + `[N]` + `[N]` | `[N, V]` fp32 | batch≥8用Triton |
+| 5a | 创建输出缓冲 | `torch.full + fill_` | **GPU** | - | `[B, S+1]` int32 | PLACEHOLDER=-1 |
+| 5b-i | argmax | `target_logits.argmax(dim=-1)` | **GPU** | `[N, V]` fp32 | `[N]` int64 | 贪心路径 |
+| 5b-ii | **贪心拒绝** | **`rejection_greedy_sample_kernel`** | **GPU (Triton)** | `[N]` + `[N]` + `[B]` | `[B, S+1]` int32 | 逐请求遍历 |
+| 5c | softmax | `.softmax(dim=-1, fp32)` | **GPU** | `[N, V]` fp32 | `[N, V]` fp32 | 随机路径 |
+| 5d | uniform_probs | `torch.rand([N], fp64)` | **GPU (CUDA)** | - | `[N]` fp64 | + per-gen 覆盖 |
+| 5e-i | q + exponential | `torch.empty + exponential_()` | **GPU (CUDA)** | - | `[B, V]` fp32 | CUDA 原生高效 |
+| 5e-ii | inv_q | `q.reciprocal()` | **GPU** | `[B, V]` fp32 | `[B, V]` fp32 | 预计算倒数 |
+| 5e-iii | **恢复token采样** | **`sample_recovered_tokens_kernel`** | **GPU (Triton)** | `[N,V]` + `[B,V]` | `[N]` int32 | grid=(B,S), BLOCK=8192 |
+| 5f | **随机拒绝** | **`rejection_random_sample_kernel`** | **GPU (Triton)** | 多输入 | `[B, S+1]` int32 | 逐token验证 |
+
+> **图例**: B=batch_size, N=num_draft_tokens(展平总数), S=max_spec_len, V=vocab_size
+>
+> **特殊分支**:
+> - `all_greedy=True`: 执行 5a→5b, 跳过 5c-5f
+> - `all_random=True`: 跳过 5b, 直接走 5c→5f
+> - `mixed`: 5b 和 5f 都执行, Triton kernel 通过 `is_greedy` 掩码区分
+
+#### 4.2.2 数据流详细追踪
+
+```
+输入: logits [N+B, V] fp16/bf16  (来自 compute_logits)
+      metadata.bonus_logits_indices [B], metadata.target_logits_indices [N]
+ │
+ ├─ 提取 Bonus Logits:
+ │   logits[bonus_logits_indices] → bonus_logits [B, V]
+ │   算子: IndexSelect          位置: GPU
+ │   │
+ │   └─ Sampler.forward(bonus_logits) → bonus_token_ids [B, 1] int32
+ │       (完整传统采样流程: fp32→logits_processors→sample→logprobs)
+ │
+ ├─ 提取 Target Logits:
+ │   logits[target_logits_indices] → raw_target_logits [N, V]
+ │   算子: IndexSelect          位置: GPU
+ │   │
+ │   ├─ .to(fp32) → [N, V] fp32
+ │   │   算子: Cast              位置: GPU
+ │   │
+ │   └─ .clone() → target_logits [N, V] fp32
+ │       算子: Clone             位置: GPU
+ │
+ ├─ apply_logits_processors() → target_logits [N, V] fp32 (原地修改)
+ │   ├─ allowed_token_ids_mask → masked_fill_(-inf)
+ │   ├─ apply_bad_words_with_drafts()
+ │   ├─ non_argmax_invariant 处理器 (MinTokensLogitsProcessor等)
+ │   └─ apply_all_penalties (repetition/frequency/presence)
+ │
+ ├─ apply_sampling_constraints():
+ │   │
+ │   ├─[贪心快速路径] all_greedy=True: 直接返回
+ │   │
+ │   └─[需要约束处理]:
+ │       ├─ expand_kernel (Triton): temperature[B] → [N]
+ │       │   replace_from=0(GREEDY_TEMP) → replace_to=1
+ │       │
+ │       ├─ Div_: logits[N,V] / temperature[N,1] → logits[N,V] (原地)
+ │       │
+ │       ├─ expand_kernel (Triton): top_k[B] → [N]  (如有)
+ │       ├─ expand_kernel (Triton): top_p[B] → [N]  (如有)
+ │       │
+ │       └─ apply_top_k_top_p(logits[N,V], top_k[N], top_p[N])
+ │           ├─ batch≥8: Triton kernel (sort-free)
+ │           └─ batch<8: PyTorch sort+mask
+ │
+ ├─ rejection_sample():
+ │   │
+ │   ├─ torch.full: output_token_ids [B, S+1] int32 = PLACEHOLDER(-1)
+ │   │
+ │   ├─[贪心路径] (not all_random):
+ │   │   ├─ ArgMax: target_logits[N,V] → target_argmax[N] int64
+ │   │   │
+ │   │   └─ rejection_greedy_sample_kernel[(batch_size,)]:
+ │   │       位置: GPU (Triton JIT)
+ │   │       逐请求: 遍历 draft tokens
+ │   │         load draft_token → load target_argmax → store target_argmax
+ │   │         → 比较 → 不匹配时停止 → 全匹配追加 bonus_token
+ │   │       输出: output_token_ids[B, S+1] 部分填充
+ │   │
+ │   │   └─ if all_greedy: return output_token_ids  ◀─ 快速返回
+ │   │
+ │   ├─ Softmax: target_logits[N,V] → target_probs[N,V] fp32
+ │   │
+ │   ├─ generate_uniform_probs: → uniform_probs[N] fp64
+ │   │   算子: torch.rand(fp64)     位置: GPU (CUDA)
+ │   │   + 逐请求 generator 覆盖
+ │   │
+ │   ├─ sample_recovered_tokens:
+ │   │   ├─ q = Empty[B,V].exponential_()
+ │   │   │   算子: Exponential       位置: GPU (CUDA, 高效)
+ │   │   ├─ inv_q = q.reciprocal()
+ │   │   │   算子: Reciprocal        位置: GPU
+ │   │   └─ sample_recovered_tokens_kernel[(B, S)]:
+ │   │       位置: GPU (Triton JIT)
+ │   │       分块遍历 vocab (BLOCK=8192):
+ │   │         N-gram: target_probs[draft_token]=0 → prob * inv_q → argmax
+ │   │         有draft_probs: max(0, target-draft) * inv_q → argmax
+ │   │       输出: recovered_token_ids[N] int32
+ │   │
+ │   └─[随机路径]:
+ │       rejection_random_sample_kernel[(batch_size,)]:
+ │         位置: GPU (Triton JIT)
+ │         逐请求逐token:
+ │           draft_prob>0 && target_prob/draft_prob >= uniform → accept
+ │           else → reject, 使用 recovered_token
+ │           全部 accept → 追加 bonus_token
+ │         输出: output_token_ids[B, S+1] 完成填充
+ │
+ └─ 返回 SamplerOutput:
+     ├─ sampled_token_ids: output_token_ids [B, S+1] int32
+     └─ logprobs_tensors: LogprobsTensors | None
+```
+
+#### 4.2.3 运行位置分布统计
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  GPU 投机推理后处理算子运行位置分布                             │
+├──────────────┬──────────────────────────────────────────────────────────────┤
+│  GPU-CUDA    │ ████████████████████████████████████████████████  ~75%       │
+│  (PyTorch)   │ IndexSelect, Cast, Clone, MaskedFill, Div_, SoftmaxV2,     │
+│              │ ArgMax, Fill_, Exponential_, Reciprocal, penalties系列        │
+│              │ ✅ exponential_() 在 CUDA 上高效执行                          │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│  GPU-CUDA    │ ██████████████████  ~22%                                    │
+│  (Triton)    │ expand_kernel ×3, apply_top_k_top_p_triton,                │
+│              │ rejection_greedy_sample_kernel,                              │
+│              │ sample_recovered_tokens_kernel,                              │
+│              │ rejection_random_sample_kernel                               │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│  Host CPU    │ █  ~2%                                                      │
+│              │ _get_cumsum_and_arange (numpy), bad_words处理,              │
+│              │ H2D传输 (from_numpy → to(device))                           │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│  GPU-Tensor  │ ▏ ~1% (batch<8时 apply_top_k_top_p_pytorch sort路径)       │
+│  Core        │ sort + mask + scatter                                       │
+└──────────────┴──────────────────────────────────────────────────────────────┘
+```
+
+#### 4.2.4 Triton Kernel 详细列表
+
+| Kernel 名称 | grid 配置 | 功能 | 核心逻辑 |
+|------------|----------|------|---------|
+| `expand_kernel` | `(batch_size,)` | batch→token 参数扩展 | 根据 cu_num_tokens 将 x[B] 复制到 expanded[N], 支持 replace_from→replace_to |
+| `rejection_greedy_sample_kernel` | `(batch_size,)` | 贪心拒绝采样 | 逐请求: 遍历 draft tokens, 首次不匹配停止, 全匹配时追加 bonus |
+| `sample_recovered_tokens_kernel` | `(B, max_spec_len)` | 恢复 token 采样 | 分块(BLOCK=8192)遍历vocab, max(0,target-draft)*inv_q → argmax |
+| `rejection_random_sample_kernel` | `(batch_size,)` | 随机拒绝采样 | 逐token: target/draft >= uniform → accept/reject |
+| `apply_top_k_top_p_triton` | (内部计算) | Top-K + Top-P 过滤 | Triton 实现的 sort+mask+filter (batch≥8时启用) |
+
+> **与 Ascend Triton Kernel 对比**:
+>
+> | 特性 | GPU | Ascend |
+> |------|-----|--------|
+> | 贪心 kernel 数量 | 1 个通用 | 2 个 (spec_len=1 优化 + 通用) |
+> | 随机 kernel 数量 | 1 个通用 | 2 个 (逐个验证 + block verify) |
+> | block verify | ❌ | ✅ max_spec_len≥3 时使用 |
+> | grid 配置 | `(batch_size,)` | `cal_grid_and_block_size()` 动态计算 |
+> | recovered kernel BLOCK | 8192 | 4096 (SUB_BLOCK) |
+> | inv_q 预计算 | ✅ `reciprocal()` | ❌ kernel 内除法 |
+
+---
+
+## 5. 数据流程
+
+### 5.1 完整数据流
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ execute_model() 完成                                            │
+│ 输出: hidden_states [num_tokens, hidden_size]                   │
+└─────────────────────┬───────────────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ compute_logits()                                                │
+│ logits = model.compute_logits(hidden_states)                    │
+│ 输出: logits [num_tokens + batch_size, vocab_size]              │
+└─────────────────────┬───────────────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ sample_tokens()                                                 │
+│                                                                 │
+│ 0. kv_connector_output 处理                                     │
+│    ├── PP 非最后 rank: 提前返回 None / EMPTY_MODEL_RUNNER_OUTPUT │
+│    └── PP+KV transfer: 封装 kv_connector_output 返回            │
+│                                                                 │
+│ 1. 解包 execute_model_state（10个字段）                          │
+│    scheduler_output, logits, spec_decode_metadata,              │
+│    spec_decode_common_attn_metadata, hidden_states,             │
+│    sample_hidden_states, aux_hidden_states,                     │
+│    ec_connector_output, cudagraph_stats, slot_mappings          │
+│                                                                 │
+│ 2. 应用 grammar bitmask（结构化输出）                            │
+│                                                                 │
+│ 3. _sample(logits, spec_decode_metadata)                        │
+│    ├── update_async_output_token_ids()  [异步调度]              │
+│    ├── update_async_spec_token_ids()    [异步调度+draft tokens]  │
+│    └── RejectionSampler.forward()                               │
+│        ├── bonus_logits → Sampler → bonus_token_ids [B, 1]     │
+│        ├── target_logits → processors → constraints             │
+│        └── rejection_sample() → output_token_ids [B, S+1]      │
+│                                                                 │
+│ 4. _update_states_after_model_execute()  [Hybrid模型状态更新]   │
+│                                                                 │
+│ 5. PP 异步广播 _pp_broadcast_prev_sampled_token_ids()           │
+│                                                                 │
+│ 6. 清理 _draft_token_ids, prev_sampled_token_ids = None        │
+└─────────────────────┬───────────────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 7. Draft 提案策略分支                                           │
+│ ┌───────────────────────────────────────────────────────────┐   │
+│ │ 路径A: EAGLE/DraftModel + input fits                      │   │
+│ │ → bookkeeping 前直接 propose_draft_token_ids(GPU tokens)  │   │
+│ ├───────────────────────────────────────────────────────────┤   │
+│ │ 路径B: EAGLE/DraftModel + input 不 fit                    │   │
+│ │ → prepare_next_token_ids_padded() + zeros fallback        │   │
+│ │ → _copy_draft_token_ids_to_cpu(zeros_only=True)           │   │
+│ ├───────────────────────────────────────────────────────────┤   │
+│ │ 路径C: Ngram/Suffix 等                                    │   │
+│ │ → propose_drafts_after_bookkeeping = True (延迟提案)      │   │
+│ └───────────────────────────────────────────────────────────┘   │
+└─────────────────────┬───────────────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 8. _bookkeeping_sync()                                          │
+│ ├── NaN 检测: _get_nans_in_logits(logits)                       │
+│ ├── 丢弃请求: generator offset 回退                             │
+│ ├── 拷贝 req_ids（防异步修改）                                   │
+│ ├── 同步路径: parse_output() → valid_sampled_token_ids          │
+│ │   └── 过滤 PLACEHOLDER(-1) 和越界 token → list[list[int]]     │
+│ ├── 异步路径: 缓存 GPU tokens，延迟拷贝                         │
+│ ├── 更新 token_ids_cpu + num_tokens_no_spec + req_state         │
+│ └── 计算 prompt_logprobs: _get_prompt_logprobs_dict()           │
+└─────────────────────┬───────────────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 9. 延迟 draft 提案（路径C: ngram等，用 CPU tokens）              │
+│    propose_draft_token_ids(valid_sampled_token_ids)              │
+│                                                                 │
+│ 10. clear_kv_connector_metadata()                               │
+│     延迟到 draft model 运行后再清理 KV 元数据                    │
+│                                                                 │
+│ 11. eplb_step()  Expert Load Balancing 步进                      │
+└─────────────────────┬───────────────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ 12. 构建 ModelRunnerOutput                                      │
+│ ├── req_ids, req_id_to_index                                    │
+│ ├── sampled_token_ids: list[list[int]]                          │
+│ ├── logprobs, prompt_logprobs_dict                              │
+│ ├── kv_connector_output, ec_connector_output                    │
+│ ├── num_nans_in_logits, cudagraph_stats                         │
+│ └── draft_token_ids: 下一轮的 draft tokens                      │
+├─────────────────────────────────────────────────────────────────┤
+│ 13. 异步调度返回路径                                             │
+│ ├── 同步: 直接返回 ModelRunnerOutput                             │
+│ └── 异步: AsyncGPUModelRunnerOutput                              │
+│     ├── 封装 sampled_token_ids(GPU), logprobs_tensors           │
+│     ├── invalid_req_indices, async_output_copy_stream           │
+│     └── set_async_sampled_token_ids() 保存异步拷贝引用          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 张量形状变化
+
+```
+hidden_states: [num_tokens, hidden_size]
+      ↓ compute_logits()
+logits: [num_tokens + batch_size, vocab_size]
+      ↓
+      ├── bonus_logits: [batch_size, vocab_size]
+      │     ↓ sampler()
+      │   bonus_token_ids: [batch_size, 1]
+      │
+      └── target_logits: [num_draft_tokens, vocab_size]
+            ↓ apply_sampling_constraints()
+          processed_target_logits: [num_draft_tokens, vocab_size]
+            ↓ rejection_sample()
+          output_token_ids: [batch_size, max_spec_len + 1]
+            ↓ parse_output()
+          valid_sampled_token_ids: list[list[int]]
+```
+
+---
+
+## 6. GPU vs Ascend 投机推理后处理对比总结
+
+### 6.1 SpecDecodeMetadata 构建差异
+
+| 特性 | GPU | Ascend |
+|------|-----|--------|
+| 文件位置 | `gpu_model_runner.py:2209-2286` | `model_runner_v1.py:856-932` |
+| cumsum+arange | `_get_cumsum_and_arange` 封装方法 | 手动内联计算 |
+| PCP 支持 | ❌ | ✅ `num_pcp_pads` 参数修正 |
+| H2D 传输 | `from_numpy().to(device)` | `from_numpy().pin_memory().to(device)` |
+
+### 6.2 apply_sampling_constraints 差异
+
+| 特性 | GPU | Ascend |
+|------|-----|--------|
+| temperature 扩展 | Triton `expand_kernel` | Triton `expand_kernel` (HAS_TRITON) |
+| Top-K/Top-P | `apply_top_k_top_p_triton` (batch≥8) 或 PyTorch sort | `npu_apply_top_k_top_p` 昇腾原生算子 (A2/A3) |
+| 回退路径 | PyTorch sort+mask+scatter | PyTorch sort 实现 |
+
+### 6.3 rejection_sample 差异
+
+| 特性 | GPU | Ascend |
+|------|-----|--------|
+| 贪心 Triton kernel | 1 个通用 kernel | 2 个 (spec_len=1 优化 + 通用 + bonus_renew) |
+| 随机 Triton kernel | 1 个通用 kernel | 2 个 (逐个验证 + block verify) |
+| block verify 优化 | ❌ | ✅ max_spec_len≥3 时累积乘积验证 |
+| grid 配置 | `(batch_size,)` 固定 | `cal_grid_and_block_size()` 基于 vectorcore 数量动态计算 |
+| exponential_() | CUDA 上高效执行 | AI-CPU 执行，性能瓶颈 |
+| inv_q 预计算 | ✅ `reciprocal()` + kernel 内乘法 | ❌ kernel 内除法 |
+| uniform_probs dtype | float64 | float32 (cast后) |
+| BLOCK_SIZE | 8192 | 4096 (SUB_BLOCK) |
+| PyTorch 回退路径 | ❌ 无 (Triton 必须可用) | ✅ 完整 PyTorch 实现 |
+
+### 6.4 Bonus 采样差异
+
+| 特性 | GPU | Ascend |
+|------|-----|--------|
+| 采样器 | `Sampler` (含 TopKTopPSampler) | `AscendSampler` (含异步流优化) |
+| FlashInfer 支持 | ✅ (VLLM_USE_FLASHINFER_SAMPLER=1) | ❌ |
+| 异步流优化 | ❌ | ✅ NPU 多流重叠 |
+
+### 6.5 关键文件列表（GPU）
+
+| 功能 | 文件路径 |
+|------|----------|
+| 模型运行器 | `vllm/v1/worker/gpu_model_runner.py` |
+| 传统采样器 | `vllm/v1/sample/sampler.py` |
+| 拒绝采样 | `vllm/v1/sample/rejection_sampler.py` |
+| TopK/TopP 采样 | `vllm/v1/sample/ops/topk_topp_sampler.py` |
+| TopK/TopP Triton | `vllm/v1/sample/ops/topk_topp_triton.py` |
+| SamplingMetadata | `vllm/v1/sample/metadata.py` |
+| SpecDecodeMetadata | `vllm/v1/spec_decode/metadata.py` |
+| Eagle Proposer | `vllm/v1/spec_decode/eagle.py` |
+| Medusa Proposer | `vllm/v1/spec_decode/medusa.py` |
+| DraftModel Proposer | `vllm/v1/spec_decode/draft_model.py` |
+| Ngram Proposer | `vllm/v1/spec_decode/ngram_proposer.py` |
