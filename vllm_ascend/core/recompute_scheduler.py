@@ -227,7 +227,10 @@ class RecomputeScheduler(Scheduler):
                 continue
 
             num_new_tokens = (
-                request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
+                request.num_tokens_with_spec
+                + request.num_output_placeholders
+                + getattr(request, "num_spec_tokens_in_flight", 0)
+                - request.num_computed_tokens
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
@@ -826,6 +829,34 @@ class RecomputeScheduler(Scheduler):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """Track in-flight spec token count after scheduling.
+
+        In sync scheduling, the number of spec tokens scheduled for a
+        request in this step is recorded on the request so the
+        ``num_new_tokens`` budget formula can avoid double-counting tokens
+        that are still in flight from the previous step.
+        """
+        super()._update_after_schedule(scheduler_output)
+        if not self.scheduler_config.async_scheduling:
+            spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+            for req_id in scheduler_output.num_scheduled_tokens:
+                request = self.requests.get(req_id)
+                if request is not None:
+                    request.num_spec_tokens_in_flight = len(
+                        spec_decode_tokens.get(req_id, ())
+                    )
+
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """Reset in-flight spec token count on preemption.
+
+        ``_preempt_request`` clears ``request.spec_token_ids``; the
+        in-flight counter must be reset in lockstep so the next schedule
+        step does not carry stale spec token budget.
+        """
+        request.num_spec_tokens_in_flight = 0
+        return super()._preempt_request(request, timestamp)
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1113,6 +1144,21 @@ class RecomputeScheduler(Scheduler):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+
+        # Surface draft token ids to the scheduler. update_from_output is
+        # fully overridden and does not call super(), so without this the
+        # spec decode chain would be silently lost.
+        # NOTE: minimal back-fill only — full parity with the upstream
+        # scheduler.update_from_output (prefill-chunk skip, grammar validate,
+        # num_spec_tokens_in_flight reset) is deferred until RCS + spec decode
+        # is actually exercised end-to-end.
+        spec_token_ids = getattr(model_runner_output, "spec_token_ids", None)
+        if spec_token_ids is not None:
+            from vllm.v1.outputs import DraftTokenIds
+            self.update_draft_token_ids(DraftTokenIds(
+                req_ids=list(model_runner_output.req_id_to_index.keys()),
+                draft_token_ids=spec_token_ids,
+            ))
 
         return engine_core_outputs
 

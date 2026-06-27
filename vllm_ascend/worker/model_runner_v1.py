@@ -706,6 +706,102 @@ class NPUModelRunner(GPUModelRunner):
             return self.model.unwrap()
         return self.model
 
+    def _collect_pp_mtp_readded_token(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> dict[str, tuple[list[int], int]]:
+        """Collect token ids for requests re-added to a non-last PP rank.
+
+        On non-last pipeline stages, a request that was removed from the
+        persistent batch and later re-added may miss the sampled tokens from
+        previous steps in its ``token_ids_cpu``. This returns the new token
+        ids and computed-token offset needed to back-fill ``token_ids_cpu``
+        before spec token placement.
+        """
+        if get_pp_group().is_last_rank:
+            return {}
+
+        req_data = scheduler_output.scheduled_cached_reqs
+        new_token_ids = getattr(req_data, "new_token_ids", None)
+        if not new_token_ids:
+            return {}
+
+        cached_req_ids = set(self.input_batch.req_id_to_index)
+        finished_req_ids = set(scheduler_output.finished_req_ids)
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
+        resumed_req_ids = set(req_data.resumed_req_ids)
+        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        req_ids_after_parent_removals = (
+            cached_req_ids - finished_req_ids - unscheduled_req_ids
+        )
+
+        token_fixes: dict[str, tuple[list[int], int]] = {}
+        for i, req_id in enumerate(req_data.req_ids):
+            if req_id in req_ids_after_parent_removals or i >= len(new_token_ids):
+                continue
+            if new_tokens := new_token_ids[i]:
+                token_fixes[req_id] = (
+                    list(new_tokens),
+                    req_data.num_computed_tokens[i],
+                )
+        return token_fixes
+
+    @contextmanager
+    def _pp_mtp_update_req_spec_token_ids(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ):
+        """Wrap _update_states so re-added non-last-PP-rank requests get
+        their token_ids_cpu back-filled before spec token placement.
+
+        The upstream ``update_req_spec_token_ids`` places draft tokens at
+        ``num_tokens_no_spec`` offset. For re-added requests on non-last PP
+        ranks, ``token_ids_cpu`` may be missing previously sampled tokens,
+        so we inject them before the upstream placement runs.
+        """
+        if scheduler_output.total_num_scheduled_tokens == 0:
+            yield
+            return
+
+        token_fixes = self._collect_pp_mtp_readded_token(scheduler_output)
+        if not token_fixes:
+            yield
+            return
+
+        input_batch = self.input_batch
+        had_instance_update_spec_tokens = (
+            "update_req_spec_token_ids" in input_batch.__dict__
+        )
+        original_update_spec_tokens = input_batch.update_req_spec_token_ids
+        fixed_req_ids: set[str] = set()
+
+        def update_req_spec_token_ids_pp_mtp(
+            request,
+            scheduled_spec_tokens,
+        ) -> None:
+            req_id = request.req_id
+            if req_id not in fixed_req_ids and (fix_data := token_fixes.get(req_id)):
+                req_index = input_batch.req_id_to_index.get(req_id)
+                if req_index is not None:
+                    new_tokens, num_computed_tokens = fix_data
+                    end_token_index = num_computed_tokens + len(new_tokens)
+                    input_batch.token_ids_cpu[
+                        req_index, num_computed_tokens:end_token_index
+                    ] = new_tokens
+                    input_batch.num_tokens_no_spec[req_index] = end_token_index
+                    fixed_req_ids.add(req_id)
+
+            return original_update_spec_tokens(request, scheduled_spec_tokens)
+
+        input_batch.update_req_spec_token_ids = update_req_spec_token_ids_pp_mtp
+        try:
+            yield
+        finally:
+            if had_instance_update_spec_tokens:
+                input_batch.update_req_spec_token_ids = original_update_spec_tokens
+            else:
+                del input_batch.update_req_spec_token_ids
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         # Temporary rewind guard for KV-load-failure recompute.
         # This can be removed after the upstream fix is merged.
@@ -1697,6 +1793,12 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
+        # Reset stale draft state before proposing new draft tokens.
+        # Without this, a step that skips proposal (input_fits_in_drafter=False)
+        # would leave the previous step's draft tokens visible to the output
+        # path, causing stale spec_token_ids to be attached to ModelRunnerOutput.
+        self._draft_token_ids = None
+        self._draft_token_req_ids = None
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -2004,11 +2106,6 @@ class NPUModelRunner(GPUModelRunner):
         )):
             scheduler_output = deepcopy(scheduler_output)
         pp_group = get_pp_group()
-        if pp_group.world_size > 1 and not pp_group.is_last_rank:
-            new_token_ids = scheduler_output.scheduled_cached_reqs.new_token_ids
-            if new_token_ids and all(not token_ids for token_ids in new_token_ids):
-                scheduler_output = deepcopy(scheduler_output)
-                scheduler_output.scheduled_cached_reqs.new_token_ids = []
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -2040,9 +2137,10 @@ class NPUModelRunner(GPUModelRunner):
                             req_state.prev_num_draft_len = 0
 
                 # Update persistent batch states.
-                deferred_state_corrections_fn = self._update_states(
-                    scheduler_output
-                )
+                with self._pp_mtp_update_req_spec_token_ids(scheduler_output):
+                    deferred_state_corrections_fn = self._update_states(
+                        scheduler_output
+                    )
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -2393,6 +2491,40 @@ class NPUModelRunner(GPUModelRunner):
             deferred_state_corrections_fn()
         return None
 
+    def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
+        """NPU override: cast ``prev_sampled_token_ids`` to int32 after the
+        upstream receive so it matches ``input_ids.gpu`` dtype.
+
+        The upstream ``recv`` tensor is int64, but NPU ``input_ids.gpu`` is
+        int32 and ``scatter_`` does not do implicit conversion, which would
+        raise ``EZ1001 aclnnInplaceScatter`` without this cast.
+        """
+        super()._pp_receive_prev_sampled_token_ids_to_input_batch()
+        if self.input_batch.prev_sampled_token_ids is not None:
+            self.input_batch.prev_sampled_token_ids = (
+                self.input_batch.prev_sampled_token_ids.to(dtype=torch.int32)
+            )
+
+    def _pp_broadcast_prev_sampled_token_ids(
+        self,
+        sampled_token_ids: torch.Tensor,
+        draft_token_ids: torch.Tensor | None = None,
+    ) -> None:
+        """NPU override: force int64 before broadcasting so sender/receiver
+        dtypes match.
+
+        HCCL is stricter than NCCL and requires all ranks to share the same
+        dataType; the NPU sampler may emit int32 while the receiver's
+        ``recv`` is fixed int64, which would raise ``EI0005 HcomBroadcast``
+        without this cast.
+        """
+        sampled_token_ids = sampled_token_ids.to(dtype=torch.int64)
+        if draft_token_ids is not None:
+            draft_token_ids = draft_token_ids.to(dtype=torch.int64)
+        super()._pp_broadcast_prev_sampled_token_ids(
+            sampled_token_ids, draft_token_ids
+        )
+
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -2404,10 +2536,12 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
-            # receive sampled token ids from the last PP rank when using
-            # async scheduling + pipeline parallelism so downstream code
-            # (e.g., PCP input preparation) can access them.
-            if self.use_async_scheduling and pp.world_size > 1 and not skip_pp_pd_broadcast:
+            # Receive sampled token ids from the last PP rank in both sync and
+            # async modes. The upstream _update_states no longer writes
+            # token_ids_cpu for non-last ranks, so without this receive the
+            # input_ids would miss the previous step's sampled token and cause
+            # KV cache misalignment / garbled output.
+            if pp.world_size > 1 and not skip_pp_pd_broadcast:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # noqa
@@ -2519,10 +2653,30 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
 
+        # Surface draft token ids to the scheduler so spec decode actually
+        # takes effect. Use a synchronous copy to avoid async stream/event
+        # sync issues with self._draft_token_ids on NPU.
+        output_spec_token_ids = None
+        if self._draft_token_ids is not None:
+            if torch.is_tensor(self._draft_token_ids):
+                num_reqs = self._draft_token_ids.shape[0]
+                draft_ids_list = self._draft_token_ids[:num_reqs].cpu().tolist()
+                draft_req_ids = self._draft_token_req_ids
+            else:
+                draft_ids_list = self._draft_token_ids
+                draft_req_ids = self.input_batch.req_ids
+            if draft_ids_list and draft_req_ids:
+                draft_by_req_id = dict(zip(draft_req_ids, draft_ids_list))
+                output_spec_token_ids = [
+                    draft_by_req_id.get(req_id, [])
+                    for req_id in req_ids_output_copy
+                ]
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
+            spec_token_ids=output_spec_token_ids,
             logprobs=logprobs_lists,
             prompt_logprobs_dict=prompt_logprobs_dict,
             kv_connector_output=kv_connector_output,
@@ -2549,12 +2703,29 @@ class NPUModelRunner(GPUModelRunner):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
-        # In async scheduling + PP, broadcast sampled token ids from the
-        # last PP rank so other PP ranks can receive them without going
-        # through the scheduler/engine IPC path.
-        if self.use_async_scheduling:
-            if pp.world_size > 1 and pp.is_last_rank and not skip_pp_pd_broadcast:
-                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
+        # Broadcast prev sampled token + draft from last PP rank so other
+        # PP ranks can receive them without going through the scheduler/engine
+        # IPC path. Symmetric for sync and async: since _update_states no
+        # longer persists the previous sampled token for non-last ranks,
+        # sync mode also relies on this broadcast to recover it.
+        if pp.world_size > 1 and pp.is_last_rank and not skip_pp_pd_broadcast:
+            draft = (self._draft_token_ids
+                     if self._draft_token_ids is not None
+                     and torch.is_tensor(self._draft_token_ids)
+                     else None)
+            if self.use_async_scheduling:
+                self._pp_broadcast_prev_sampled_token_ids(
+                    sampler_output.sampled_token_ids, draft,
+                )
+            else:
+                if spec_decode_metadata is None:
+                    sampled = sampler_output.sampled_token_ids
+                else:
+                    sampled = torch.tensor(
+                        [[ids[-1]] if ids else [0]
+                         for ids in valid_sampled_token_ids],
+                        device=self.device)
+                self._pp_broadcast_prev_sampled_token_ids(sampled, draft)
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
@@ -3853,9 +4024,13 @@ class NPUModelRunner(GPUModelRunner):
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
+        # Drafter attention backend is only initialized on the last PP stage;
+        # non-last ranks do not load the drafter model, so the assert below
+        # would fire if this guard were removed.
         if (
             self.speculative_config
             and self.drafter is not None
+            and get_pp_group().is_last_rank
             and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
@@ -4957,6 +5132,7 @@ class NPUModelRunner(GPUModelRunner):
         if (
             self.speculative_config
             and self.drafter is not None
+            and get_pp_group().is_last_rank
             and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_extract_hidden_states()

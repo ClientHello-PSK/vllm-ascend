@@ -30,6 +30,100 @@ from functools import wraps
 from vllm.logger import logger
 
 _PATCHED = False
+_ORIGINAL_ENGINE_POST_STEP = None
+
+
+def _patch_model_runner_output() -> None:
+    """Inject ``spec_token_ids`` field into ``ModelRunnerOutput``.
+
+    The drafter produces draft tokens that belong to the current model
+    output. Carrying them on ``ModelRunnerOutput`` lets the scheduler
+    update ``request.spec_token_ids`` from the output being consumed
+    rather than from live request state that may already reflect a newer
+    schedule step.
+    """
+    from vllm.v1 import outputs as outputs_mod
+
+    model_runner_output_cls = outputs_mod.ModelRunnerOutput
+    fields = getattr(model_runner_output_cls, "__dataclass_fields__", {})
+    if "spec_token_ids" not in fields:
+        model_runner_output_cls.spec_token_ids = None
+        original_init = model_runner_output_cls.__init__
+        if getattr(original_init, "_vllm_ascend_pp_mtp_patched", False):
+            return
+
+        @wraps(original_init)
+        def _patched_init(self, *args, spec_token_ids=None, **kwargs):
+            original_init(self, *args, **kwargs)
+            self.spec_token_ids = spec_token_ids
+
+        _patched_init._vllm_ascend_pp_mtp_patched = True  # type: ignore[attr-defined]
+        model_runner_output_cls.__init__ = _patched_init
+
+    empty_output = outputs_mod.EMPTY_MODEL_RUNNER_OUTPUT
+    if not hasattr(empty_output, "spec_token_ids"):
+        empty_output.spec_token_ids = None
+
+
+def _patch_engine_core() -> None:
+    """Skip ``EngineCore.post_step`` global draft-token update in PP
+    batch_queue + sync + spec_decode mode.
+
+    In PP batch_queue mode, EngineCore schedules a newer batch before
+    consuming the older output. ``post_step`` updates global
+    ``request.spec_token_ids`` from live request state, which would
+    attach draft tokens to the wrong schedule step. Skip it so the
+    scheduler's ``update_from_output`` (driven by ``ModelRunnerOutput.
+    spec_token_ids``) is the sole source of truth.
+    """
+    global _ORIGINAL_ENGINE_POST_STEP
+
+    from vllm.v1.engine.core import EngineCore
+
+    if getattr(EngineCore.post_step, "_vllm_ascend_pp_mtp_patched", False):
+        return
+
+    _ORIGINAL_ENGINE_POST_STEP = EngineCore.post_step
+
+    @wraps(_ORIGINAL_ENGINE_POST_STEP)
+    def _patched_post_step(self, model_executed: bool) -> None:
+        if (
+            getattr(self, "batch_queue", None) is not None
+            and not getattr(self, "async_scheduling", False)
+            and getattr(self, "use_spec_decode", False)
+            and model_executed
+        ):
+            return
+        return _ORIGINAL_ENGINE_POST_STEP(self, model_executed)
+
+    _patched_post_step._vllm_ascend_pp_mtp_patched = True  # type: ignore[attr-defined]
+    EngineCore.post_step = _patched_post_step
+
+
+def _patch_request_attributes() -> None:
+    """Inject ``num_spec_tokens_in_flight`` onto ``Request``.
+
+    Tracks how many spec tokens were scheduled for a request in the
+    current step but not yet consumed by the model. The scheduler uses
+    this to avoid double-counting in-flight spec tokens in the
+    ``num_new_tokens`` budget formula and to reset on preemption.
+    """
+    from vllm.v1.request import Request
+
+    if hasattr(Request, "num_spec_tokens_in_flight"):
+        return
+
+    original_init = Request.__init__
+    if getattr(original_init, "_vllm_ascend_pp_mtp_patched", False):
+        return
+
+    @wraps(original_init)
+    def _patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.num_spec_tokens_in_flight = 0
+
+    _patched_init._vllm_ascend_pp_mtp_patched = True  # type: ignore[attr-defined]
+    Request.__init__ = _patched_init
 
 
 def _patch_model_config_validation() -> None:
@@ -78,6 +172,9 @@ def _apply_patch() -> None:
     if _PATCHED:
         return
     _PATCHED = True
+    _patch_model_runner_output()
+    _patch_engine_core()
+    _patch_request_attributes()
     _patch_model_config_validation()
 
 
