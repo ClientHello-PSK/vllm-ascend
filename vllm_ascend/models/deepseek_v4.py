@@ -451,9 +451,15 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, input_ids=None) -> torch.Tensor:
+        # —— ① 形状拍平 ——
+        # 把 (batch, seq, hidden) 多维拍成 (num_tokens, hidden) 二维，
+        # 后续路由、专家计算都按"一列 token"统一处理；num_tokens 留着结尾还原形状。
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        # —— ② 序列并行切分（可选）——
+        # 开启 use_sequence_parallel_moe 时，把 token 在 TP 卡间切分，每张卡只处理一段，
+        # 避免同一份 token 在所有 TP 卡上重复跑专家计算。代价：结尾要 all_gather 拼回（见⑥）。
         # Chunk the hidden states so they aren't replicated across TP ranks.
         # This avoids duplicate computation in self.experts.
         # TODO: We can replace the all_reduce at the end of attn with a
@@ -461,6 +467,13 @@ class DeepseekV4MoE(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        # —— ③ 路由打分（gate）——
+        # is_internal_router 决定"gate 在哪算"：
+        #   True  → gate 计算收进 FusedMoE 内部（用 gate.weight_fp32），这里只传 hidden_states 作占位。
+        #           好处：可配合 multistream_overlap_gate 把 gate 放独立 stream 与专家计算重叠；且 fp32 权重路由精度更高。
+        #           V4 因设了 gate.precast_fp32_weight=True，恒走此分支。
+        #   False → 在外层先用 F.linear 算好 router_logits 再传入（兼容路径，V4 不走）。
+        # router_logits 语义：(num_tokens, n_routed_experts)，每个 token 对每个专家的偏好分。
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
@@ -469,37 +482,61 @@ class DeepseekV4MoE(nn.Module):
             router_logits = F.linear(hidden_states.float(), self.gate.weight)
             fused_moe_out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
 
+        # —— ④⑤ 合并 shared+routed 并施加 scaling（V4 关键差异点）——
+        # V4 的顺序：先 normalize top-k 权重，再对"整个 routed 输出"乘 routed_scaling_factor
+        # （scaling 在 router 路径之外，而非 V3 那样塞进 topk_weights）。所以本层要显式处理缩放。
+        # FusedMoE 返回两种形态：
+        #   tuple (shared_output, routed_output) → legacy / 共享专家并行路径，本层需自行合并 + 收尾
+        #   单 tensor                            → 上游 MoERunner 已合并并 reduce 完，本层直接用
         fused_moe_out_is_tuple = isinstance(fused_moe_out, tuple)
         if fused_moe_out_is_tuple:
             shared_output, final_hidden_states = fused_moe_out
+            # 无共享专家时，shared_output 必然为 None（断言保护）
             if self.shared_experts is None:
                 assert shared_output is None
 
             if hidden_states.dtype != torch.float16:
+                # —— 非 fp16（bf16/fp32）：严格等价式 ——
+                # is_rocm_aiter_moe_enabled 在 Ascend 上恒为 False，故该分支实际总成立。
                 if not self.is_rocm_aiter_moe_enabled:
                     if self.shared_experts is not None:
+                        # 有共享专家：final = routed * scale + shared
+                        # muls_add_triton 是 Triton kernel，语义 out = x * scale + y
                         assert shared_output is not None
                         final_hidden_states = muls_add_triton(
                             final_hidden_states, shared_output, self.routed_scaling_factor
                         )
                     else:
+                        # 无共享专家：仅缩放 routed 输出
                         final_hidden_states *= self.routed_scaling_factor
             elif self.shared_experts is not None:
+                # —— fp16：防溢出改写式 ——
+                # fp16 数值范围小，若走 routed*scale 容易溢出，故改写成 shared*(1/scale)+routed，
+                # 让 routed 不被放大、改放放大 shared 的倒数形式（数学上与标准式不等价，是工程兜底）。
+                # 注：fp16 且无 shared 的情形此处不做任何缩放（边界情况，V4 一般有 shared 专家不会触发）。
                 assert shared_output is not None
                 final_hidden_states = muls_add_triton(
                     shared_output, final_hidden_states, 1.0 / self.routed_scaling_factor
                 )
         else:
+            # 单 tensor 返回：上游已合并好 shared+routed 并做完 reduce，直接采用
             final_hidden_states = fused_moe_out
 
+        # —— ⑥ 通信收尾 ——
         if self.is_sequence_parallel:
+            # SP 路径：all_gather 把②切分的各卡结果拼回完整序列，再截掉尾部 pad
             final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
             final_hidden_states = final_hidden_states[:num_tokens]
         elif self.tp_size > 1 and fused_moe_out_is_tuple:
+            # 非 SP + tuple 返回（legacy）：本层补一次 TP all-reduce。
+            # 但若 moe_comm_type ∈ {MC2, ALLTOALL, FUSED_MC2}，finalize 内部已 reduce，
+            # maybe_all_reduce 会直接返回不重复 reduce（避免 double-count）。
             # Legacy tuple outputs are reduced here. Tensor outputs from the
             # upstream MoERunner have already gone through its final reduction.
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
 
+        # —— ⑦ 形状还原 ——
+        # 把①拍平的 (num_tokens, hidden) 还原回二维交还上层（HC 层会处理后续维度）
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 

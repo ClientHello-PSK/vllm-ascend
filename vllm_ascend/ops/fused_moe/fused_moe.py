@@ -609,11 +609,20 @@ class AscendFusedMoE(FusedMoE):
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
     ) -> torch.Tensor | FusedMoEResult:
+        # ============================================================
+        # Ascend MoE 层的核心实现。被 AscendMoERunner.forward_impl 委托调用。
+        # 完整职责：路由打分 → 选 top-k 专家 → 分组 GEMM(专家FFN) → 通信 combine/reduce。
+        # 整体分为几个阶段：① 层索引/负载均衡预处理 ② gate stream 重叠(路由+共享专家)
+        #                  ③ 通信 prepare(dispatch前准备) ④ 核心 GEMM(专家FFN)
+        #                  ⑤ EPLB 负载热度收集 ⑥ 通信 finalize(combine+reduce) ⑦ 返回
+        # ============================================================
         assert self.quant_method is not None
 
         forward_context = get_forward_context()
         # When static kernels are enabled, the forward pass runs twice (compilation + capture),
         # causing moe_layer_index to overflow. Wrap the index to prevent out-of-bounds errors.
+        # —— 静态 kernel(NPU graph)模式下，forward 会跑两遍(编译期+捕获期)，
+        #    moe_layer_index 会一直自增导致越界；这里对层数取模回绕，防止下标越界。
         if self.enable_npugraph_ex_static_kernel and forward_context.all_moe_layers:
             moe_layer_index = forward_context.moe_layer_index % (len(forward_context.all_moe_layers))
             forward_context.moe_layer_index = moe_layer_index
@@ -621,104 +630,136 @@ class AscendFusedMoE(FusedMoE):
         # Load balancing for token distribution among experts in dummy_run
         # TODO: The community only considers load balancing when DP > 1.
         # This approach may overlook some extreme scenarios.
+        # —— 是否强制做"专家间 token 均匀分布"。仅在 profile/dummy_run 阶段开启，
+        #    目的是让编译器在各专家负载均衡的假设下编译/捕获图，避免极端不均导致形状失配。
         enable_force_load_balance = _EXTRA_CTX.in_profile_run
 
         forward_context = get_forward_context()
+        # —— ② gate stream 重叠：把"路由打分 + 共享专家计算"放到独立的 gate_stream 上，
+        #    与主 stream 后续的分组 GEMM 并行重叠，隐藏 gate/共享专家的延迟。
+        #    gate_stream 上算出的 shared_out 与 topk 通过全局 flash_common3_context 交给主 stream。
         if self.multistream_overlap_gate:
+            # gate_stream：AscendFusedMoE 类级共享的一条独立 NPU 流，专门跑 gate/共享专家。
             assert AscendFusedMoE.gate_stream is not None
+            # fc3_context：全局跨 stream 中转对象，承载 shared_out / topk / shared_experts 模块。
             fc3_context = get_flash_common3_context()
             assert fc3_context is not None
+            # gate_stream 先等主 stream 把前置依赖(hidden_states 等)算完，避免读到未就绪数据。
             AscendFusedMoE.gate_stream.wait_stream(torch.npu.current_stream())
+            # 切到 gate_stream 上执行下面这段：路由打分 + 共享专家，与主 stream 的 GEMM 并行。
             with npu_stream_switch(AscendFusedMoE.gate_stream, enabled=self.multistream_overlap_gate):
+                # —— 共享专家计算：所有 token 都走的那个 FFN(DeepseekV2MLP)，不参与路由。
                 # share_expert
                 assert fc3_context.shared_experts is not None
                 shared_out = fc3_context.shared_experts(hidden_states)
                 # NOTE: This is exactly the opposite of `maybe_all_reduce_tensor_model_parallel`
+                # —— MC2/AlltoAll/FUSED_MC2 通信模式下，共享专家输出在多卡上是分片的，
+                #    需要一次 all_reduce 拼成完整结果；AllGather 模式则由后面 finalize 统一 reduce。
+                #    shared_expert_dp_enabled() 为真时(共享专家走 DP)各卡独立，不 reduce。
                 moe_comm_type = _EXTRA_CTX.moe_comm_type
                 if (
                     moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
                     and not shared_expert_dp_enabled()
                 ):
                     shared_out = tensor_model_parallel_all_reduce(shared_out)
+                # 把算好的 shared_out 存进中转上下文，主 stream 取来与 routed_out 相加。
                 set_flash_common3_context(shared_out=shared_out)
+                # —— 路由打分：根据 router_logits 选出每个 token 的 top-k 个专家。
                 input_ids = getattr(get_forward_context(), "input_ids", None)
                 topk_weights, topk_ids = select_experts(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=self.use_grouped_topk,
-                    renormalize=self.renormalize,
-                    topk_group=self.topk_group,
-                    num_expert_group=self.num_expert_group,
-                    custom_routing_function=self.custom_routing_function,
-                    scoring_func=self.scoring_func,
-                    routed_scaling_factor=self._original_routed_scaling_factor,
-                    e_score_correction_bias=self.e_score_correction_bias,
-                    num_experts=self.moe_config.num_experts,
-                    input_ids=input_ids,
-                    tid2eid=self.tid2eid,
+                    top_k=self.top_k,                          # 每个 token 选几个专家(如6)
+                    use_grouped_topk=self.use_grouped_topk,    # 是否启用分组topk(DeepSeek的grouped专家选择)
+                    renormalize=self.renormalize,              # 是否对topk权重做归一化(norm_topk_prob)
+                    topk_group=self.topk_group,                # 分组选择时每组选几个
+                    num_expert_group=self.num_expert_group,    # 专家分多少组
+                    custom_routing_function=self.custom_routing_function,  # 自定义路由函数(可空)
+                    scoring_func=self.scoring_func,            # 打分函数(softmax/sigmoid/sqrtsoftplus等)
+                    routed_scaling_factor=self._original_routed_scaling_factor,  # 路由缩放因子(Flash=1.5/Pro=2.5)
+                    e_score_correction_bias=self.e_score_correction_bias,  # noaux_tc 偏置修正项
+                    num_experts=self.moe_config.num_experts,   # 路由专家总数(Flash=256/Pro=384)
+                    input_ids=input_ids,                       # 用于 hash 路由(前几层 hash 层用)
+                    tid2eid=self.tid2eid,                      # token-id→专家 映射(hash路由用)
                 )
+                # 返回：topk_weights (num_tokens, top_k) 归一化后的权重；topk_ids (num_tokens, top_k) 选中的专家编号。
 
+                # AllGather 通信模式：topk 是按 TP 分片算的，需要跨卡 gather 成完整结果。
                 if isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl):
                     topk_weights = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_weights, True, True)
                     topk_ids = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(topk_ids, True, True)
 
+                # 把 topk 也存进中转上下文，主 stream 的 GEMM 靠它分发 token 到对应专家。
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
+        # —— ③ 通信 prepare：分发(dispatch)前的准备工作。
+        #    moe_comm_method 按 MoE 通信方式(AllGather / MC2 / AlltoAll)不同有不同实现，
+        #    负责对 hidden_states/router_logits 做按专家分发、padding 对齐、生成量化所需掩码等。
         prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
-            replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
-            enable_shared_expert_dp=self.enable_shared_expert_dp,
-            quant_type=self.quant_type,
+            replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,   # flash comm v1：用 all_gather 替代 all_reduce
+            enable_shared_expert_dp=self.enable_shared_expert_dp,  # 共享专家是否走数据并行
+            quant_type=self.quant_type,                            # 量化类型(fp8/int8/w8a8等)，影响缩放生成
         )
-        hidden_states = prepare_output.hidden_states
-        router_logits = prepare_output.router_logits
-        mc2_mask = prepare_output.mc2_mask
-        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape
-        pertoken_scale = prepare_output.pertoken_scale
+        hidden_states = prepare_output.hidden_states                      # 处理后的输入(可能已分发/pad)
+        router_logits = prepare_output.router_logits                      # 处理后的路由打分
+        mc2_mask = prepare_output.mc2_mask                                # MC2 通信掩码：标记哪些 token 要参与通信
+        padded_hidden_states_shape = prepare_output.padded_hidden_states_shape  # pad 后的形状，finalize 时用于裁回
+        pertoken_scale = prepare_output.pertoken_scale                    # per-token 量化缩放(量化推理用)
 
         # Make sure the default stream waits for the gate stream to finish.
+        # —— ④ 主 stream 等待 gate_stream：GEMM 要用到 gate_stream 上算出的 topk，必须先等它完成。
         if self.multistream_overlap_gate:
             torch.npu.current_stream().wait_stream(AscendFusedMoE.gate_stream)
 
+        # —— ⑤ 核心 GEMM：分组矩阵乘，即"专家 FFN"的真正执行。
+        #    按 topk_ids 把 token 分发到对应专家，跑 gate_up_proj → 激活 → down_proj(SwiGLU)，
+        #    再按 topk_weights 加权合并。量化方法(quant_method)决定具体 kernel(fp8/int8/bf16)。
         # Matrix multiply.
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            router_logits=router_logits,
-            pertoken_scale=pertoken_scale,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            num_experts=self.moe_config.num_experts,
-            expert_map=self._expert_map,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self._original_routed_scaling_factor,
-            e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            enable_force_load_balance=enable_force_load_balance,
-            log2phy=self.log2phy,
-            global_redundant_expert_num=self.global_redundant_expert_num,
-            mc2_mask=mc2_mask,
+            layer=self,                                            # FusedMoE 层自身(携带 w1/w2 权重)
+            x=hidden_states,                                       # 输入 token 特征
+            router_logits=router_logits,                           # 路由打分(部分实现内部再算topk)
+            pertoken_scale=pertoken_scale,                         # per-token 量化缩放
+            top_k=self.top_k,                                      # 每token选专家数
+            renormalize=self.renormalize,                          # topk权重是否归一化
+            use_grouped_topk=self.use_grouped_topk,                # 分组topk开关
+            num_experts=self.moe_config.num_experts,               # 路由专家总数
+            expert_map=self._expert_map,                           # EPLB: 逻辑专家→物理卡重映射表
+            topk_group=self.topk_group,                            # 分组每组选几个
+            num_expert_group=self.num_expert_group,                # 专家分组数
+            custom_routing_function=self.custom_routing_function,  # 自定义路由(可空)
+            scoring_func=self.scoring_func,                        # 打分函数
+            routed_scaling_factor=self._original_routed_scaling_factor,  # 路由缩放因子
+            e_score_correction_bias=self.e_score_correction_bias,  # noaux_tc 偏置修正
+            activation=self.activation,                            # 激活函数(默认silu)
+            apply_router_weight_on_input=self.apply_router_weight_on_input,  # 是否把路由权重提前乘到输入(省一次乘)
+            enable_force_load_balance=enable_force_load_balance,   # 强制负载均衡(编译/profile期)
+            log2phy=self.log2phy,                                  # EPLB: 逻辑专家→物理专家索引
+            global_redundant_expert_num=self.global_redundant_expert_num,  # EPLB: 冗余专家数
+            mc2_mask=mc2_mask,                                     # MC2 通信掩码
         )
+        # 返回 FusedExpertsResult：含 routed_out(路由专家输出)、event(各阶段同步事件)、
+        # expert_tokens/group_list_type(EPLB 热度统计用)、swiglu_limit 等。
 
+        # —— ⑥ EPLB(Expert-Level Load Balance) 负载热度收集。
+        #    动态专家负载均衡：统计每个专家分到的 token 数(负载热度)，攒到 moe_load 表里，
+        #    后续按热度把"热专家"重映射复制到更多卡上，消除 MoE 的负载不均。
         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
-            expert_tokens = fused_experts_results.expert_tokens
-            group_list_type = fused_experts_results.group_list_type
+            expert_tokens = fused_experts_results.expert_tokens       # 每个专家的 token 数统计
+            group_list_type = fused_experts_results.group_list_type   # 统计值的组织形式
             assert expert_tokens is not None and group_list_type is not None, (
                 "expert_tokens and group_list_type should not be None when dynamic_eplb is enabled."
             )
+            # group_list_type==1：直接是每专家 token 数；否则是前缀和(cumsum)形式，需差分还原成增量。
             local_load = (
                 expert_tokens
                 if group_list_type == 1
                 else torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
             )
             if self.multi_stage:
+                # 多阶段统计：按迭代轮转写入 moe_load 的不同行(滑动窗口)，取多步平均更稳。
                 cur_iter = torch.remainder(self.load_counter, self.num_iter)
                 self.moe_load.index_add_(
                     dim=0, index=cur_iter, source=local_load.to(torch.int32, non_blocking=True).view(1, -1)
@@ -727,12 +768,17 @@ class AscendFusedMoE(FusedMoE):
             else:
                 self.moe_load.add_(local_load)
 
+        # —— ⑦ 通信 finalize：combine(把分到各专家的 token 结果汇合) + reduce。
+        #    AllGather 模式需要在此 reduce；MC2/AlltoAll 模式内部已 reduce(reduce_results=False)。
         routed_out = _EXTRA_CTX.moe_comm_method.finalize(
             hidden_states=fused_experts_results.routed_out,
             reduce_results=isinstance(_EXTRA_CTX.moe_comm_method, AllGatherCommImpl),
-            padded_hidden_states_shape=padded_hidden_states_shape,
+            padded_hidden_states_shape=padded_hidden_states_shape,   # 按 prepare 时记的 pad 形状裁回原长
         )
 
+        # —— ⑧ 返回：是否带同步事件(event)。
+        #    带 event：返回 FusedMoEResult，含 GMM 各阶段(dispatch/gmm2/combine)的 event，
+        #              供上层做多 stream 调度/重叠时精确同步。
         if return_with_event:
             return FusedMoEResult(
                 routed_out=routed_out,
@@ -743,6 +789,7 @@ class AscendFusedMoE(FusedMoE):
             )
         else:
             # The vLLM FusedMoE forward_impl does not return events.
+            # —— 不带 event：直接返回 routed_out，与上游 vLLM forward_impl 返回类型一致。
             return routed_out
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor, fused_moe_evts: FusedMoEEvents):
@@ -856,9 +903,21 @@ class AscendFusedMoE(FusedMoE):
     def shared_forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
+        # ============================================================
+        # 带"共享专家"的 MoE 前向。被 AscendMoERunner.forward_impl 委托调用
+        # (当本层有共享专家时)。职责：算出 路由专家输出 routed_out + 共享专家输出 shared_out，
+        # 以元组 (shared_out, routed_out) 返回 —— 对应 deepseek_v4.py 里 fused_moe_out_is_tuple=True 分支。
+        # 整体阶段：① 注册共享专家到全局上下文 ② gate 路由打分 ③ 路由专家 GEMM→routed_out
+        #          ④ 无共享专家提前返回 ⑤ 算共享专家 shared_out ⑥ 返回 (shared_out, routed_out)
+        # ============================================================
+        # —— ① 若开启"共享专家与 gate 的多 stream 重叠"模式，先把共享专家模块注册进
+        #    全局 flash_common3_context，供 forward_impl 内的 gate_stream 取用(在那里并行算共享专家)。
         if self.shared_multistream_overlap_gate:
             set_flash_common3_context(shared_experts=self._shared_experts)
 
+        # —— ② gate 路由打分：决定每个 token 走哪些路由专家。
+        #    is_internal_router=True(V4 走此路径)：gate 计算收进本类内部，用 fp32 权重算 router_logits。
+        #    is_internal_router=False：外层(如 deepseek_v4.py 的 else 分支)已算好 router_logits 传入，这里直接用。
         if self.is_internal_router:
             gate = self.gate
             assert gate is not None
@@ -866,29 +925,49 @@ class AscendFusedMoE(FusedMoE):
             # increase with extra hidden states. We also assume that all gate
             # linear is unquantized so that we the weight is pre-casted in
             # process_weights_after_loading of AscendUnquantizedLinearMethod.
+            # —— 转 fp32 做高精度路由：代价是多一份 fp32 拷贝增加 HBM 占用；
+            #    前提是 gate 未量化、其权重在加载后已预先 cast 成 fp32(gate.weight_fp32)。
             hidden_states_fp32 = hidden_states.float()
+            # 在当前 stream 打两个时序 event，夹住 gate 计算，供后面共享专家做多 stream 重叠同步。
             before_routed_experts = torch.npu.current_stream().record_event()
+            # 核心路由打分：(num_tokens,hidden)@(hidden,n_experts) → (num_tokens,n_experts)，
+            # 每个 token 对每个专家的偏好分(内积)。
             router_logits = F.linear(hidden_states_fp32, gate.weight_fp32)
             after_routed_experts = torch.npu.current_stream().record_event()
         else:
+            # 外层已算好 router_logits：这里只在进入路由专家前打一个起始 event，无需计时(after=None)。
             before_routed_experts = torch.npu.current_stream().record_event()
             after_routed_experts = None
 
+        # —— ③ 路由专家 GEMM：分组矩阵乘(专家 FFN)。return_with_event=True 带回各阶段时序 event，
+        #    供后面共享专家做多 stream 重叠同步。详见 forward_impl 内部流程。
         fused_moe_results = self.forward_impl(
             hidden_states=hidden_states,
             router_logits=router_logits,
             return_with_event=True,
         )
-        routed_out = fused_moe_results.routed_out
+        routed_out = fused_moe_results.routed_out   # 路由专家的加权融合输出
 
+        # —— ④ 无共享专家：直接返回 routed_out(单个 tensor，非元组)。
         if self._shared_experts is None:
             return routed_out
 
+        # —— ⑤ 算共享专家输出 shared_out。两条路径：
+        #    A) shared_multistream_overlap_gate=True：共享专家已在 forward_impl 的 gate_stream 上
+        #       并行算好(见 forward_impl ② 阶段)，直接从全局上下文取现成的 shared_out。
+        #    B) 否则：同步调用 _forward_shared_experts 计算，并把路由专家的时序 event 传入，
+        #       支撑"共享专家 ↔ 路由专家"的多 stream 重叠同步(详见 _forward_shared_experts)。
         if self.shared_multistream_overlap_gate:
+            # 路径 A：取 gate_stream 上已算好的共享专家输出。
             fc3_context = get_flash_common3_context()
             assert fc3_context is not None
             shared_out = fc3_context.shared_out
         else:
+            # 路径 B：同步算共享专家。FusedMoEEvents 打包路由专家各阶段 event：
+            #   before/after_routed_experts — gate 路由阶段的起止点；
+            #   before_dispatch/before_gmm2/before_combine — 路由专家 GMM 各阶段(dispatch/down_proj/合并)之前；
+            #   swiglu_limit — swiglu 限幅阈值(精度保护，防激活值爆炸)。
+            #   共享专家流靠这些 event 与路由专家流做精确时序对齐，实现并行重叠。
             shared_out = self._forward_shared_experts(
                 hidden_states,
                 FusedMoEEvents(
@@ -900,4 +979,6 @@ class AscendFusedMoE(FusedMoE):
                     swiglu_limit=fused_moe_results.swiglu_limit,
                 ),
             )
+        # —— ⑥ 返回元组 (shared_out, routed_out)。上层(deepseek_v4.py)会做
+        #    final = routed_out * routed_scaling_factor + shared_out 合并。
         return shared_out, routed_out

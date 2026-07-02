@@ -601,6 +601,8 @@ class NPUModelRunner(GPUModelRunner):
         self.num_sms = None
 
     def _sync_device(self) -> None:
+        # 阻塞等当前 NPU 设备上所有流（默认流 + 拷贝流 + 全局流等）完成。
+        # 用于 profiling 计时等场景：必须等真算完才能取 wall-clock 耗时。
         torch.npu.synchronize()
 
     def _set_up_drafter(self):
@@ -1704,6 +1706,25 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
+        """推测解码的草稿提议入口。
+
+        职责：基于本轮目标模型已采样得到的 valid_sampled_token_ids，调用对应
+        类型的 drafter 生成下一批候选 draft token，供下一轮目标模型 verify。
+
+        入参说明：
+          - valid_sampled_token_ids：本轮采样的 token，GPU tensor 或 CPU list，
+            形态取决于 disable_padded_drafter_batch 与是否异步调度。
+          - spec_decode_metadata：上一轮 draft 的 rejection 结果；为 None 表示
+            无上一步 draft 需要验（首步或上一步全接受）。
+          - hidden_states / aux_hidden_states / sample_hidden_states：目标模型
+            前向产出的隐状态，部分 drafter（EAGLE3/Medusa/extract_hidden）需要。
+          - target_model_batch_desc：目标模型的 batch 描述，drafter 组 padded
+            batch 时对齐用。
+
+        返回：draft_token_ids，形态为 list[list[int]] 或 None（未开启推测解码）。
+
+        内部按 drafter 类型分多分支：见下方各分支注释。
+        """
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -1788,13 +1809,29 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
+            # 分支 ⑤：EAGLE / EAGLE3 / MTP / dflash / draft_model。
+            # 这些方法共享同一条"基于 draft 模型"的起草流水线：
+            #   ① 准备 next_token_ids（padded GPU tensor 或 CPU list）
+            #   ② 若开启 PCP（Prefill Context Parallel），收集 PCP 上下文
+            #   ③ 让 target 模型覆写 hidden_states（如 MTP 的 pre-hc_head residual）
+            #   ④ 组装三元组 (target_token_ids / positions / hidden_states)：
+            #      - 无上一步 draft 可验时 → 全量切片
+            #      - 有上一步 draft 被拒时 → 按 token_indices 切片
+            #   ⑤ 调 drafter._propose() 跑 draft 网络
+            # 注意：use_eagle() 同时覆盖 mtp 和 dflash（见 SpeculativeConfig），
+            # 真正区分它们的是 drafter 类。
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
+            # ① 准备 next_token_ids：每个 req 喂给 drafter 作为"下一个输入"的 token。
+            # 两条互斥路径：
+            #   - disable_padded_drafter_batch=True：走 CPU list（兼容路径，
+            #     例如 MTP-fullgraph 与 PCP 不兼容时强制走这条）
+            #   - 否则：走 GPU padded tensor（默认的高性能路径）
             if self.vllm_config.speculative_config.disable_padded_drafter_batch:
-                # When padded-batch is disabled, the sampled_token_ids should be
-                # the cpu-side list[list[int]] of valid sampled tokens for each
-                # request, with invalid requests having empty lists.
+                # 关闭 padded-batch 时，sampled_token_ids 是 CPU 端的
+                # list[list[int]]，每个 req 一个子列表存放有效采样 token，
+                # 无效 req 对应空列表。
                 assert isinstance(sampled_token_ids, list), (
                     "sampled_token_ids should be a python list whenpadded-batch is disabled."
                 )
@@ -1803,10 +1840,8 @@ class NPUModelRunner(GPUModelRunner):
                     sampled_token_ids, self.requests, self.input_batch, scheduler_output.num_scheduled_tokens
                 )
             else:
-                # When using padded-batch, the sampled_token_ids should be
-                # the gpu tensor of sampled tokens for each request, of shape
-                # (num_reqs, num_spec_tokens + 1) with rejected tokens having
-                # value -1.
+                # padded 模式：sampled_token_ids 是 GPU tensor，shape 为
+                # (num_reqs, num_spec_tokens + 1)，被拒绝的 token 用 -1 占位。
                 assert isinstance(sampled_token_ids, torch.Tensor), (
                     "sampled_token_ids should be a torch.Tensor whenpadded-batch is enabled."
                 )
@@ -1820,6 +1855,11 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
 
+            # ② 收集 PCP（Prefill Context Parallel）上下文。PCP 把长 prefill
+            # 切到多步执行；开启时 input_ids 和 query_start_loc 必须从
+            # pcp_full buffers 读取，prefill/decode req 数也要分开统计，
+            # 让 drafter 能正确地为各阶段分桶。
+            # 未开启 PCP 时这些置 None / 0，drafter 走标准的单步 buffer。
             req_scheduled_tokens = scheduler_output.num_scheduled_tokens
             if self.use_cp:
                 long_seq_metadata = self.long_seq_metadata  # type: ignore
@@ -1834,18 +1874,31 @@ class NPUModelRunner(GPUModelRunner):
                 num_prefill_reqs = 0
                 num_decode_reqs = 0
 
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). Safe to
-            # rebind here: hidden_states was already consumed for sampling
-            # above and is not used again in this branch.
+            # ③ 让 target 模型覆写喂给 drafter 的 hidden_states（例如
+            # DeepSeek V4 MTP 需要 pre-hc_head 的 residual）。这里重绑是
+            # 安全的：hidden_states 在上面的采样路径里已经用过了，
+            # 本分支后续不会再使用原始的 hidden_states。
             mtp_hidden_states = getattr(
                 self.get_model(), "get_mtp_target_hidden_states", lambda: None
             )()
             if mtp_hidden_states is not None:
                 hidden_states = mtp_hidden_states
 
+            # ④ 组装三元组 (target_token_ids / target_positions /
+            # target_hidden_states) 喂给 drafter。按"是否有上一步 draft 要
+            # 验证"分两条路径：
+            #   - spec_decode_metadata 为 None：无上一步 draft（首步，或
+            #     上一步 draft 全被接受）。喂全量 scheduled tokens 切片；
+            #     token_indices_to_sample 留 None，_propose 内部会从
+            #     query_start_loc 推导默认值。
+            #   - spec_decode_metadata 非空：上一步 draft 经过 rejection
+            #     采样，部分被拒。调 prepare_inputs_padded 计算
+            #     token_indices（实际要喂的 token 索引）和
+            #     num_rejected_tokens_gpu（每个 req 被拒的 token 数，
+            #     作为信号让 drafter 在新一轮起草时考虑上一步拒绝情况）。
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
+                # 路径 A：全量切片，无上一步 draft 要验证。
                 # update pcp related params
                 if self.pcp_size > 1:
                     token_indices_to_sample = query_start_loc_pcp_full[1 : num_reqs + 1] - 1
@@ -1864,6 +1917,9 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
+                # 路径 B：有上一步 draft，需要验证并按 reject 情况重新切片。
+                # 先把 per-group attn metadata 的 query_start_loc 同步到
+                # PCP-full 视图，保证后续索引计算一致。
                 if self.pcp_size > 1:
                     assert common_attn_metadata is not None
                     common_attn_metadata.query_start_loc_cpu[: num_reqs + 1] = query_start_loc_pcp_full_cpu[
@@ -1879,6 +1935,10 @@ class NPUModelRunner(GPUModelRunner):
                         common_attn_metadata, sampled_token_ids, spec_decode_metadata.num_draft_tokens
                     )
                 else:
+                    # padded 路径：一个 triton kernel 同时算出 token_indices、
+                    # token_indices_to_sample 和 num_rejected_tokens_gpu ——
+                    # 被拒绝的 token 作为 padding 留在 batch 里，最后由
+                    # token_indices_to_sample 挑出真正要采样的位置。
                     assert self.drafter is not None
                     common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
                         self.drafter.prepare_inputs_padded(
@@ -1898,6 +1958,10 @@ class NPUModelRunner(GPUModelRunner):
                         target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[token_indices]
+            # ⑤ 跑 draft 网络。_propose 用上面的三元组组装 padded drafter
+            # batch，按需 dispatch cudagraph，调 self.model(...) 产出 GPU
+            # 上的 draft_token_ids。eagle3/dflash 还会在 forward 前先
+            # 合并多层 aux hidden states（见 _propose 内的 combine_hidden_states）。
             assert self.drafter is not None
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
@@ -1924,16 +1988,35 @@ class NPUModelRunner(GPUModelRunner):
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
+        """把 draft token ids 从 NPU 异步拷贝到 CPU pinned buffer。
+
+        目的：下一轮目标模型 verify 时需要 host 侧的 draft token；异步调度下
+        不能阻塞默认流，因此走专门的拷贝流 + event 同步。
+
+        入参：
+          - scheduler_output：用于判断是否含结构化输出请求等条件。
+          - zeros_only：True 时不做 D2H，而是把 CPU buffer 清零（如本轮无
+            有效 draft 需要下发，但需让下游看到"零"状态）。
+
+        提前返回的条件：
+          - 未开启推测解码（num_spec_tokens == 0）；
+          - 异步调度且无结构化输出 / 无 output_token_ids 时（这种场景下
+            下一轮不需要 host 侧 draft，跳过以省一次 D2H）。
+        """
         if not self.num_spec_tokens:
             return
+        # 异步调度下，仅当存在结构化输出或 output_token_ids 时才需要拷；
+        # 否则下一轮 verify 路径不读 host draft，跳过避免无谓 D2H
         if self.use_async_scheduling and not (
             scheduler_output.has_structured_output_requests
             or self.input_batch.sampling_metadata.output_token_ids
         ):
             return
+        # 同步记录本轮 draft 对应的 req_ids（拷一份副本，避免后续被改动）
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
 
         draft_token_ids: torch.Tensor = self._draft_token_ids  # type: ignore[has-type]
+        # 非 tensor（如 None 或 list）直接返回，下游有兜底
         if not torch.is_tensor(draft_token_ids):
             return
         assert self.draft_token_ids_event is not None
@@ -1941,14 +2024,18 @@ class NPUModelRunner(GPUModelRunner):
         assert self.draft_token_ids_cpu is not None
         default_stream = torch.npu.current_stream()
         num_reqs = draft_token_ids.shape[0]
+        # 切到专用拷贝流，避免阻塞默认流的前向 / 采样
         with torch.npu.stream(self.draft_token_ids_copy_stream):
             if not zeros_only:
+                # 先等默认流把 draft_token_ids 写完，再发起 D2H
                 self.draft_token_ids_copy_stream.wait_stream(default_stream)
                 self.draft_token_ids_cpu[:num_reqs].copy_(
                     draft_token_ids, non_blocking=True
                 )
             else:
+                # 清零分支：不拷贝，直接把对应区间置 0
                 self.draft_token_ids_cpu[:num_reqs] = 0
+            # 记录事件，下游在事件 ready 后即可安全读取 CPU buffer
             self.draft_token_ids_event.record()
 
     @torch.inference_mode()
@@ -2404,22 +2491,38 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        """采样阶段的统一入口。
+
+        职责：把前向得到的 logits 转成实际采样 token，并按场景驱动后续动作：
+          - 推测解码：草稿提议 / 接受、KV connector 收尾；
+          - Mamba 类模型（need_accepted_tokens）：采样完成后做状态机更新；
+          - 异步调度 + PP：广播采样 token 给其它 PP rank。
+        最终返回同步或异步的 ModelRunnerOutput。
+
+        入参 grammar_output：结构化输出（grammar/受限解码）的 bitmask 数据，
+        为 None 表示不启用结构化输出；非 None 时会在采样前用它修正 logits。
+        返回值：非异步调度返回同步 ModelRunnerOutput；异步调度返回
+        AsyncGPUModelRunnerOutput（带 D2H 拷贝流），PP 非最终 rank 可能返回 None。
+        """
+        # 取出并清空 KV connector 的输出（前向阶段写入），后续要随输出下传
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        # 流水并行（PP）组信息，用于决定是否需要在本 rank 做采样/广播
         pp = get_pp_group()
+        # 当前 rank 是 KV producer 且 PP > 1 时，跳过"上一轮采样 token 广播"，
+        # 因为 producer 不参与最终采样
         skip_pp_pd_broadcast = self.is_kv_producer and pp.world_size > 1
 
+        # execute_model_state 为 None：本 rank 不做采样（PP 非最终 rank 等）
         if self.execute_model_state is None:
-            # Nothing to do (PP non-final rank case), output isn't used.
-            # receive sampled token ids from the last PP rank when using
-            # async scheduling + pipeline parallelism so downstream code
-            # (e.g., PCP input preparation) can access them.
+            # 无需采样，输出不会被使用。
+            # 异步调度 + PP 场景下，从最后一个 PP rank 接收上一轮采样到的 token id，
+            # 写入 input_batch，供下游（如 PCP 输入准备）访问
             if self.use_async_scheduling and pp.world_size > 1 and not skip_pp_pd_broadcast:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # noqa
-            # In case of PP with kv transfer, we need to pass through the
-            # kv_connector_output
+            # PP + KV 传输场景下需要把 kv_connector_output 透传下去
             if kv_connector_output.is_empty():
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -2427,7 +2530,7 @@ class NPUModelRunner(GPUModelRunner):
             output.kv_connector_output = kv_connector_output
             return output
 
-        # Unpack ephemeral state.
+        # 解包前向阶段保存的临时状态（logits、hidden_states、attn_metadata 等）
         (
             scheduler_output,
             logits,
@@ -2442,32 +2545,46 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats,
             batch_desc,
         ) = self.execute_model_state
-        # Clear ephemeral state.
+        # 临时状态已取出，立即清空，避免被后续步骤误用或影响下一轮
         self.execute_model_state = None
 
-        # Apply structured output bitmasks if present.
+        # 结构化输出：用 grammar bitmask 修正 logits，屏蔽非法 token 的采样概率
         if grammar_output is not None:
-            # here we are different from gpu_model_runner,
-            # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
+            # 与 gpu_model_runner 不同：apply_grammar_bitmask 在 GPU 上用 torch.compile 优化，
+            # Ascend 暂不支持，因此先搬到 CPU float 上做修正再搬回 NPU
             logits_dtype = logits.dtype
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        # 采样：logits -> token，按是否推测解码分别走 sampler / rejection_sampler
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # need_accepted_tokens 为 True 表示 attn group 中存在 MambaSpec
+        # （Mamba/SSM 类状态空间模型）：这类模型的状态机更新依赖"实际被
+        # 接受的 token"，因此必须保证本轮 NPU 上的采样真正完成后再往下走，
+        # 以便后续 _update_states_after_model_execute 拿到完整采样结果做状态推进
         if self.need_accepted_tokens:
+            # 懒创建一个 NPU Event，整个 runner 生命周期内复用同一个事件对象，
+            # 避免每次采样都新建 Event 带来的开销
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
 
+            # 类型检查提示：此时事件对象一定已创建
             assert self.sampling_done_event is not None
+            # 在当前 NPU 流上记录一个事件点，标记"采样已完成"。
+            # 后续全局流在 _update_states_after_model_execute 前会 wait_event，
+            # 以此作为同步屏障，防止读到未完成的采样输出
             self.sampling_done_event.record()
 
+        # 失效上一轮缓存的"有效采样 token 数"张量，强制后续重新计算
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
 
+        # 草稿提议闭包：封装 propose + 拷到 CPU 两步，便于在合适时机调用
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            # 由 drafter 模型基于已采样 token 生成下一批候选草稿 token
             self._draft_token_ids = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
@@ -2481,8 +2598,28 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
+            # 把草稿 token 拷到 CPU，供下一轮目标模型 verify 使用
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        # 同步记录：把采样结果、logprobs、prompt logprobs、req 索引映射等
+        # 从 NPU 同步到 host 可用形态；同时拿到有效的采样 token id（valid_ 前缀）
+        # 采样后同步记账：解析采样输出、回写 input_batch、计算 logprobs。
+        # 入参含义：
+        #   - scheduler_output：本轮调度器输出，提供请求数、scheduled tokens 数、
+        #     discard 请求索引等上下文。
+        #   - sampler_output：_sample 的返回值，含 sampled_token_ids（GPU 张量）
+        #     和 logprobs_tensors，是本方法的输入数据来源。
+        #   - logits：前向 + grammar 修正后的最终 logits；当前 _bookkeeping_sync
+        #     实际未使用，仅作为接口预留参数。
+        #   - hidden_states：目标模型前向的隐状态，用于计算 prompt logprobs
+        #     （方法内部按 [:num_scheduled_tokens] 切片使用）。
+        #   - total_num_scheduled_tokens：本轮调度的总 token 数，用于切片
+        #     hidden_states、routed_experts D2H 的拷贝长度等。
+        #   - spec_decode_metadata：推测解码上一轮 draft 的 rejection 元数据；
+        #     为 None 表示非推测解码或首步，方法据此选择 _to_list 还是
+        #     RejectionSampler.parse_output 分支。
+        # 返回 6 元组：logprobs_lists、valid_sampled_token_ids、prompt_logprobs_dict、
+        # req_ids_output_copy、req_id_to_index_output_copy、invalid_req_indices。
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2499,8 +2636,11 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
+        # 草稿提议阶段：根据推测解码类型选择输入源
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
+                # 是否使用 padded drafter batch：EAGLE/draft_model/extract_hidden/ngram_gpu
+                # 这些走 GPU 采样的 drafter 才启用，且未被显式禁用
                 use_padded_batch = (
                     self.speculative_config
                     and (
@@ -2512,20 +2652,20 @@ class NPUModelRunner(GPUModelRunner):
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
                 if use_padded_batch:
-                    # EAGLE speculative decoding can use the GPU sampled tokens
-                    # as inputs, and does not need to wait for bookkeeping to finish.
+                    # EAGLE 类推测解码可直接用 GPU 上的采样 token 作为 drafter 输入，
+                    # 不必等 bookkeeping 完成（数据仍在 NPU 上）
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
                 if self.speculative_config and not use_padded_batch:
-                    # ngram and other speculative decoding methods use the sampled
-                    # tokens on the CPU, so they are run after bookkeeping.
+                    # ngram 等其它推测解码使用 CPU 侧的采样 token，
+                    # 必须在 bookkeeping 同步之后才能拿到，因此放在这里执行
                     propose_draft_token_ids(valid_sampled_token_ids)
 
-            # vLLM v0.18 defers KV connector finalization during target-model
-            # forward when speculative decoding is enabled. Finalize here after
-            # draft model runs so KV pool save/put can complete.
+            # vLLM v0.18 在开启推测解码时，把 KV connector 的收尾延迟到目标模型前向之后。
+            # 这里在 drafter 运行完后做收尾，保证 KV pool 的 save/put 能完成
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
 
+        # 组装最终输出对象，把各路同步好的结果填入
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2538,15 +2678,22 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats=cudagraph_stats,
             routed_experts=None,
         )
+        # 若开启 profiling 的分块计时，且记录了前向起始时间，则同步设备并计算耗时
         if self.ascend_config.profiling_chunk_config.need_timing and hasattr(self, '_execution_start_time'):
             self._sync_device()
             model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
 
+        # 动态 expert parallel load balancing：前向结束触发负载热度统计
         if self.dynamic_eplb:
             self.eplb_updator.forward_end(self.eplb_heat_collection_status)
 
+        # 落盘 dump 数据（调试/分析用途）
         self._finalize_dump_data()
 
+        # Mamba 类模型（need_accepted_tokens）路径：在全局流上等采样完成事件，
+        # 再做异步状态更新（_update_states_after_model_execute 会基于采样结果
+        # 推进 Mamba 状态机）。切到全局流避免与默认流的采样/草稿操作抢资源，
+        # 同时通过 wait_event 保证读到完整采样结果
         if self.need_accepted_tokens:
             assert self.sampling_done_event is not None
             with (
@@ -2556,37 +2703,30 @@ class NPUModelRunner(GPUModelRunner):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
-        # In async scheduling + PP, broadcast sampled token ids from the
-        # last PP rank so other PP ranks can receive them without going
-        # through the scheduler/engine IPC path.
+        # 异步调度 + PP：从最后一个 PP rank 广播采样到的 token id，
+        # 其它 PP rank 直接接收，避免走 scheduler/engine IPC 的慢路径
         if self.use_async_scheduling:
             if pp.world_size > 1 and pp.is_last_rank and not skip_pp_pd_broadcast:
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
+        # —— 同步调度路径：直接返回组装好的同步输出 ——
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
-                # Sync path: D2H was issued in ``_bookkeeping_sync`` and
-                # synchronized by ``_to_list``'s event.synchronize(), so
-                # the pinned buffers are ready to be wrapped as numpy.
+                # 同步路径：D2H 已在 _bookkeeping_sync 中下发，并由 _to_list 的
+                # event.synchronize() 同步完成，pinned buffer 已就绪可直接转 numpy
                 total = scheduler_output.total_num_scheduled_tokens
                 model_runner_output.routed_experts = RoutedExpertsLists(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
             return model_runner_output
-        
-        # Async path: produce a device-side snapshot that the async
-        # copy stream can D2H later. Both tensors must be private
-        # clones because:
-        #   - ``routing_data`` source is the shared capturer buffer,
-        #     which is ``clear_buffer()``-ed at the start of the
-        #     next step on the default stream.
-        #   - ``slot_mapping`` source is our own
-        #     ``routed_experts_slot_mapping_device``, which the
-        #     next ``_prepare_inputs`` overwrites on the default
-        #     stream while the D2H is still pending on the copy
-        #     stream.
-        # Without clones, the copy stream would read torn data.
+
+        # —— 异步调度路径：构造设备侧快照，交由异步拷贝流稍后 D2H ——
+        # 必须各自 clone() 私有副本，原因：
+        #   - routing_data 源是共享 capturer buffer，下一步在默认流上 clear_buffer() 会被清空；
+        #   - slot_mapping 源是 self.routed_experts_slot_mapping_device，
+        #     下一轮 _prepare_inputs 在默认流上会覆写它，而此时拷贝流上的 D2H 尚未完成。
+        # 不 clone 的话拷贝流会读到被撕裂的数据
         routed_experts_snapshot = None
         if self.routed_experts_initialized:
             buf = self.routed_experts_capturer.get_device_buffer()
@@ -2597,6 +2737,8 @@ class NPUModelRunner(GPUModelRunner):
                     :total
                 ].clone(),
             )
+        # 异步输出：持有同步输出 + 设备侧采样/logprobs/routed_experts 张量，
+        # 由 async_output_copy_stream 在后续做 D2H
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -2606,6 +2748,8 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.input_batch.vocab_size,
             routed_experts=routed_experts_snapshot,
         )
+        # 把异步输出里的 CPU 端采样 token 和"拷贝就绪事件"登记到 input_batch，
+        # 供下一轮在事件 ready 后消费
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
@@ -2614,25 +2758,52 @@ class NPUModelRunner(GPUModelRunner):
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
-        # Sample the next token and get logprobs if needed.
+        # 采样下一个 token 并按需计算 logprobs。
+        # 该方法对 vLLM 默认实现做了两点重写：
+        #   1) 兼容 lmhead 张量并行（lmhead_tp_enable）：开启时 logits 在准备
+        #      阶段会被 pad 到跨 DP 的统一尺寸（见 _prepare_inputs 中对
+        #      logits_indices 的 pad），采样前需截回本 rank 实际需要采样的
+        #      行数，避免把 padding 行送入采样器。
+        #   2) NPU reduce 采样加速（enable_reduce_sample）：当请求带 top_k 时，
+        #      先把本批次最大 top_k 预下发到 NPU 采样器，走 reduce 路径而非
+        #      Host 端大向量 top-k，降低同步与搬运开销。
+
+        # 把上一轮异步采样得到的 token id 回写到 input_batch，供本轮请求状态使用
         self.input_batch.update_async_output_token_ids()
+        # 取当前批次的采样元数据（top_k/top_p/temperature、是否采样、logprobs 等）
         sampling_metadata = self.input_batch.sampling_metadata
+
+        # 分支一：非推测解码场景，走常规采样器
         if spec_decode_metadata is None:
+            # lmhead TP 场景下 logits 在准备阶段被 pad 到跨 DP 统一尺寸，
+            # 这里截回本 rank 实际请求数，避免把 padding 行送入采样
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
+            # 当请求指定了 top_k 且开启 NPU reduce 采样时，预先准备采样器：
+            #   - 从 top_k_cpu 中过滤掉超过词表大小的非法值
+            #   - 取剩余 top_k 的最大值作为本批次下发统一的 top_k 上限
+            #   - 调 prepare_sampling 将该值下发到 NPU，供后续 reduce 采样使用
             if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
                 max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
                 self.sampler.prepare_sampling(max_topk)
+            # 执行常规采样并返回（含 sampled_token_ids 及可选 logprobs）
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
 
+        # 分支二：推测解码场景，走 rejection sampler
+        # lmhead TP 场景下 logits 在准备阶段被 pad 到跨 DP 统一尺寸，
+        # 这里按 spec_decode_metadata.logits_indices 的长度截回实际需要
+        # 采样的 token 行数（推测解码下每个 req 可能对应多行 logits）
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+        # 同样在开启 reduce 采样时为 rejection sampler 预下发最大 top_k
         if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
             max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
             self.rejection_sampler.prepare_sampling(max_topk)
+        # 执行拒绝采样：对草稿 token 与目标模型 logits 做比对，决定接受/拒绝
+        # draft_probs 传 None，由 rejection_sampler 内部按需处理草稿概率
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
@@ -2659,15 +2830,40 @@ class NPUModelRunner(GPUModelRunner):
         dict[str, int],
         list[int],
     ]:
+        """采样后的同步记账：解析采样输出、回写 input_batch、计算 logprobs。
+
+        主要职责：
+          1) 丢弃请求处理：把被 discard 的请求的随机数生成器 offset 回滚，
+             保证后续可复现 / 不污染下一个请求的随机性。
+          2) 拷贝 req_ids / req_id_to_index 副本（异步调度下原表会被下一轮改，
+             输出必须用快照）。
+          3) 同步路径：下发 routed_experts 的 D2H（依赖 _to_list 里的 event 同步）。
+          4) 解析采样输出得到 valid_sampled_token_ids 与 logprobs：
+             - 非推测解码（max_gen_len==1）：直接 _to_list + logprobs.tolists()；
+             - 推测解码（max_gen_len>1）：用 RejectionSampler.parse_output 过滤
+               被拒 token，并按 cu_num_generated_tokens 整理 logprobs。
+          5) 异步路径：不在本机解析 token，只缓存 GPU 上的 sampled_token_ids
+             到 prev_sampled_token_ids，留给下一轮 _prepare_inputs 处理。
+          6) 把采样 token 回写到 input_batch.token_ids_cpu / num_tokens 等，
+             并同步到 req_state.output_token_ids，避免 scheduler 回传（PP 除外）。
+          7) 计算提示词 logprobs（如请求）。
+
+        返回：(logprobs_lists, valid_sampled_token_ids, prompt_logprobs_dict,
+              req_ids_output_copy, req_id_to_index_output_copy,
+              invalid_req_indices)。
+        """
         # TODO: implement PR 28597 from vllm
+        # 被 discard 的请求：回滚其采样时消耗的随机数 offset，
+        # 避免影响后续请求的随机数序列（rejection sampler 内部会用到）
         discard_sampled_tokens_req_indices = self.discard_request_indices.np[: self.num_discarded_requests]
         for i in discard_sampled_tokens_req_indices:
             gen = self.input_batch.generators.get(int(i))
             if gen is not None:
                 gen.set_offset(gen.get_offset() - 4)
 
-        # Copy some objects so they don't get modified after returning.
-        # This is important when using async scheduling.
+        # 拷贝 req_ids / req_id_to_index 副本作为输出。
+        # 异步调度下 input_batch 的这两张表会在下一轮被改写，输出必须用快照
+        # 防止上层在异步拷贝未完成时读到下一轮的新值
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
@@ -2677,12 +2873,9 @@ class NPUModelRunner(GPUModelRunner):
         invalid_req_indices = []
         logprobs_lists = None
         if not self.use_async_scheduling:
-            # Sync scheduling: issue routed experts D2H into the pinned
-            # CPU buffer BEFORE ``_to_list`` below. ``_to_list`` does
-            # ``event.synchronize()`` on the async copy stream which
-            # waits for every D2H queued on the default stream since
-            # the last sync, so this enqueue is naturally covered
-            # without requiring its own synchronize.
+            # 同步调度路径：在 _to_list 之前下发 routed_experts 的 D2H 到 pinned buffer。
+            # _to_list 内部会对异步拷贝流做 event.synchronize()，会等齐默认流上
+            # 自上次同步以来的所有 D2H，因此这里下发自然被覆盖，无需单独同步
             if self.routed_experts_initialized:
                 buf = self.routed_experts_capturer.get_device_buffer()
                 total = scheduler_output.total_num_scheduled_tokens
@@ -2692,19 +2885,20 @@ class NPUModelRunner(GPUModelRunner):
                     non_blocking=True,
                 )
 
-            # Get the valid generated tokens.
+            # 取出"有效的"采样 token（已过滤被 discard / 被拒的 token）
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
-                # No spec decode tokens.
+                # 非推测解码：每个请求只采 1 个 token
                 valid_sampled_token_ids = self._to_list(sampled_token_ids)
-                # Mask out the sampled tokens that should not be sampled.
+                # 被丢弃请求的采样结果置空
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[int(i)].clear()
                 if logprobs_tensors is not None:
                     logprobs_lists = logprobs_tensors.tolists()
             else:
-                # Includes spec decode tokens.
-                # parse_output returns (list[list[int]], LogprobsLists | None)
+                # 推测解码：sampled_token_ids 含 draft token，需要按 rejection
+                # 结果挑出被接受的 token，并整理对应 logprobs
+                # parse_output 返回 (list[list[int]], LogprobsLists | None)
                 valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
                     sampled_token_ids,
                     self.input_batch.vocab_size,
@@ -2712,29 +2906,34 @@ class NPUModelRunner(GPUModelRunner):
                     logprobs_tensors=logprobs_tensors,
                 )
         else:
+            # 异步调度路径：不在 host 解析，避免阻塞。
+            # GPU 上 sampled_token_ids 缓存到 prev_sampled_token_ids，
+            # 下一轮 _prepare_inputs 会把它写进 input_ids
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
 
             if self.num_spec_tokens <= 0:
                 assert sampled_token_ids.shape[-1] == 1
-                # Cache the sampled tokens on the NPU and avoid CPU sync.
-                # These will be copied into input_ids in the next step
-                # when preparing inputs.
+                # 把采样 token 留在 NPU 上避免 CPU 同步；
+                # 下一步准备输入时再拷进 input_ids
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
 
+            # 记录"上一轮 req_id 到 index 的映射"，且只含有效请求
             self.input_batch.prev_req_id_to_index = {
                 req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
 
-        # Cache the sampled tokens in the model runner, so that the scheduler
-        # doesn't need to send them back.
+        # 把本轮采样 token 缓存到 model_runner 内的 input_batch，
+        # 这样 scheduler 不必再回传 token（PP 场景例外：首尾 stage 无直接通信，
+        # scheduler 仍需中转）
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
+                # 异步路径：host 还没解析出真正 token，先用占位 -1
                 sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
             else:
                 sampled_ids = valid_sampled_token_ids[req_idx]
@@ -2744,6 +2943,7 @@ class NPUModelRunner(GPUModelRunner):
             if not sampled_ids:
                 continue
 
+            # 把采样 token 追加到该 req 的 token 序列尾部
             start_idx = self.input_batch.num_tokens_no_spec[req_idx]
             end_idx = start_idx + num_sampled_ids
             assert end_idx <= self.max_model_len, (
@@ -2761,17 +2961,32 @@ class NPUModelRunner(GPUModelRunner):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
-        # logprobs_lists is already set above:
-        # - max_gen_len == 1: logprobs_tensors.tolists() (no cu_num_tokens)
-        # - max_gen_len > 1: from RejectionSampler.parse_output() (filtered
-        #   with cu_num_generated_tokens already set)
+        # logprobs_lists 在上面已设置：
+        # - max_gen_len == 1：来自 logprobs_tensors.tolists()（未含 cu_num_tokens）
+        # - max_gen_len > 1：来自 RejectionSampler.parse_output()（已按
+        #   cu_num_generated_tokens 过滤）
 
-        # Compute prompt logprobs if needed.
+        # 按需计算提示词 logprobs（仅当请求声明要 prompt logprobs）
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output.num_scheduled_tokens,
         )
 
+        # 返回 6 元组，各字段含义：
+        #   - logprobs_lists：采样 token 的 logprobs（按请求分组的列表结构），
+        #     不需要 logprobs 时为 None。推测解码下来自 RejectionSampler.parse_output，
+        #     普通采样下来自 logprobs_tensors.tolists()。
+        #   - valid_sampled_token_ids：过滤后的有效采样 token，每个请求一个子列表，
+        #     已剔除被 discard 的请求（清空）和被拒绝的 draft token。
+        #     同步路径下有值，异步路径下为空 []（host 不解析，留在 NPU 上）。
+        #   - prompt_logprobs_dict：提示词部分的 logprobs，按 req_id 索引；
+        #     未请求 prompt logprobs 的请求对应 None。
+        #   - req_ids_output_copy：input_batch.req_ids 的快照副本。异步调度下原表
+        #     会在下一轮被改写，输出必须用快照，避免上层在 D2H 未完成时读到
+        #     下一轮的新值。
+        #   - req_id_to_index_output_copy：req_id → index 映射的快照副本，目的同上。
+        #   - invalid_req_indices：无效（被 discard）请求在本批次中的索引列表；
+        #     异步路径下直接来自 discard_sampled_tokens_req_indices.tolist()。
         return (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -3827,6 +4042,12 @@ class NPUModelRunner(GPUModelRunner):
         self._debugger_started = True
 
     def _finalize_dump_data(self, **kwargs) -> None:
+        """结束本轮调试数据 dump。
+
+        仅当 debugger 已配置且本 step 已启动时才执行；否则直接返回。
+        流程：先 stop 内部 capture（停止采集），再调 step() 把本轮
+        dump 数据落盘 / 上报。用于离线分析输入、KV、采样等中间状态。
+        """
         if self.debugger is None or not self._debugger_started:
             return
         if hasattr(self.debugger, "stop"):
