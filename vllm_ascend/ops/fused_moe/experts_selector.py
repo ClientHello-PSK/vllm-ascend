@@ -173,19 +173,38 @@ def _native_grouped_topk(
     num_expert_group: int | None,
     topk_group: int | None,
 ):
+    """分组筛选(grouped topk)第一阶段: 选"最强组",淘汰非选中组的专家。
+
+    DeepSeek grouped expert 的两阶段选择:
+      阶段1(本函数): 把 N_e 个专家分成 num_expert_group 组,选出最强的
+                     topk_group 个组,非选中组的专家分数置 0。
+      阶段2(由调用方做 torch.topk): 在幸存的候选里取 top_k 个专家。
+
+    为什么要分组: 强制 token 先从"几个最强组"里选,防止所有 token 扎堆到
+                  同一小撮专家,起到均衡负载的作用。
+
+    输入: topk_weights [num_token, num_experts] —— 已打分(可能已加 bias)
+    输出: topk_weights [num_token, num_experts] —— 非选中组置 0,选中组保留原分
+    """
     topk_group = 0 if topk_group is None else topk_group
     num_expert_group = 0 if num_expert_group is None else num_expert_group
 
     num_token = topk_weights.shape[0]
+    # ① 把 [num_token, num_experts] 重排为 [num_token, 组数, 每组专家数],
+    #   组内取 max 作为"组代表分"——用每组最强专家的实力代表整组
     grouped_weights = topk_weights.view(num_token, num_expert_group, -1).max(dim=-1).values
+    # ② 在组代表分上做 topk,选出最强的 topk_group 个组(返回组下标)
     topk_group_indices = torch.topk(grouped_weights.to(torch.float32), k=topk_group, dim=-1, sorted=False)[1]
+    # ③ 构造组级 mask: 被选中的组位置标 1,其余 0
     topk_group_mask = torch.zeros_like(grouped_weights)
     topk_group_mask.scatter_(1, topk_group_indices, 1)
+    # ④ 把组级 mask 扩展回专家级: 每个组位扩展成"该组所有专家"的位
     topk_weight_mask = (
         topk_group_mask.unsqueeze(-1)
         .expand(num_token, num_expert_group, topk_weights.shape[-1] // num_expert_group)
         .reshape(num_token, -1)
     )
+    # ⑤ 淘汰制: 非选中组的专家分数全部置 0,后续 topk 时它们绝不可能入选
     topk_weights = topk_weights.masked_fill(~topk_weight_mask.bool(), 0.0)
 
     return topk_weights
@@ -195,7 +214,15 @@ def _renormalize_topk_weights(
     topk_weights: torch.Tensor,
     renormalize: bool,
 ):
+    """对选中的 top-k 权重做归一化(norm_topk_prob)。
+
+    作用: 让每个 token 选中的 k 个专家权重之和 = 1。
+          即 topk_weights /= sum(topk_weights, dim=-1)。
+    何时触发: 当配置 norm_topk_prob=True(即 renormalize=True)时执行。
+    位置: 在 topk 选出专家之后、乘 routed_scaling_factor 之前。
+    """
     if renormalize:
+        # 沿专家维(dim=-1,即 k 个专家)求和并保持维度,再做逐元素除法
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights
 
@@ -208,26 +235,50 @@ def _select_expert_use_group_topk(
     num_expert_group: int | None,
     e_score_correction_bias: torch.Tensor | None,
 ):
+    """分组 topk 选择 + noaux_tc 权重还原。
+
+    本函数浓缩 DeepSeek MoE 路由两大精髓:
+      ① grouped topk(分组选择): 先选最强组,再选专家,防扎堆。
+      ② noaux_tc(无辅助损失负载均衡): 用 bias 调"选谁",但不污染"权重多大"。
+
+    noaux_tc 双轨机制(核心):
+      · "选谁"(选组 + 选专家) 用 s + bias  ← bias 在此生效,引导负载均衡
+      · "权重多大"(最终权重) 用 s(原始分)  ← gather 回不加 bias 的分数
+      bias 像幕后调度员: 左右选择,但不出现在最终权重数字里。
+
+    输入: topk_weights [num_token, num_experts] —— 已打分但未选专家
+    输出: topk_weights [num_token, top_k] —— 选中的 k 个专家权重
+          topk_ids    [num_token, top_k] —— 选中的 k 个专家 id(int32)
+    注意: 本函数不乘 routed_scaling_factor,由调用方收尾时乘。
+    """
     assert topk_group is not None
     assert num_expert_group is not None
 
     if e_score_correction_bias is not None:
         # Store original scores before applying correction bias. We use biased
         # scores for expert selection but original scores for routing weights
+        # —— noaux_tc: 备份原始分(用于最后算权重),加 bias 后的分仅用于"选"
         original_weights = topk_weights
         topk_weights = topk_weights + e_score_correction_bias.unsqueeze(0)
 
     # TODO: Change to npu_group_topk when the latest CANN and NNAL is available
     # >>> torch_npu._npu_group_topk(topk_weights, group_num=num_expert_group, k=topk_group)
+    # 阶段1: 分组筛选 —— 选 topk_group 个最强组,非选中组专家置 0
     topk_weights = _native_grouped_topk(topk_weights, num_expert_group, topk_group)
     # TODO bfloat16 is not supported in torch.topk with ge graph.
+    # 阶段2: topk —— 在幸存候选里取 top_k 个专家
     if e_score_correction_bias is not None:
+        # 有 bias: 用加 bias 的分选专家(biased),用原始分当权重(unbiased)
         topk_ids = torch.topk(topk_weights.to(torch.float32), k=top_k, dim=-1, sorted=False)[1]
         # Use original unbiased scores for the routing weights
+        # —— noaux_tc 精髓: 权重 gather 不加 bias 的原始分
         topk_weights = original_weights.gather(1, topk_ids)
     else:
+        # 无 bias: 直接 topk,分数同时当权重
         topk_weights, topk_ids = torch.topk(topk_weights.to(torch.float32), k=top_k, dim=-1, sorted=False)
+    # 后续 npu_moe_init_routing 算子要求专家 id 为 int32
     topk_ids = topk_ids.to(torch.int32)
+    # 可选归一化: 让选中 k 个权重和为 1(norm_topk_prob)
     topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
     return topk_weights, topk_ids
 
@@ -325,39 +376,58 @@ def _native_select_experts(
     tid2eid: dict[int, int] | None = None,
     input_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Select top-k experts based on router logits.
+    """纯 PyTorch 的 MoE 路由参考实现(NPU 融合算子不可用时的 fallback)。
+
+    本函数逻辑完全透明,是理解"MoE 选专家到底在算什么"的最佳入口。
+    V4 正常配置走融合算子(_select_experts_with_fusion_ops),不走这里;
+    但融合算子做的事与本函数一一对应。
+
+    选专家的本质四步:
+      ① 打分 scoring    : router_logits → 每个专家的分数(全部 N_e 个)
+      ② 筛选(可选) group : 分组场景先选"最强组",缩小候选
+      ③ topk           : 取分数最高的 k 个 → topk_ids
+      ④ 后处理         : 归一化(renorm) + 路由缩放(scaling) → topk_weights
 
     Args:
-        hidden_states: Hidden states of shape (num_tokens, hidden_size).
-        router_logits: Router logits of shape (num_tokens, num_experts).
-        top_k: Number of experts to select.
-        use_grouped_topk: Whether to group experts before selecting top-k.
-        renormalize: Whether to renormalize the routing weights.
-        topk_group: Number of expert groups to select from.
-        num_expert_group: Number of experts in each group.
-        custom_routing_function: Custom routing function.
-        scoring_func: Scoring function to use.
-        e_score_correction_bias: Correction bias to apply to expert scores.
+        hidden_states: shape (num_tokens, hidden_size);本函数仅用其 dtype
+        router_logits: shape (num_tokens, num_experts);gate 已算好的原始偏好分
+        top_k: 每个 token 选几个专家
+        use_grouped_topk: 是否启用 DeepSeek 分组选择
+        renormalize: 是否对 top-k 权重归一化(norm_topk_prob)
+        topk_group: 分组选择时选几个组
+        num_expert_group: 专家分多少组
+        custom_routing_function: 自定义路由函数(可空)
+        scoring_func: 打分函数 softmax/sigmoid/sqrtsoftplus(V4 用 sqrtsoftplus)
+        routed_scaling_factor: 路由缩放因子
+        e_score_correction_bias: noaux_tc 偏置(可空)
+        use_hash/tid2eid/input_ids: hash 路由相关;本函数不支持(融合算子才支持)
 
     Returns:
-        topk_weights: Routing weights of shape (num_tokens, top_k).
-        topk_ids: Selected expert IDs of shape (num_tokens, top_k).
+        topk_weights: shape (num_tokens, top_k);路由权重
+        topk_ids: shape (num_tokens, top_k);选中的专家 id(int32)
 
     Raises:
         ValueError: If an unsupported scoring function is provided.
     """
 
+    # ① 打分: 对全部 N_e 个专家应用打分函数,得到可比、可作权重的分数
+    #   注: 此时 topk_weights 形状仍为 [num_tokens, num_experts],还没开始选
     if scoring_func == "softmax":
+        # softmax: 沿专家维归一化为概率分布(和为1),指数放大差距
         topk_weights = router_logits.softmax(dim=-1)
     elif scoring_func == "sigmoid":
+        # sigmoid: 逐元素压到 (0,1),各专家独立,互不影响
         topk_weights = router_logits.sigmoid()
     elif scoring_func == "sqrtsoftplus":
+        # sqrtsoftplus(V4): sqrt(ln(1+e^x)),平滑、恒正、压缩范围,不剧烈放大差距
         topk_weights = F.softplus(router_logits).sqrt()
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
 
+    # ②③ 分支选择专家
     if use_grouped_topk:
+        # 分支 A: DeepSeek 分组选择(V4 走这条)
+        # 内部完成 noaux_tc + 分组筛选 + topk + gather 还原权重 + renorm
         topk_weights, topk_ids = _select_expert_use_group_topk(
             topk_weights=topk_weights,
             top_k=top_k,
@@ -366,12 +436,15 @@ def _native_select_experts(
             num_expert_group=num_expert_group,
             e_score_correction_bias=e_score_correction_bias,
         )
+        # 乘路由缩放因子(补偿"只激活 k 个专家"带来的幅度下降)
         return topk_weights * routed_scaling_factor, topk_ids
 
+    # 非 grouped 分支: 先加 bias(如有),用于选专家
     if e_score_correction_bias is not None:
         topk_weights = topk_weights + e_score_correction_bias
 
     if custom_routing_function is not None:
+        # 分支 B: 自定义路由 —— 调用户函数,自己负责选专家和权重(不乘 scaling)
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -382,11 +455,16 @@ def _native_select_experts(
         topk_ids = topk_ids.to(torch.int32)
         return topk_weights, topk_ids
 
+    # 分支 C: 普通 topk(无分组、无自定义)
+    # 在(可能加 bias 的)分数上取 top_k 个专家
+    # 注: 此分支权重含 bias(未像分支A那样 gather 还原为 unbiased),
+    #     但本分支通常不与 noaux_tc 组合使用
     topk_weights, topk_ids = topk_weights.topk(top_k, dim=-1)
     topk_weights = topk_weights.to(hidden_states.dtype)
 
     # Required by npu_moe_init_routing
     topk_ids = topk_ids.to(torch.int32)
+    # ④ 后处理: 归一化 + 路由缩放
     topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
     topk_weights = topk_weights * routed_scaling_factor
 
