@@ -34,7 +34,7 @@ pydantic_core.ValidationError: 1 validation error for ParallelConfig
 
 **解决**：去掉 `--data-parallel-rank 0`。DP=1 单进程不需要外置 DP rank —— PD 分离靠 **kv-transfer（KV 传输）+ router（请求转发）**，跟 data-parallel 外置无关。
 
-**影响文件**：`hixl-p.sh` / `hixl-d.sh`（v0.23.0 + dss，各去掉 `--data-parallel-rank 0` 一行）。
+**影响文件**：`hixl-p.sh` / `hixl-d.sh`（v0.23.0 + dss，各去掉 `--data-parallel-rank 0` 一行）。该 bug 与 KV connector 无关（纯 vLLM `ParallelConfig` 校验），`mooncake-p.sh` / `mooncake-d.sh` 同样带这行，2026-07-23 一并删除。
 
 ---
 

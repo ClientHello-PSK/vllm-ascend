@@ -66,6 +66,7 @@ vllm serve "$MODEL_PATH" \
   --trust-remote-code \
   --gpu_memory_utilization "$GPU_MEMORY_USE" \
   --enforce-eager \
+  --kv-cache-memory-bytes 52162245120 \
   --kv-transfer-config \
 '{
   "kv_connector": "HIXLConnectorV1",

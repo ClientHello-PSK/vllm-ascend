@@ -25,7 +25,7 @@ export MOONCAKE_CONFIG_PATH=./mooncake-d.json
 export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.0/python/site-packages/mooncake:$LD_LIBRARY_PATH
 
 NETWORK_INTERFACE="eth0"
-export ASCEND_RT_VISIBLE_DEVICES=0
+export ASCEND_RT_VISIBLE_DEVICES=7  # 与 hixl-d.sh 同卡；启动前 npu-smi info 确认该卡空闲
 
 # 模型：须与 P 端一致（同 hixl-d.sh）
 MODEL_PATH="/data/models/Qwen2.5-3B-Instruct"
@@ -59,7 +59,6 @@ vllm serve "$MODEL_PATH" \
   --host "$IP_ADDRESS" \
   --port "$SERVICE_PORT" \
   --data-parallel-size "$DECODE_DATA_PARALLEL_SIZE" \
-  --data-parallel-rank 0 \
   --tensor-parallel-size "$DECODE_TENSOR_PARALLEL_SIZE" \
   --served-model-name "$MODEL_NAME" \
   --max_model_len 32768 \

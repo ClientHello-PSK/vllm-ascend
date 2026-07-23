@@ -1,17 +1,18 @@
 #!/bin/bash
 # ============================================================================
-# MooncakeConnectorV1 基线测试 - Prefill 节点（kv_producer）
+# HIXLConnectorV1 Phase 1 测试 - Prefill 节点（kv_producer）
 # ----------------------------------------------------------------------------
-# 作为 HIXL 的对比基线：与 hixl-p.sh 严格对齐（同 Qwen2.5-3B / TP=1 / DP=1），
-# 验证 HIXL 输出与 mooncake 一致（HIXL 正确性验收的基准）。
+# 最小配置：单 P 单 D、TP=1/PP=1/DP=1、单 HIXLConnectorV1（不组合）、
+# 标准 FullAttention 模型。用于验证 HIXL 主链路（register_blocks_cache +
+# link_clusters + pull_blocks）。
 #
-# ⚠️ mooncake 必需（HIXL 不需要，hixl-p.sh 没有这些）：
-#   - MOONCAKE_CONFIG_PATH 指向 mooncake.json（P2P 握手配置）
-#   - mooncake 库（LD_LIBRARY_PATH）
-#   准备：把你原 p0-223.sh 配套的 mooncake.json 复制到本脚本同目录。
+# 启动顺序：先启 hixl-p.sh（本脚本），等 P 端 log 出现
+#   "HIXL KVCacheSendingThread listening on ..." 后，再启 hixl-d.sh。
 #
-# 启动顺序：先启 mooncake-p.sh，P 端 log 出现 "KVCacheSendingThread
-# listening on ..." 后，再启 mooncake-d.sh。
+# 验证点（P 端 log）：
+#   1. "HixlDataDist initialized: role=PROMPT cluster_id=1000 ..."
+#   2. "HIXL KVCacheSendingThread listening on tcp://<ip>:<handshake_port>"
+#   3. 收到 D 的 GET_META / DONE 后正常回 ACK
 # ============================================================================
 
 # ======================== 需修改：环境相关 ========================
@@ -22,19 +23,16 @@ MASTER_IP_ADDRESS="x.x.x.223"   # TODO: 改成 P 节点 IP
 IP_ADDRESS="x.x.x.223"          # TODO: 改成 P 节点 IP（本机）
 SERVICE_PORT=8800
 
-# ---- mooncake 必需（HIXL 不需要这些，别漏）----
-export MOONCAKE_CONFIG_PATH=./mooncake-p.json
-# TODO: 改成你环境的 mooncake 库路径（参考原 p0-223.sh，cann 版本号按实际）
-export LD_LIBRARY_PATH=/usr/local/Ascend/cann-9.0.0/python/site-packages/mooncake:$LD_LIBRARY_PATH
-
+# 卡：TP=1 用单卡
 NETWORK_INTERFACE="eth0"
-export ASCEND_RT_VISIBLE_DEVICES=0
+export ASCEND_RT_VISIBLE_DEVICES=7
 
-# 模型：与 hixl-p.sh 一致（标准 FullAttention，便于对比）
+# 模型：标准 FullAttention 单 group（HIXL Phase 1 要求 block_size_scale==1、单 group）
+# TODO: 改成你的标准 attention 模型路径（Qwen2.5/Llama 等，勿用 MoE/Mamba/MTP）
 MODEL_PATH="/data/models/Qwen2.5-3B-Instruct"
 MODEL_NAME="Qwen2.5-3B"
 
-# 并行维度：与 hixl-p.sh 一致（TP=1/DP=1）
+# Phase 1 并行维度（硬约束：TP=1/PP=1，建议 DP=1）
 PREFILL_DATA_PARALLEL_SIZE=1
 PREFILL_TENSOR_PARALLEL_SIZE=1
 DECODE_DATA_PARALLEL_SIZE=1
@@ -44,7 +42,7 @@ LIBJEMALLOC_SO_PATH="/usr/lib/aarch64-linux-gnu/libjemalloc.so.2"
 GPU_MEMORY_USE=0.9
 MAX_BATCHED_TOKENS=4096
 
-# ======================== 通用环境变量 ========================
+# ======================== 通用环境变量（无 mooncake）========================
 export VLLM_USE_V1=1
 export HCCL_BUFFSIZE=512
 export HCCL_IF_IP="$IP_ADDRESS"
@@ -62,7 +60,6 @@ vllm serve "$MODEL_PATH" \
   --host "$IP_ADDRESS" \
   --port "$SERVICE_PORT" \
   --data-parallel-size "$PREFILL_DATA_PARALLEL_SIZE" \
-  --data-parallel-rank 0 \
   --tensor-parallel-size "$PREFILL_TENSOR_PARALLEL_SIZE" \
   --served-model-name "$MODEL_NAME" \
   --max_model_len 32768 \
@@ -71,17 +68,22 @@ vllm serve "$MODEL_PATH" \
   --trust-remote-code \
   --gpu_memory_utilization "$GPU_MEMORY_USE" \
   --enforce-eager \
+  --kv-cache-memory-bytes 52162245120 \
   --kv-transfer-config \
 '{
-  "kv_connector": "MooncakeConnectorV1",
+  "kv_connector": "HIXLConnectorV1",
   "kv_role": "kv_producer",
-  "kv_port": "21202",
+  "kv_port": "21299",
   "kv_connector_extra_config": {
-    "use_ascend_direct": true,
+    "hixl": {
+      "cluster_id_base": 1000,
+      "model_id": 0,
+      "link_timeout_ms": 5000
+    },
     "prefill": {"dp_size": 1, "tp_size": 1},
     "decode":   {"dp_size": 1, "tp_size": 1}
   }
 }' \
-  > /tmp/mooncake-p.log 2>&1 &
+  > /tmp/hixl-p.log 2>&1 &
 
-echo "Prefill (MooncakeConnectorV1 kv_producer) started, log: /tmp/mooncake-p.log, pid: $!"
+echo "Prefill (kv_producer) started, log: /tmp/hixl-p.log, pid: $!"
