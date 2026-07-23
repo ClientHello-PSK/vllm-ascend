@@ -27,9 +27,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
+from vllm.logger import logger
 
 # Fixed for the direct-HIXL (no-Mooncake) path. Setting ``transfer_backend``
 # requires EnableCacheManager + EnableRemoteCacheAccessible + listen_ip_info,

@@ -24,7 +24,7 @@ SERVICE_PORT=8801
 
 # 卡：TP=1 用单卡
 NETWORK_INTERFACE="eth0"
-export ASCEND_RT_VISIBLE_DEVICES=0
+export ASCEND_RT_VISIBLE_DEVICES=7
 
 # 模型：须与 P 端一致（同路径/同配置）
 MODEL_PATH="/data/models/Qwen2.5-3B-Instruct"
@@ -58,7 +58,6 @@ vllm serve "$MODEL_PATH" \
   --host "$IP_ADDRESS" \
   --port "$SERVICE_PORT" \
   --data-parallel-size "$DECODE_DATA_PARALLEL_SIZE" \
-  --data-parallel-rank 0 \
   --tensor-parallel-size "$DECODE_TENSOR_PARALLEL_SIZE" \
   --served-model-name "$MODEL_NAME" \
   --max_model_len 32768 \
@@ -71,7 +70,7 @@ vllm serve "$MODEL_PATH" \
 '{
   "kv_connector": "HIXLConnectorV1",
   "kv_role": "kv_consumer",
-  "kv_port": "20102",
+  "kv_port": "21299",
   "kv_connector_extra_config": {
     "hixl": {
       "cluster_id_base": 2000,

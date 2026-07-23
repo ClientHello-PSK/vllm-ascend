@@ -25,7 +25,7 @@ SERVICE_PORT=8800
 
 # 卡：TP=1 用单卡
 NETWORK_INTERFACE="eth0"
-export ASCEND_RT_VISIBLE_DEVICES=0
+export ASCEND_RT_VISIBLE_DEVICES=7
 
 # 模型：标准 FullAttention 单 group（HIXL Phase 1 要求 block_size_scale==1、单 group）
 # TODO: 改成你的标准 attention 模型路径（Qwen2.5/Llama 等，勿用 MoE/Mamba/MTP）
@@ -60,7 +60,6 @@ vllm serve "$MODEL_PATH" \
   --host "$IP_ADDRESS" \
   --port "$SERVICE_PORT" \
   --data-parallel-size "$PREFILL_DATA_PARALLEL_SIZE" \
-  --data-parallel-rank 0 \
   --tensor-parallel-size "$PREFILL_TENSOR_PARALLEL_SIZE" \
   --served-model-name "$MODEL_NAME" \
   --max_model_len 32768 \
@@ -73,7 +72,7 @@ vllm serve "$MODEL_PATH" \
 '{
   "kv_connector": "HIXLConnectorV1",
   "kv_role": "kv_producer",
-  "kv_port": "21202",
+  "kv_port": "21299",
   "kv_connector_extra_config": {
     "hixl": {
       "cluster_id_base": 1000,

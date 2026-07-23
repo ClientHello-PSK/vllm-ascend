@@ -577,6 +577,11 @@ class KVCacheRecvingThread(threading.Thread):
             ensure_zmq_send(sock, self.encoder.encode((GET_META_MSG, "")), f"{remote_host}:{remote_handshake_port}")
             metadata_bytes = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
             agent_meta = self.decoder.decode(metadata_bytes)
+            logger.info(
+                "HIXL DEBUG D got meta: cluster_id=%s listen=%s:%s num_tensors_per_group=%s",
+                agent_meta.cluster_id, agent_meta.listen_ip, agent_meta.listen_port,
+                agent_meta.num_tensors_per_group,
+            )
             engine_id = agent_meta.engine_id
             assert engine_id != self.local_engine_id, (
                 f"Conflict engine id {engine_id} with local {self.local_engine_id}."
@@ -652,6 +657,14 @@ class KVCacheRecvingThread(threading.Thread):
                 continue
             # Chunk by contiguous spans to reduce number of pull calls.
             grouped_remote, grouped_local = group_concurrent_contiguous(src_blocks, dst_blocks)
+            logger.info(
+                "HIXL DEBUG pull: remote_cluster=%s dst_cache_id=%s dst_is_blocks=%s "
+                "dst_shape=%s dst_num_tensors=%s src_blocks=%s dst_blocks=%s",
+                remote_cluster_id, dst_cache.cache_id, dst_cache.is_blocks_cache,
+                dst_cache.cache_desc.shape, dst_cache.cache_desc.num_tensors,
+                src_blocks, dst_blocks,
+            )
+            num_layers = dst_cache.cache_desc.num_tensors // 2
             for chunk_remote, chunk_local in zip(grouped_remote, grouped_local):
                 try:
                     self.cache_manager.pull_blocks(
@@ -659,7 +672,8 @@ class KVCacheRecvingThread(threading.Thread):
                         dst_cache,
                         src_blocks=chunk_remote,
                         dst_blocks=chunk_local,
-                        # PP=1: src/dst_layer_range omitted (None).
+                        src_layer_range=range(num_layers),
+                        dst_layer_range=range(num_layers),
                     )
                 except LLMException as e:
                     logger.error(
@@ -1052,7 +1066,7 @@ class HIXLConnectorWorker:
         hixl_cfg: dict[str, Any] = kvtc.get_from_extra_config("hixl", {})
         hixl_cfg.setdefault("prefill" if self.kv_role == "kv_producer" else "decode", role_cfg)
         hixl_cfg.setdefault("cluster_id_base", None)
-        hixl_cfg.setdefault("listen_port_base", kvtc.kv_port)
+        hixl_cfg.setdefault("listen_port_base", kvtc.kv_port + 10000)
         return hixl_cfg
 
     def _compute_identity(self) -> tuple[int, str, int]:
@@ -1062,7 +1076,7 @@ class HIXLConnectorWorker:
         assert cluster_id_base is not None, (
             "extra_config['hixl']['cluster_id_base'] is required (P/D must use disjoint bases)."
         )
-        listen_port_base = extra.get("listen_port_base", self.vllm_config.kv_transfer_config.kv_port)
+        listen_port_base = extra.get("listen_port_base", self.vllm_config.kv_transfer_config.kv_port + 10000)
         device_index = (self.pp_rank * 1 + 0) * self.tp_size + self.tp_rank  # pcp=1, pcp_rank=0
         offset = self.dp_rank * (self.tp_size * self.pp_size) + device_index
         return int(cluster_id_base) + offset, self.side_channel_host, int(listen_port_base) + offset
@@ -1087,6 +1101,21 @@ class HIXLConnectorWorker:
     def _build_kv_group2layeridx(self) -> dict[int, tuple[dict[str, Any], list[int]]]:
         from vllm.v1.worker.utils import extract_layer_index
 
+        def to_msgpackable(value: Any) -> Any:
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, dict):
+                return {str(k): to_msgpackable(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [to_msgpackable(item) for item in value]
+            try:
+                builtins_value = msgspec.to_builtins(value)
+                if builtins_value is value:
+                    return repr(value)
+                return to_msgpackable(builtins_value)
+            except TypeError:
+                return repr(value)
+
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] = {}
         num_attn_module = 1
         transfer_group_id = 0
@@ -1096,7 +1125,7 @@ class HIXLConnectorWorker:
             spec = group_spec.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = {n: spec.kv_cache_specs[n] for n in layer_names}
-            serialized_spec = msgspec.to_builtins(spec)
+            serialized_spec = to_msgpackable(spec)
             if not isinstance(serialized_spec, dict):
                 serialized_spec = {"repr": serialized_spec}
             num_kv_heads = getattr(group_spec.kv_cache_spec, "num_kv_heads", None)
@@ -1118,8 +1147,11 @@ class HIXLConnectorWorker:
         """Register KV via HIXL register_blocks_cache (one Cache per group).
 
         Replaces Mooncake's collect_storage_merged_register_regions +
-        global_te.register_buffer. P registers with remote_accessible=True; D
-        with False (dst_cache for pull_blocks)."""
+        global_te.register_buffer. Both P and D register with
+        remote_accessible=True: P so the decoder can find/resolve the src
+        cache, D because llm_datadist's PullCacheByGet path (force-enabled by
+        EnableRemoteCacheAccessible=1) requires the local dst cache to be
+        remote_accessible too, else pull_blocks returns LLM_PARAM_INVALID."""
         from llm_datadist import CacheDesc, BlocksCacheKey, Placement
 
         self.kv_caches = kv_caches
@@ -1171,11 +1203,23 @@ class HIXLConnectorWorker:
                 data_type=_torch_dtype_to_llm_dtype(ref_dtype),
                 placement=Placement.DEVICE,
             )
+            # Both P and D register remote_accessible=True. P so the decoder
+            # can resolve the src cache; D because llm_datadist's PullCacheByGet
+            # path (force-enabled via EnableRemoteCacheAccessible=1) requires
+            # the local dst cache to be remote_accessible too, else
+            # pull_blocks returns LLM_PARAM_INVALID.
+            remote_accessible = True
             cache = self.cache_manager.register_blocks_cache(
                 cache_desc,
                 addrs,
                 BlocksCacheKey(self.cluster_id, self.model_id),
-                remote_accessible=(self.kv_role == "kv_producer"),
+                remote_accessible=remote_accessible,
+            )
+            logger.info(
+                "HIXL DEBUG register: cluster_id=%s model_id=%s shape=%s num_tensors=%s "
+                "num_blocks=%s remote_accessible=%s kv_role=%s",
+                self.cluster_id, self.model_id, cache_desc.shape, cache_desc.num_tensors,
+                ref_shape[0], remote_accessible, self.kv_role,
             )
             self.group_caches[kv_cache_group_id] = cache
 
@@ -1194,6 +1238,10 @@ class HIXLConnectorWorker:
             block_size_scale=block_size_scale,
             local_ip=get_ip(),
             handshake_port=self.handshake_port,
+        )
+        logger.info(
+            "HIXL DEBUG P metadata: cluster_id=%s listen=%s:%s num_tensors_per_group=%s",
+            self.cluster_id, self.listen_ip, self.listen_port, num_tensors_per_group,
         )
         self.xfer_handshake_metadata = metadata
 
