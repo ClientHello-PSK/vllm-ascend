@@ -1066,7 +1066,7 @@ class HIXLConnectorWorker:
         hixl_cfg: dict[str, Any] = kvtc.get_from_extra_config("hixl", {})
         hixl_cfg.setdefault("prefill" if self.kv_role == "kv_producer" else "decode", role_cfg)
         hixl_cfg.setdefault("cluster_id_base", None)
-        hixl_cfg.setdefault("listen_port_base", kvtc.kv_port + 10000)
+        hixl_cfg.setdefault("listen_port_base", kvtc.kv_port + 1000)
         return hixl_cfg
 
     def _compute_identity(self) -> tuple[int, str, int]:
@@ -1076,7 +1076,7 @@ class HIXLConnectorWorker:
         assert cluster_id_base is not None, (
             "extra_config['hixl']['cluster_id_base'] is required (P/D must use disjoint bases)."
         )
-        listen_port_base = extra.get("listen_port_base", self.vllm_config.kv_transfer_config.kv_port + 10000)
+        listen_port_base = extra.get("listen_port_base", self.vllm_config.kv_transfer_config.kv_port + 1000)
         device_index = (self.pp_rank * 1 + 0) * self.tp_size + self.tp_rank  # pcp=1, pcp_rank=0
         offset = self.dp_rank * (self.tp_size * self.pp_size) + device_index
         return int(cluster_id_base) + offset, self.side_channel_host, int(listen_port_base) + offset
