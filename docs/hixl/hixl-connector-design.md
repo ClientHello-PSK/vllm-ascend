@@ -97,7 +97,7 @@ sequenceDiagram
 
 ### 1.6.1 时序图的代码落地（调用点）
 
-时序图里每个箭头，代码里就两个文件调用：**worker 侧全在 [`ActiveKVConnector`](../../../../vllm/vllm/v1/worker/gpu/kv_connector.py)（`vllm/v1/worker/gpu/kv_connector.py`），scheduler 侧全在 `vllm/v1/core/sched/scheduler.py`**。
+时序图里每个箭头，代码里就两个文件调用：**scheduler 侧全在 `vllm/v1/core/sched/scheduler.py`，worker 侧全在 [`ActiveKVConnector`](../../../../vllm/vllm/v1/worker/gpu/kv_connector.py)（`vllm/v1/worker/gpu/kv_connector.py`）**。
 
 **调用链总览**：
 
@@ -109,32 +109,6 @@ vLLM engine 一个 step
     ├─ ActiveKVConnector.pre_forward()
     ├─ … forward 计算 …
     └─ ActiveKVConnector.post_forward()
-```
-
-**Worker 侧 — `ActiveKVConnector`**（适配层，把 model_runner 的 pre/post_forward 翻译成 connector 方法调用；`self.kv_connector` 是 `get_kv_transfer_group()` 返回的全局 connector 实例）：
-
-```python
-# __init__（启动时一次）→ register_kv_caches
-self.kv_connector.register_kv_caches(kv_caches_dict)              # kv_connector.py:56
-
-# pre_forward（每 forward 开始）→ handle_preemptions / bind / start_load_kv
-def pre_forward(self, scheduler_output):
-    kv_connector_metadata = scheduler_output.kv_connector_metadata
-    self.kv_connector.handle_preemptions(kv_connector_metadata)       # :67
-    self.kv_connector.bind_connector_metadata(kv_connector_metadata)  # :68
-    self.kv_connector.start_load_kv(get_forward_context())            # :72
-
-# post_forward（每 forward 结束）→ wait_for_save / get_finished / ... / clear
-def post_forward(self, finished_req_ids, wait_for_save=True):
-    if wait_for_save:
-        self.kv_connector.wait_for_save()                             # :85
-    output.finished_sending, output.finished_recving = \
-        self.kv_connector.get_finished(finished_req_ids)              # :87
-    output.invalid_block_ids = \
-        self.kv_connector.get_block_ids_with_load_errors()            # :89
-    output.kv_connector_worker_meta = \
-        self.kv_connector.build_connector_worker_meta()               # :93
-    self.kv_connector.clear_connector_metadata()                      # :95
 ```
 
 **Scheduler 侧 — `scheduler.py`**：
@@ -158,15 +132,67 @@ if not isinstance(self.connector, SupportsHMA):
 return self.connector.request_finished_all_groups(request, block_ids)     # scheduler.py:2503
 ```
 
+**Worker 侧 — `ActiveKVConnector`**（适配层，把 model_runner 的 pre/post_forward 翻译成 connector 方法调用；`self.kv_connector` 是 `get_kv_transfer_group()` 返回的全局 connector 实例）：
+
+```python
+# __init__（启动时一次）→ register_kv_caches（kv_connector.py:56）
+self.kv_connector.register_kv_caches(kv_caches_dict)
+
+# pre_forward（每 forward 开始）：绑计划、派活，不阻塞
+def pre_forward(self, scheduler_output):
+    # scheduler 在 scheduler.py:1166 挂的本 step 收发计划（即"桥梁"）
+    kv_connector_metadata = scheduler_output.kv_connector_metadata
+    # 抢占/驱逐前清理 paged buffer——base 默认 no-op（base.py:285），HIXL 未覆写
+    self.kv_connector.handle_preemptions(kv_connector_metadata)       # :67
+    # 把计划存到 self._connector_metadata（base.py:211），供 start_load_kv 内部取
+    self.kv_connector.bind_connector_metadata(kv_connector_metadata)  # :68
+    # 真正派活（HIXL 重写，hixl_connector.py:1309）：
+    #   1. 遍历 metadata.reqs_in_batch，给 send/recv 线程 task_tracker 登记本批 req
+    #   2. 遍历 metadata.requests（D 待接收），每组构造 GroupPull（Phase 1
+    #      num_group_pulls=1、remote_tp_offset=0），算远端握手端口
+    #      remote_port + tp_rank，调 kv_recv_thread.add_request(...) 交接收线程异步 pull_blocks
+    #   3. 遍历 metadata.requests_to_send（P 延迟发送），调 kv_send_thread.add_delayed_request(...)
+    # 只"派活"给后台线程，真正的 pull_blocks/发送在收发线程里异步进行，与 model forward 并行
+    self.kv_connector.start_load_kv(get_forward_context())            # :72
+
+# post_forward（每 forward 结束）：收结果、清状态
+def post_forward(self, finished_req_ids, wait_for_save=True):
+    if wait_for_save:
+        # 阻塞至异步 save 完成防 paged buffer 被覆盖；HIXL 是 no-op（hixl_connector.py:829）——
+        # P 发送由 KVCacheSendingThread 独立持有/拷贝，不在 forward 关键路径覆盖 buffer。
+        # save_kv_layer / wait_for_layer_load 同样 no-op
+        self.kv_connector.wait_for_save()                             # :85
+    # 从收发线程取本 step 已完成的 req id（hixl_connector.py:1291）：
+    #   P 端 kv_send_thread.get_and_clear_finished_requests() → finished_sending
+    #   D 端 kv_recv_thread.get_and_clear_finished_requests() → finished_recving
+    # scheduler 据此判定哪些 req 的 KV 转移真正结束（对应 request_finished 返回
+    # delay_free_blocks=True 的那些），可释放延迟占用的 block
+    output.finished_sending, output.finished_recving = \
+        self.kv_connector.get_finished(finished_req_ids)              # :87
+    # 取加载失败的 block id（hixl_connector.py:1304）：D 端 kv_recv_thread 拉取失败时
+    # 标记 invalid 并清空（get_and_clear_invalid_block_ids），告诉调度器这些 block 的
+    # KV 不可信、需重算
+    output.invalid_block_ids = \
+        self.kv_connector.get_block_ids_with_load_errors()            # :89
+    # 构造回传 scheduler 的 worker 元数据（如远端握手端口）；HIXL 基类默认 None（base.py:429），
+    # 握手走 set_xfer_handshake_metadata_*，Phase 1 此处一般空
+    output.kv_connector_worker_meta = \
+        self.kv_connector.build_connector_worker_meta()               # :93
+    # 把 self._connector_metadata 置 None（base.py:223），防本 step 计划泄漏到下一步
+    self.kv_connector.clear_connector_metadata()                      # :95
+```
+
+> 代码位置：HIXL worker 侧实现在 [`hixl_connector.py`](../../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py)，收发线程 `KVCacheSendingThread` / `KVCacheRecvingThread` 同文件。
+
 **时序 ↔ 代码对照表**：
 
 | §1.6 箭头 | 调用点 | 文件:行 |
 |---|---|---|
-| `register_kv_caches`（启动一次） | `ActiveKVConnector.__init__` | kv_connector.py:56 |
 | `get_num_new_matched_tokens` | `scheduler.schedule` | scheduler.py:763 |
 | `update_state_after_alloc` | `scheduler.schedule` | scheduler.py:956 |
 | `build_connector_meta` | `_build_kv_connector_meta` | scheduler.py:1189 |
 | `request_finished[_all_groups]` | 请求完成处理 | scheduler.py:2501/2503 |
+| `register_kv_caches`（启动一次） | `ActiveKVConnector.__init__` | kv_connector.py:56 |
 | `handle_preemptions` | `pre_forward` | kv_connector.py:67 |
 | `bind_connector_metadata` | `pre_forward` | kv_connector.py:68 |
 | `start_load_kv` | `pre_forward` | kv_connector.py:72 |
@@ -180,6 +206,20 @@ return self.connector.request_finished_all_groups(request, block_ids)     # sche
 
 1. **scheduler 和 worker 是两个进程**，靠 `SchedulerOutput.kv_connector_metadata` 传话：scheduler 在 `build_connector_meta` 把传输计划塞进去 → 序列化送 worker → worker 在 `pre_forward` 里 `bind_connector_metadata` 取出。这就是 §1.3 说的"metadata 是 scheduler↔worker 的桥梁"。
 2. **真正触发 KV 传输的是 `start_load_kv`**（kv_connector.py:72）。mooncake 在这里把请求入 `KVCacheRecvingThread` 队列（异步拉），HIXL 也在这里入队（→ `pull_blocks`）。所以时序图里 `start_load_kv` 是个**黑盒**——传输业务全在这个钩子内部，字节读还是 block 读时序图体现不出。
+
+**整 step 控制流串联**（调度侧 ↔ worker 侧）：
+
+```
+update_state_after_alloc（登记单个 req 的待接收 block）
+        → build_connector_meta（把本 batch 所有登记汇总成 metadata）
+        → [跨进程] scheduler_output.kv_connector_metadata
+        → pre_forward: bind + start_load_kv（派发给收发线程异步执行）
+        → forward 计算（与 pull/push 并行）
+        → post_forward: get_finished + get_block_ids_with_load_errors（汇报完成/失败）
+        → clear_connector_metadata
+```
+
+> 上文逐行描述对 mooncake 同样适用（钩子时序是框架驱动的通用合同），差异只在 `start_load_kv` 内部——mooncake 入队后走 `batch_transfer_sync_read` 字节级 RDMA 读，HIXL 入队后走 `pull_blocks` 块索引读（见 §2.1.3 / §3 的 HIXL 数据面）。`wait_for_save` 在 mooncake 里也是 no-op（整 request 传输，非逐层）。
 
 ---
 
@@ -285,6 +325,109 @@ _transfer（每请求，D 端）:      ④ batch_transfer_sync_read（字节寻�
 4. **P 端从不主动发数据**：P 只做 ①②③（暴露），数据 D 主动 read——HIXL 沿用此 D-pull 模型。
 
 **HIXL 替换要点**：① 换 `LLMDataDist`（`transfer_backend="hixl"`，非 mooncake ascend 后端）；② 换 `register_blocks_cache`（tensor，非字节段，**删 HCCL region 合并**）；③ 不需要（`listen_ip_info` 在 `LLMConfig` 设）；④ 换 `pull_blocks`（block 索引，非字节地址，**删字节算术簿记**）。详见第三部分 §3.2。
+
+### 2.1.5 P/D 端到端时序（scheduler + worker，mermaid）
+
+对照第三部分 §3.3.4.1 的 HIXL 时序。**控制面骨架（ZMQ GET_META / DONE + ROUTER/REQ + 握手汇总）与 HIXL 完全一致**，差异全在数据面：mooncake 用**字节寻址**（`register_memory` 字节段 + `batch_transfer_sync_read`），无 `ensure_linked`/`cluster_id`，靠 `session_id=f"{P_host}:{P_rpc_port}"` 建 session。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PS as P-scheduler
+    participant PW as P-worker
+    participant PST as P-sendThread
+    participant DS as D-scheduler
+    participant DW as D-worker
+    participant DRT as D-recvThread
+
+    rect rgb(230,245,255)
+    Note over PS,DW: 0. 启动期（一次性；register_kv_caches 纯 worker 侧，握手经框架汇总到 scheduler）
+    Note over PW: register_kv_caches（纯 worker 侧，无 scheduler 参与）
+    PW->>PW: register_memory（collect_storage_merged_register_regions 合并相邻段，控 region ≤256 → global_te.register_buffer 循环按字节段注册，远端可 RDMA 访问）
+    PW->>PW: 组装 MooncakeAgentMetadata → self.xfer_handshake_metadata（含 te_rpc_port / kv_caches_base_addr / block_lens / block_strides 字节寻址簿记）
+    PW->>PST: 起 ZMQ ROUTER 监听 tcp://side_channel_host:handshake_port（= side_channel_port + device_index）；阻塞等 ready_event
+    Note over DW: register_kv_caches（纯 worker 侧，无 scheduler 参与）
+    DW->>DW: register_memory（同样按字节段注册本地 KV，作为 batch_transfer_sync_read 的 dst 地址空间）
+    DW->>DW: 组装 MooncakeAgentMetadata → self.xfer_handshake_metadata 打包路由元数据
+    DW->>DRT: 起 KVCacheRecvingThread（内部用 zmq.REQ 主动连各 P 的 ROUTER，不 bind 监听）；阻塞等 ready_event
+    Note over PS,PW: 框架把各 worker 握手汇总到 scheduler
+    PW->>PS: get_handshake_metadata → set_xfer_handshake_metadata_from_workers
+    Note over PS: 整理进 multi_nodes_meta_mapping{port_offset:{host,engine_id}}
+    DW->>DS: get_handshake_metadata → set_xfer_handshake_metadata
+    Note over DS: D 端同理收集（供自身路由用）
+    end
+
+    rect rgb(255,245,230)
+    Note over PS,PW: 1. P 端 prefill（Step A，请求带 do_remote_decode=True）
+    PS->>PS: schedule: get_num_new_matched_tokens → (0, F)
+    PS->>PS: schedule: allocate_slots（整段 prompt 分 block）
+    PS->>PS: schedule: update_state_after_alloc → 入 _reqs_in_batch
+    PS->>PS: schedule: build_connector_meta（打包 _reqs_need_send + batch）
+    PS->>PW: scheduler_output(+meta)
+    PW->>PW: pre_forward: handle_preemptions(meta)
+    PW->>PW: pre_forward: bind_connector_metadata(meta)
+    PW->>PST: pre_forward: start_load_kv → add_delayed_request(...)
+    Note over PW: forward: prefill 算 KV → 本地 block
+    PW->>PS: post_forward: get_finished
+    Note over PS: update_from_output: request_finished()
+    Note over PS: 填 _reqs_need_send / 返回 (delay_free, params_dict)
+    Note over PS: params_dict = {do_remote_prefill=True, do_remote_decode=False, remote_block_ids, remote_engine_id,<br/>  remote_request_id, remote_host(=side_channel_host), remote_port(=side_channel_port), remote_pcp_size, remote_dcp_size,<br/>  remote_ptp_size, last_token_id, remote_multi_nodes_meta_mapping, num_prompt_blocks, remote_block_size}
+    Note over PS: delay_free → 不释放 block（D 还没拉走）
+    end
+
+    Note over PS,DS: params_dict 经 disaggregated router 路由到 D<br/>→ 成为 D 请求的 kv_transfer_params（do_remote_prefill=True）
+
+    rect rgb(230,255,230)
+    Note over DS,DW: 2. D 端拉取 KV（Step B，请求带 do_remote_prefill=True）
+    DS->>DS: schedule: get_num_new_matched_tokens → (count, T)
+    DS->>DS: schedule: num_new_tokens=0（load_kv_async，本步不算）
+    DS->>DS: schedule: allocate_slots（分接收 block）
+    DS->>DS: schedule: update_state_after_alloc → _reqs_need_recv + _reqs_in_batch；置 do_remote_prefill=False
+    DS->>DS: schedule: build_connector_meta: add_new_req 从 kv_transfer_params 提取 remote_block_ids/remote_engine_id/<br/>  remote_request_id/remote_host/remote_port/remote_pcp_size/remote_dcp_size/remote_ptp_size/<br/>  remote_multi_nodes_meta_mapping/num_prompt_blocks/remote_block_size + 本地 local_block_ids/num_external_tokens → ReqMeta
+    DS->>DW: scheduler_output(+meta)
+    DW->>DW: pre_forward: handle_preemptions(meta)
+    DW->>DW: pre_forward: bind_connector_metadata(meta)
+    DW->>DRT: pre_forward: start_load_kv → add_request(...)
+    Note over DW: _get_kv_split_metadata 算 TP/PP/PCP/DCP 几何（从哪些 P rank 哪些端口拉哪些 block）<br/>→ _get_group_pulls_metadata → 入 request_queue
+    Note over DW: forward: 本请求不算（num_new_tokens=0）
+    DRT->>PST: ZMQ GET_META：(GET_META_MSG, "")
+    PST-->>DRT: MooncakeAgentMetadata（msgpack：te_rpc_port, kv_caches_base_addr, block_lens, block_strides, block_size_scale, num_blocks, kv_group2layeridx）
+    Note over DRT: 缓存 P 的 kv_caches_base_addr / remote_te_port / remote_block_stride_per_addr / block_size_scale（字节寻址簿记，每 (engine,port) 只取一次）
+    DRT->>DRT: 遍历 group_pulls，对每层每 block 算字节地址：<br/>  src = P_base + local_block_id*block_stride + offset*inner_block_len<br/>  dst = D_base + remote_block_id*remote_block_stride<br/>  length = inner_block_len * len(block_group)
+    DRT->>DRT: engine.batch_transfer_sync_read(session_id=f"{P_host}:{P_rpc_port}", src_list, dst_list, length_list) → D 主动从 P 字节级 RDMA 读
+    Note over PW: P 被动，显存被读，不主动推数据（P worker 不参与此步）
+    Note over DRT: 后置 reformat（仅 TP>1 或 NZ 时）：把按 split 写入的 head shard 拼成正确布局
+    DRT->>DRT: 写入 local_block_ids
+    DRT->>PST: ZMQ DONE：(DONE_RECVING_MSG, request_id=remote_request_id, remote_port_send_num)
+    PST->>PST: task_tracker.update_done_task_count（按 remote_port_send_num 计数达标后完成 + 移出 delayed_free）
+    PST-->>DRT: ACK
+    DW->>DS: post_forward: get_finished
+    end
+
+    rect rgb(255,255,230)
+    Note over PS,PW: 3. P 端收尾
+    PW->>PS: get_finished 上报 send 完成（收到 DONE）
+    Note over PS: 取消 delay_free，释放 block
+    end
+
+    rect rgb(245,230,255)
+    Note over DS,DW: 4. D 端 decode（Step C+，KV 已就绪）
+    Note over DS: schedule: get_num→(0,F) / num_computed_tokens 含拉来的 KV
+    DS->>DW: scheduler_output
+    Note over DW: forward: decode 用本地 KV
+    end
+```
+
+**与 HIXL 时序的差异点（逐行对照 §3.3.4.1）**：
+
+| 阶段 | mooncake | HIXL |
+|---|---|---|
+| 0 注册 | `register_memory` 字节段（合并相邻 + ≤256 上限） | `register_blocks_cache` tensor/block（无合并） |
+| 0 metadata | `MooncakeAgentMetadata`（te_rpc_port / kv_caches_base_addr / block_lens / block_strides） | `HixlAgentMetadata`（cluster_id / listen_ip:port，砍字节字段） |
+| 2 GET_META 回包 | 字节寻址簿记（base_addr / rpc_port / strides） | cluster_id + listen_*（D 据此 `ensure_linked`） |
+| 2 建链 | 无 `ensure_linked`，靠 `session_id=f"{P_host}:{P_rpc_port}"` | `ensure_linked(P.cluster_id, listen_ip, listen_port)` |
+| 2 拉数据 | `batch_transfer_sync_read(session, src_list, dst_list, length_list)` 字节寻址，需自算裸地址 | `pull_blocks(BlocksCacheKey, dst_cache, src/dst_blocks, layer_range)` block 索引寻址 |
+| 2 后置 reformat | TP>1/NZ 时按 split 直写 + transpose 拼 | Phase 1 scale==1 no-op；TP>1 走 staging Cache |
 
 ## 2.2 Mooncake 的特殊适配点
 
@@ -474,6 +617,95 @@ D._send_done_recv_signal        → ZMQ DONE_RECVING_MSG 通知 P（P 仅记账+
 shutdown                        → D 端 shutdown_datadist()（unlink 所有 P + finalize）；P 端同理
 ```
 
+#### 3.3.4.1 P/D 端到端时序（scheduler + worker，mermaid）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PS as P-scheduler
+    participant PW as P-worker
+    participant PST as P-sendThread
+    participant DS as D-scheduler
+    participant DW as D-worker
+    participant DRT as D-recvThread
+
+    rect rgb(230,245,255)
+    Note over PS,DW: 0. 启动期（一次性；register_kv_caches 纯 worker 侧，握手经框架汇总到 scheduler）
+    Note over PW: register_kv_caches（纯 worker 侧，无 scheduler 参与）
+    PW->>PW: register_blocks_cache：按 group 把本地 KV 显存登记为 llm_datadist 的 block cache（remote_accessible=True）
+    PW->>PW: 组装 HixlAgentMetadata → self.xfer_handshake_metadata 打包路由元数据
+    PW->>PST: 起 ZMQ ROUTER 监听 tcp://side_channel_host:handshake_port（= side_channel_port + device_index）；阻塞等 ready_event
+    Note over DW: register_kv_caches（纯 worker 侧，无 scheduler 参与）
+    DW->>DW: register_blocks_cache：按 group 把本地 KV 显存登记为 llm_datadist 的 block cache（remote_accessible=True）→ 作为 pull_blocks 的 dst cache
+    DW->>DW: 组装 HixlAgentMetadata → self.xfer_handshake_metadata 打包路由元数据
+    DW->>DRT: 起 KVCacheRecvingThread（内部用 zmq.REQ 主动连各 P 的 ROUTER，不 bind 监听）；阻塞等 ready_event
+    Note over PS,PW: 框架把各 worker 握手汇总到 scheduler
+    PW->>PS: get_handshake_metadata → set_xfer_handshake_metadata_from_workers
+    Note over PS: 整理进 multi_nodes_meta_mapping{port_offset:{host,engine_id}}
+    DW->>DS: get_handshake_metadata → set_xfer_handshake_metadata
+    Note over DS: D 端同理收集（供自身路由用）
+    end
+
+    rect rgb(255,245,230)
+    Note over PS,PW: 1. P 端 prefill（Step A，请求带 do_remote_decode=True）
+    PS->>PS: schedule: get_num_new_matched_tokens → (0, F)
+    PS->>PS: schedule: allocate_slots（整段 prompt 分 block）
+    PS->>PS: schedule: update_state_after_alloc → 入 _reqs_in_batch
+    PS->>PS: schedule: build_connector_meta（打包 _reqs_need_send + batch）
+    PS->>PW: scheduler_output(+meta)
+    PW->>PW: pre_forward: handle_preemptions(meta)
+    PW->>PW: pre_forward: bind_connector_metadata(meta)
+    PW->>PST: pre_forward: start_load_kv → add_delayed_request(...)
+    Note over PW: forward: prefill 算 KV → 本地 block
+    PW->>PS: post_forward: get_finished
+    Note over PS: update_from_output: request_finished()
+    Note over PS: 填 _reqs_need_send / 返回 (delay_free, params_dict)
+    Note over PS: params_dict = {do_remote_prefill=True, do_remote_decode=False,<br/>  remote_block_ids(computed_block_ids), remote_engine_id, remote_request_id, remote_host(=get_ip()),<br/>  remote_port(=side_channel_port), remote_ptp_size, last_token_id, remote_multi_nodes_meta_mapping,<br/>  num_prompt_blocks, remote_block_size}（remote_multi_nodes_meta_mapping 来自 0. 握手汇总）
+    Note over PS: delay_free → 不释放 block（D 还没拉走）
+    end
+
+    Note over PS,DS: params_dict 经 disaggregated router 路由到 D<br/>→ 成为 D 请求的 kv_transfer_params（do_remote_prefill=True）
+
+    rect rgb(230,255,230)
+    Note over DS,DW: 2. D 端拉取 KV（Step B，请求带 do_remote_prefill=True）
+    DS->>DS: schedule: get_num_new_matched_tokens → (count, T)
+    DS->>DS: schedule: num_new_tokens=0（load_kv_async，本步不算）
+    DS->>DS: schedule: allocate_slots（分接收 block）
+    DS->>DS: schedule: update_state_after_alloc → _reqs_need_recv[req_id]=(req, local_block_ids, num_external_tokens) + _reqs_in_batch；置 do_remote_prefill=False
+    DS->>DS: schedule: build_connector_meta（打包 requests(ReqMeta) + batch）
+    Note over DS: add_new_req 从 kv_transfer_params 提取 remote_block_ids/remote_engine_id/remote_request_id/<br/>  remote_host/remote_port/remote_ptp_size/num_prompt_blocks/remote_block_size/num_computed_tokens<br/>  + 本地 local_block_ids/num_external_tokens → ReqMeta
+    DS->>DW: scheduler_output(+meta)
+    DW->>DW: pre_forward: handle_preemptions(meta)
+    DW->>DW: pre_forward: bind_connector_metadata(meta)
+    DW->>DRT: pre_forward: start_load_kv → add_request(...)
+    Note over DW: remote_handshake_port = remote_port + tp_rank(0)；group_pulls = [GroupPull(group_id,<br/>  remote_tp_offset=0, num_group_pulls=1, is_group_transfer_end=True)] per group；入 request_queue
+    Note over DW: forward: 本请求不算（num_new_tokens=0）
+    DRT->>PST: ZMQ GET_META：(GET_META_MSG, "")
+    PST-->>DRT: HixlAgentMetadata（msgpack：cluster_id, listen_ip/port, num_tensors_per_group,<br/>  kv_group2layeridx, block_size, num_blocks, block_size_scale）
+    DRT->>DRT: ensure_linked(remote_cluster_id=cluster_id, remote_ip=listen_ip, remote_port=listen_port)
+    DRT->>DRT: cache_manager.pull_blocks(BlocksCacheKey(P.cluster_id, model_id), dst_cache(D 已注册),<br/>  src_blocks=P.block_ids, dst_blocks=D.block_ids, src/dst_layer_range=range(num_layers))（按连续 span 分块）→ RDMA 读 P 显存
+    Note over PW: P 被动，显存被读，不主动推数据（P worker 不参与此步）
+    DRT->>DRT: 写入 local_block_ids（dst_cache）
+    DRT->>PST: ZMQ DONE：(DONE_RECVING_MSG, request_id=remote_request_id, remote_port_send_num)
+    PST->>PST: task_tracker.update_done_task_count（按 remote_port_send_num 计数达标后完成 + 移出 delayed_free）
+    PST-->>DRT: ACK
+    DW->>DS: post_forward: get_finished
+    end
+
+    rect rgb(255,255,230)
+    Note over PS,PW: 3. P 端收尾
+    PW->>PS: get_finished 上报 send 完成（收到 DONE）
+    Note over PS: 取消 delay_free，释放 block
+    end
+
+    rect rgb(245,230,255)
+    Note over DS,DW: 4. D 端 decode（Step C+，KV 已就绪）
+    Note over DS: schedule: get_num→(0,F) / num_computed_tokens 含拉来的 KV
+    DS->>DW: scheduler_output
+    Note over DW: forward: decode 用本地 KV
+    end
+```
+
 **与 AscendMultiConnector 组合**：HIXLConnector 的 scheduler 须容忍 `num_external_tokens=0`（非 chosen 子 connector 会收到真实 blocks 但 `n_ext=0`，base.py:501-504），此时 no-op（mooncake_connector.py:1742 已如此）。
 
 ## 3.4 关键决策（已核实）
@@ -580,7 +812,9 @@ KVConnectorFactory.register_connector(
 
 **验收**：每期与 `MooncakeConnectorV1` 同 P/D 几何输出逐位对齐。
 
-**待 NPU 验证**（代码无法定论）：
-1. 冒烟：P `register_blocks_cache` → D `ensure_linked` → D `pull_blocks` 单 block，字节与 P 一致；
-2. 端到端：`kv_connector=HIXLConnectorV1`，TP=1/PP=1/单 FullAttention，与 `MooncakeConnectorV1` 同配置 KV 逐位对齐；
-3. HIXL 独有路径：多 tensor 独立 `register_blocks_cache`（mooncake 走合并 region，未验过）、`pull_blocks` 整块写入的字节布局。
+**NPU 验证状态**（Phase 1 范围，2026-07-23 全部通过，详见 [`tests/hixl/bugfix-log.md`](../../../tests/hixl/bugfix-log.md)）：
+1. ✅ 冒烟：P `register_blocks_cache` → D `ensure_linked` → D `pull_blocks` 单 block，字节与 P 一致；
+2. ✅ 端到端：`kv_connector=HIXLConnectorV1`，TP=1/PP=1/单 FullAttention，与 `MooncakeConnectorV1` 同配置 KV 逐位对齐（`External prefix cache hit rate: 100.0%`）；
+3. ✅ HIXL 独有路径：多 tensor 独立 `register_blocks_cache`（Bug 6 修复后 pull 成功）、`pull_blocks` 整块写入字节布局（输出正确）。
+
+> **隐含前提**：第 3 项验证成立的前提是 reformat 为 no-op（TP=1 + 非 NZ + 标准 FullAttention，shape 本就对称、不拼 head）。Phase 2 上 staging + 真做 reformat transpose 时，"`pull_blocks` 整块写 → staging → reformat" 字节布局需作为首个冒烟用例**二次验证**。

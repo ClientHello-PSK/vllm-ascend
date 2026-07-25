@@ -15,6 +15,7 @@ import hashlib
 import logging
 import math
 import queue
+import random
 import struct
 import threading
 import time
@@ -139,6 +140,7 @@ class ReqMeta:
     remote_ptp_size: int
     num_prompt_blocks: int
     remote_block_size: int
+    remote_multi_nodes_meta_mapping: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,9 @@ class GroupPull:
     group_id: int
     remote_tp_offset: int
     num_group_pulls: int
+    # Phase 3 (PP>1) only; kept for parity with Mooncake's make_group_pulls /
+    # _get_hybrid_remote_rank_group_pulls constructors. Always 0 under PP=1.
+    prefill_pp_rank: int = 0
     is_group_transfer_end: bool = False
 
 
@@ -361,6 +366,13 @@ class KVCacheRecvingThread(threading.Thread):
         group_caches: dict[int, Any],  # kv_cache_group_id -> registered Cache
         block_size_scale: list[list[int]] | None = None,
         ready_event: threading.Event | None = None,
+        staging_tensors: dict[int, dict[str, list[torch.Tensor]]] | None = None,
+        staging_caches: dict[int, Any] | None = None,
+        is_hma_required: bool = False,
+        prefill_tp_size: int = 1,
+        num_key_value_heads: int = 0,
+        num_blocks: int = 0,
+        cluster_id: int = 0,
     ):
         super().__init__(daemon=True, name="HIXLKCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -379,6 +391,21 @@ class KVCacheRecvingThread(threading.Thread):
         self.kv_group2layeridx = kv_group2layeridx
         self.group_caches = group_caches  # kv_cache_group_id -> Cache
         self.block_size_scale = block_size_scale or []
+        # Phase 2: staging + reformat (TP>1 head reassembly).
+        self.staging_tensors = staging_tensors or {}
+        self.staging_caches = staging_caches or {}
+        self.is_hma_required = is_hma_required
+        self._prefill_tp_size = prefill_tp_size
+        self.num_key_value_heads = num_key_value_heads
+        self.num_blocks = num_blocks
+        self.cluster_id = cluster_id
+        # Reformat metadata keyed by request_id then shard index (No-CP: shard 0).
+        # Populated by the last TP-offset pull task for each group; applied once
+        # all pull tasks for the request finish (all_tasks_done).
+        self.pending_reformat: defaultdict[str, dict[int, list[tuple[int, list[list[int]], int, list[int]]]]] = (
+            defaultdict(dict)
+        )
+        self.pending_reformat_lock = threading.Lock()
 
         # remote_cluster_id[engine_id][handshake_port] = P cluster_id
         self.remote_cluster_id: dict[str, dict[int, int]] = SizedDict()
@@ -386,7 +413,20 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_metadata_lock = threading.Lock()
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
-        self.executor = ThreadPoolExecutor(max_workers=32)
+        first_kv_cache = next(iter(self.kv_caches.values()), None)
+        if first_kv_cache is None:
+            self.executor = ThreadPoolExecutor(max_workers=32)
+        else:
+            # NPU device selection is thread-local. Executor workers do not
+            # inherit the device selected by the model worker thread and would
+            # otherwise use device 0 on their first NPU operation (pull_blocks /
+            # reformat), corrupting multi-card TP>1 transfers.
+            kv_cache_device = first_kv_cache[0].device
+            self.executor = ThreadPoolExecutor(
+                max_workers=32,
+                initializer=torch.npu.set_device,
+                initargs=(kv_cache_device,),
+            )
         self.peer_request_queues: defaultdict[tuple[str, int], deque[dict[str, Any]]] = defaultdict(deque)
         self.active_peer_request_handlers: set[tuple[str, int]] = set()
         self.peer_request_queues_lock = threading.Lock()
@@ -557,7 +597,26 @@ class KVCacheRecvingThread(threading.Thread):
                     self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
                     logger.exception("Failed HIXL KV transfer for request %s: %s", remote_request_id, e)
         finally:
-            if self._mark_request_task_done(request_id, all_task_done):
+            all_tasks_done = self._mark_request_task_done(request_id, all_task_done)
+            if all_tasks_done:
+                # Reformat must run BEFORE update_done_task_count so that
+                # get_finished (gated by task_tracker) only surfaces the
+                # request after staging -> D real cache is fully assembled.
+                if transfer_failed or self._is_failed_recv_request(request_id):
+                    with self.pending_reformat_lock:
+                        self.pending_reformat.pop(request_id, None)
+                else:
+                    try:
+                        self._reformat_pending_kv_caches(request_id)
+                    except Exception as e:
+                        transfer_failed = True
+                        self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
+                        with self.pending_reformat_lock:
+                            self.pending_reformat.pop(request_id, None)
+                        logger.exception(
+                            "Failed to reformat HIXL KV cache after all pulls for request %s: %s",
+                            remote_request_id, e,
+                        )
                 self.task_tracker.update_done_task_count(request_id)
                 with self.proc_not_transfer_request_lock:
                     self.proc_not_transfer_request.pop(remote_request_id, None)
@@ -612,9 +671,11 @@ class KVCacheRecvingThread(threading.Thread):
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """D-pull KV via HIXL pull_blocks (block-index addressed).
 
-        Replaces Mooncake's src_list/dst_list/length_list byte arithmetic +
-        batch_transfer_sync_read. Phase 1: TP=1 (num_group_pulls==1), single
-        FullAttention group, PP=1 (no layer_range)."""
+        Phase 2: TP>1 (num_group_pulls>1) pulls each P-rank head shard into a
+        distinct staging Cache block (dst = local_block * tp_n + tp_offset);
+        the last shard for a group stashes a pending reformat that transposes
+        staging -> D real cache once all shards land. TP=1 (num_group_pulls==1)
+        pulls straight into the D real cache (Phase 1 path, no staging)."""
         remote_request_id = req_meta["remote_request_id"]
         local_block_ids: BlockIds = req_meta["local_block_ids"]
         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
@@ -622,6 +683,7 @@ class KVCacheRecvingThread(threading.Thread):
         remote_engine_id = req_meta["remote_engine_id"]
         remote_host = req_meta["remote_host"]
         remote_handshake_port = req_meta["remote_handshake_port"]
+        request_id = req_meta["request_id"]
 
         num_local_blocks = sum(len(group_block_ids) for group_block_ids in local_block_ids)
         if num_local_blocks == 0:
@@ -637,32 +699,51 @@ class KVCacheRecvingThread(threading.Thread):
 
         from llm_datadist import BlocksCacheKey, LLMException
 
+        ready_attention_group_reformat_block_ids: list[tuple[tuple, bool]] = []
+
         for group_pull in group_pulls:
             group_idx = group_pull.group_id
-            group_spec, _ = self.kv_group2layeridx[group_idx]
+            group_spec, layer_indices = self.kv_group2layeridx[group_idx]
             kv_cache_group_id = group_spec.get("kv_cache_group_id", group_idx)
-            # Phase 1: TP=1 only.
-            assert group_pull.num_group_pulls == 1, (
-                "HIXLConnector Phase 1 supports TP=1 only (num_group_pulls>1 needs staging)."
-            )
             with self.remote_metadata_lock:
                 remote_cluster_id = self.remote_cluster_id[remote_engine_id][remote_handshake_port]
-            dst_cache = self.group_caches.get(kv_cache_group_id)
-            if dst_cache is None:
-                logger.error("No registered HIXL cache for group %s; skip.", kv_cache_group_id)
-                continue
+            tp_n = group_pull.num_group_pulls
+            tp_offset = group_pull.remote_tp_offset
             src_blocks = list(remote_block_ids[kv_cache_group_id])
-            dst_blocks = list(local_block_ids[kv_cache_group_id])
-            if not src_blocks or not dst_blocks:
+            dst_logical = list(local_block_ids[kv_cache_group_id])
+            if not src_blocks or not dst_logical:
                 continue
-            # Chunk by contiguous spans to reduce number of pull calls.
-            grouped_remote, grouped_local = group_concurrent_contiguous(src_blocks, dst_blocks)
+
+            if tp_n > 1:
+                staging_cache = self.staging_caches.get(kv_cache_group_id)
+                if staging_cache is None:
+                    logger.error(
+                        "HIXL staging cache missing for group %s (tp_n=%s); skip.",
+                        kv_cache_group_id, tp_n,
+                    )
+                    continue
+                dst_cache = staging_cache
+                # Each P-rank shard lands in staging block b*tp_n + tp_offset.
+                dst_blocks = [b * tp_n + tp_offset for b in dst_logical]
+                # staging blocks are non-contiguous across the shard set, so
+                # pull one block at a time (mirrors Mooncake tp>1 path).
+                grouped_remote = [[b] for b in src_blocks]
+                grouped_local = [[b] for b in dst_blocks]
+                reformat_local = [[b] for b in dst_logical]  # D real block ids
+            else:
+                dst_cache = self.group_caches.get(kv_cache_group_id)
+                if dst_cache is None:
+                    logger.error("No registered HIXL cache for group %s; skip.", kv_cache_group_id)
+                    continue
+                dst_blocks = dst_logical
+                grouped_remote, grouped_local = group_concurrent_contiguous(src_blocks, dst_blocks)
+                reformat_local = grouped_local
+
             logger.info(
-                "HIXL DEBUG pull: remote_cluster=%s dst_cache_id=%s dst_is_blocks=%s "
-                "dst_shape=%s dst_num_tensors=%s src_blocks=%s dst_blocks=%s",
-                remote_cluster_id, dst_cache.cache_id, dst_cache.is_blocks_cache,
-                dst_cache.cache_desc.shape, dst_cache.cache_desc.num_tensors,
-                src_blocks, dst_blocks,
+                "HIXL DEBUG pull: remote_cluster=%s dst_cache_id=%s dst_shape=%s "
+                "num_tensors=%s tp_n=%s tp_offset=%s src=%s dst=%s",
+                remote_cluster_id, dst_cache.cache_id, dst_cache.cache_desc.shape,
+                dst_cache.cache_desc.num_tensors, tp_n, tp_offset, src_blocks, dst_blocks,
             )
             num_layers = dst_cache.cache_desc.num_tensors // 2
             for chunk_remote, chunk_local in zip(grouped_remote, grouped_local):
@@ -685,9 +766,133 @@ class KVCacheRecvingThread(threading.Thread):
                 "HIXL pull ok. request=%s group=%s remote_cluster=%s src=%s dst=%s",
                 remote_request_id, group_idx, remote_cluster_id, src_blocks, dst_blocks,
             )
-        # Phase 1 (TP=1, non-NZ): post-transfer GQA/NZ reformat is a no-op,
-        # so it is intentionally omitted here. Phase 2 will add TP>1 staging
-        # reformat and Phase 3 the Mamba / NZ paths.
+
+            if tp_n > 1:
+                ready_attention_group_reformat_block_ids.append(
+                    (
+                        (group_idx, reformat_local, tp_n, layer_indices),
+                        group_pull.is_group_transfer_end,
+                    )
+                )
+
+        # Stash reformat metadata for the groups whose last shard just landed.
+        ready = [
+            reformat_group
+            for reformat_group, is_end in ready_attention_group_reformat_block_ids
+            if is_end
+        ]
+        if ready:
+            # No-CP: single shard index 0.
+            self._stash_pending_reformat(request_id, 0, ready)
+
+    def _get_group_kv_caches(self, group_idx: int, layer_indices: list[int] | None = None) -> dict[str, Any]:
+        if layer_indices is None:
+            _, layer_indices = self.kv_group2layeridx[group_idx]
+        layer_index_set = set(layer_indices)
+        num_attn_module = 1
+        from vllm.v1.worker.utils import extract_layer_index
+
+        def layer_in_group(layer_name: str) -> bool:
+            return extract_layer_index(layer_name, num_attn_module) in layer_index_set
+
+        return {
+            layer_name: layer_cache for layer_name, layer_cache in self.kv_caches.items() if layer_in_group(layer_name)
+        }
+
+    def _stash_pending_reformat(
+        self,
+        request_id: str,
+        shard_idx: int,
+        ready_attention_group_reformat_block_ids: list[tuple[int, list[list[int]], int, list[int]]],
+    ) -> None:
+        with self.pending_reformat_lock:
+            self.pending_reformat[request_id][shard_idx] = ready_attention_group_reformat_block_ids
+
+    def _reformat_pending_kv_caches(self, request_id: str) -> None:
+        with self.pending_reformat_lock:
+            shard_reformats = self.pending_reformat.pop(request_id, {})
+        for shard_idx in sorted(shard_reformats):
+            logger.debug(
+                "HIXL reformatting KV cache after all pulls. request_id=%s shard_idx=%s",
+                request_id, shard_idx,
+            )
+            self._apply_kv_cache_reformat(shard_reformats[shard_idx])
+
+    def _apply_kv_cache_reformat(
+        self,
+        ready_attention_group_reformat_block_ids: list[tuple[int, list[list[int]], int, list[int]]],
+    ) -> None:
+        """Transpose staging -> D real cache for groups with num_group_pulls>1.
+
+        HIXL adaptation of Mooncake's in-place reformat_kv_cache_hybrid_linear_torch:
+        the source is the staging Cache backing tensor (not the D cache itself,
+        since pull_blocks writes whole staging blocks, not split sub-ranges).
+        """
+        if not ready_attention_group_reformat_block_ids:
+            return
+        gqa_reformat_groups = [
+            (group_idx, grouped_local_block_ids, num_group_pulls, layer_indices)
+            for (group_idx, grouped_local_block_ids, num_group_pulls, layer_indices) in ready_attention_group_reformat_block_ids
+            if num_group_pulls > 1
+        ]
+        for group_idx, grouped_local_block_ids, num_group_pulls, layer_indices in gqa_reformat_groups:
+            group_spec, _ = self.kv_group2layeridx[group_idx]
+            kv_cache_group_id = group_spec.get("kv_cache_group_id", group_idx)
+            staging_layers = self.staging_tensors.get(kv_cache_group_id)
+            if not staging_layers:
+                logger.warning("HIXL reformat: no staging tensors for group %s; skip.", kv_cache_group_id)
+                continue
+            group_kv = self._get_group_kv_caches(group_idx, layer_indices)
+            self._reformat_staging_to_local(
+                staging_layers, group_kv, grouped_local_block_ids, num_group_pulls
+            )
+
+    @torch.no_grad()
+    def _reformat_staging_to_local(
+        self,
+        staging_layers: dict[str, list[torch.Tensor]],
+        group_kv: dict[str, Any],
+        grouped_local_block_ids: list[list[int]],
+        tp_n: int,
+    ) -> None:
+        flat_local = [b for sub in grouped_local_block_ids for b in sub]
+        if not flat_local or tp_n <= 1:
+            return
+        # staging block b*tp_n + i holds the i-th P-rank head shard of D block b.
+        staging_block_ids = [b * tp_n + i for b in flat_local for i in range(tp_n)]
+        num_blocks = len(flat_local)
+        first_staging = next(iter(staging_layers.values()))[0]
+        device = first_staging.device
+        block_ids_tensor = torch.tensor(flat_local, dtype=torch.long, device=device)
+        staging_ids_tensor = torch.tensor(staging_block_ids, dtype=torch.long, device=device)
+        head_per_split = int(first_staging.shape[-2])
+        dim = int(first_staging.shape[-1])
+        num_d_heads = tp_n * head_per_split
+        block_size = self.block_size
+
+        def _transpose(staging: torch.Tensor, dst: torch.Tensor) -> None:
+            # staging [N*tp_n, block_size, head_per_split, dim]
+            #   -> view [N, tp_n, block_size, head_per_split, dim]
+            #   -> transpose(1,2) -> [N, block_size, tp_n, head_per_split, dim]
+            #   -> reshape [N, block_size, num_d_heads, dim]  (D real cache layout)
+            #   -> index_copy_ into D real cache at flat_local.
+            selected = staging.index_select(0, staging_ids_tensor)
+            transposed = (
+                selected.reshape(num_blocks, tp_n, block_size, head_per_split, dim)
+                .transpose(1, 2)
+                .contiguous()
+                .reshape(num_blocks, block_size, num_d_heads, dim)
+            )
+            dst.index_copy_(0, block_ids_tensor, transposed)
+
+        for layer_name, d_cache in group_kv.items():
+            k_s, v_s = staging_layers[layer_name]
+            if isinstance(d_cache, (list, tuple)):
+                k_d, v_d = d_cache[0], d_cache[1]
+            else:
+                k_d = v_d = d_cache
+            _transpose(k_s, k_d)
+            _transpose(v_s, v_d)
 
     def _send_done_recv_signal(
         self,
@@ -760,6 +965,7 @@ class HIXLConnectorMetadata(KVConnectorMetadata):
             remote_ptp_size=kv_transfer_params.get("remote_ptp_size", 1),
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
             remote_block_size=kv_transfer_params.get("remote_block_size", 0),
+            remote_multi_nodes_meta_mapping=kv_transfer_params.get("remote_multi_nodes_meta_mapping", {}),
         )
 
 
@@ -1012,9 +1218,8 @@ class HIXLConnectorWorker:
         self.total_layers = vllm_config.model_config.get_total_num_hidden_layers()
         self.num_key_value_heads = vllm_config.model_config.hf_text_config.num_key_value_heads
 
-        # Phase 1 constraints.
-        assert self.tp_size == 1, "HIXLConnector Phase 1 supports TP=1 only."
-        assert self.pp_size == 1, "HIXLConnector Phase 1 supports PP=1 only."
+        # Phase 2: TP>1 staging + reformat is supported. PP/PCP/DCP stay Phase 3.
+        assert self.pp_size == 1, "HIXLConnector Phase 2 supports PP=1 only (PP>1 is Phase 3)."
 
         self.kv_cache_config = kv_cache_config
         self.num_blocks: int = kv_cache_config.num_blocks
@@ -1022,6 +1227,13 @@ class HIXLConnectorWorker:
         self._layer_specs = {
             layer: group.kv_cache_spec for group in kv_cache_config.kv_cache_groups for layer in group.layer_names
         }
+
+        # P/D parallel sizes (Phase 2: P and D may use different TP sizes; the
+        # decoder pulls num_group_pulls = prefill_tp // decode_tp P-rank shards
+        # per attention group to reassemble the full head dim).
+        self._get_prefill_decode_size(vllm_config)
+        self._is_hma_required: bool = False  # finalized in register_kv_caches
+        self.tp_num_need_pulls: int = 1
 
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port
@@ -1143,6 +1355,461 @@ class HIXLConnectorWorker:
             transfer_group_id += 1
         return kv_group2layeridx
 
+    # ------------------------------------------------------------------
+    # Phase 2: block geometry (No-CP branch, forked from MooncakeConnectorV1).
+    # Byte-address arithmetic (kv_caches_base_addr / block_len / block_stride)
+    # is dropped; only block-index geometry is retained. block_size_scale>1
+    # (MLA/compress) and PP/PCP/DCP branches stay Phase 3.
+    # ------------------------------------------------------------------
+    def _get_prefill_decode_size(self, vllm_config: VllmConfig):
+        """Prefill/decode parallel sizes from kv_transfer extra_config.
+
+        Defaults to the local (decode) sizes when the disaggregated prefill
+        config is absent, so a non-disaggregated setup degenerates to TP=1
+        behavior (num_group_pulls==1, no staging).
+        """
+        prefill_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config(
+            "prefill", {}
+        )
+        self._prefill_tp_size = int(prefill_parallel_config.get("tp_size", self.tp_size))
+        self._prefill_dp_size = int(prefill_parallel_config.get("dp_size", self.dp_rank + 1))
+        self._prefill_pp_size = int(prefill_parallel_config.get("pp_size", 1))
+        self._decode_tp_size = self.tp_size
+        # num_group_pulls = prefill_tp // decode_tp; TP>1 staging requires
+        # prefill_tp >= decode_tp so each D rank reassembles >=1 P-rank shard.
+        assert self._prefill_tp_size >= self._decode_tp_size, (
+            f"prefill_tp_size({self._prefill_tp_size}) must be >= decode_tp_size"
+            f"({self._decode_tp_size}); set extra_config['prefill']['tp_size']."
+        )
+
+    def _requires_group_aware_attention_transfer(self) -> bool:
+        total_num_kv_heads = {
+            self._get_attention_group_num_key_value_heads(group_spec)
+            for group_spec, layer_indices in self.kv_group2layeridx.values()
+            if layer_indices and group_spec["kv_cache_spec_type"] != "MambaSpec"
+        }
+        return len(total_num_kv_heads) > 1
+
+    def _get_attention_group_num_need_pulls(self, group_spec: dict[str, Any], prefill_tp_size: int) -> int:
+        return self._get_attention_group_num_need_pulls_for_decode_tp(
+            group_spec, prefill_tp_size, self.tp_size
+        )
+
+    def _get_attention_group_num_need_pulls_for_decode_tp(
+        self,
+        group_spec: dict[str, Any],
+        prefill_tp_size: int,
+        decode_tp_size: int,
+    ) -> int:
+        num_key_value_heads = self._get_attention_group_num_key_value_heads(group_spec)
+        num_d_block_heads = max(1, num_key_value_heads // decode_tp_size)
+        num_p_block_heads = max(1, num_key_value_heads // prefill_tp_size)
+        return num_d_block_heads // num_p_block_heads
+
+    def _get_attention_group_num_key_value_heads(self, group_spec: dict[str, Any]) -> int:
+        kv_cache_spec = group_spec.get("kv_cache_spec", {})
+        if isinstance(kv_cache_spec, dict):
+            for key in ("total_num_kv_heads", "num_kv_heads", "num_key_value_heads"):
+                num_key_value_heads = kv_cache_spec.get(key)
+                if isinstance(num_key_value_heads, int):
+                    return num_key_value_heads
+            for spec in kv_cache_spec.values():
+                if not isinstance(spec, dict):
+                    continue
+                for key in ("total_num_kv_heads", "num_kv_heads", "num_key_value_heads"):
+                    num_key_value_heads = spec.get(key)
+                    if isinstance(num_key_value_heads, int):
+                        return num_key_value_heads
+        return self.num_key_value_heads
+
+    def _get_attention_group_remote_rank(
+        self,
+        req_id: str,
+        group_spec: dict[str, Any],
+        prefill_tp_size: int,
+    ) -> list[int]:
+        num_key_value_heads = self._get_attention_group_num_key_value_heads(group_spec)
+        num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
+        return self._get_remote_ranks_for_req(
+            req_id,
+            prefill_tp_size,
+            num_key_value_heads=num_key_value_heads,
+            tp_num_need_pulls=num_group_pulls,
+            use_mla=num_key_value_heads == 1,
+        )[self.tp_rank]
+
+    def _get_tp_num_need_pulls(self, prefill_tp_size: int | None) -> int:
+        if prefill_tp_size is None:
+            prefill_tp_size = self._prefill_tp_size
+        if prefill_tp_size == self._prefill_tp_size:
+            return self.tp_num_need_pulls
+        if self.vllm_config.model_config.is_deepseek_mla:
+            return 1
+        num_d_block_heads = max(1, self.num_key_value_heads // self.tp_size)
+        num_p_block_heads = max(1, self.num_key_value_heads // prefill_tp_size)
+        return num_d_block_heads // num_p_block_heads
+
+    def _get_remote_rank(self, req_id: str, prefill_tp_size: int | None = None) -> list[int]:
+        return self._get_remote_ranks_for_req(req_id, prefill_tp_size)[self.tp_rank]
+
+    def _get_remote_tp_ranks(
+        self,
+        tp_ori_data: np.ndarray,
+        rand_group_index: list[int],
+        num_groups: int,
+        prefill_tp_size: int,
+        num_key_value_heads: int,
+        tp_num_need_pulls: int,
+        use_mla: bool,
+    ) -> list[list[int]]:
+        tp_sampled_nums: list[list[int]] = []
+        # Phase 2 has no sparse/MLA; use_mla is only true when num_kv_heads==1.
+        if prefill_tp_size > num_key_value_heads or use_mla:
+            tp_ori_data = tp_ori_data.reshape(-1, num_groups)
+            chosen_group = tp_ori_data[:, [rand_group_index]]
+            flattened = chosen_group.reshape(-1).tolist()
+            tp_sampled_nums = [
+                flattened[i : i + tp_num_need_pulls] for i in range(0, len(flattened), tp_num_need_pulls)
+            ]
+        else:
+            group_size = prefill_tp_size // self._decode_tp_size
+            for i in range(self._decode_tp_size):
+                slice = tp_ori_data[i * group_size : (i + 1) * group_size]
+                tp_sampled_nums.append(slice.tolist())
+        return tp_sampled_nums
+
+    def _get_remote_ranks_for_req(
+        self,
+        req_id: str,
+        prefill_tp_size: int | None = None,
+        num_key_value_heads: int | None = None,
+        tp_num_need_pulls: int | None = None,
+        use_mla: bool | None = None,
+    ) -> list[list[int]]:
+        if prefill_tp_size is None:
+            prefill_tp_size = self._prefill_tp_size
+        if num_key_value_heads is None:
+            if self.vllm_config.model_config.is_deepseek_mla:
+                num_key_value_heads = 1
+            else:
+                num_key_value_heads = self.num_key_value_heads
+        if tp_num_need_pulls is None:
+            tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
+        if use_mla is None:
+            use_mla = self.vllm_config.model_config.is_deepseek_mla
+
+        sampled_nums: list[list[int]] = []
+        if prefill_tp_size == self._decode_tp_size:
+            sampled_nums = list(
+                map(
+                    lambda tp: [tp + pp * prefill_tp_size for pp in range(self._prefill_pp_size)],
+                    range(prefill_tp_size),
+                )
+            )
+            return sampled_nums
+        ori_data = np.arange(prefill_tp_size * self._prefill_pp_size)
+        seed = string_to_int64_hash(req_id)
+        rand = random.Random(seed)
+        ori_data_2d = ori_data.reshape(self._prefill_pp_size, -1)
+        num_groups = max(1, len(ori_data_2d[0]) // num_key_value_heads)
+        rand_group_index = rand.sample(range(num_groups), max(self._decode_tp_size // num_key_value_heads, 1))
+        all_results = [
+            self._get_remote_tp_ranks(
+                ori_data_2d[pp_index],
+                rand_group_index,
+                num_groups,
+                prefill_tp_size,
+                num_key_value_heads,
+                tp_num_need_pulls,
+                use_mla,
+            )
+            for pp_index in range(self._prefill_pp_size)
+        ]
+        for group_index in range(len(all_results[0])):
+            group: list[int] = []
+            for pp_index in range(self._prefill_pp_size):
+                group.extend(all_results[pp_index][group_index])
+            sampled_nums.append(group)
+        return sampled_nums
+
+    def _get_hybrid_remote_rank_group_pulls(
+        self,
+        req_id: str,
+        prefill_tp_size: int,
+    ) -> tuple[list[int], dict[int, list[GroupPull]]]:
+        rank_group_pulls: OrderedDict[int, list[GroupPull]] = OrderedDict()
+
+        def add_group_pull(remote_rank: int, group_pull: GroupPull) -> None:
+            rank_group_pulls.setdefault(remote_rank, []).append(group_pull)
+
+        for group_id, (group_spec, layer_indices) in self.kv_group2layeridx.items():
+            if not layer_indices:
+                continue
+
+            if group_spec["kv_cache_spec_type"] == "MambaSpec":
+                # Phase 3: Mamba state is not head-sharded; kept for parity.
+                assert prefill_tp_size % self.tp_size == 0, (
+                    f"Hybrid Mamba prefill tp size({prefill_tp_size}) must be divisible by "
+                    f"decode tp size({self.tp_size})."
+                )
+                num_group_pulls = prefill_tp_size // self.tp_size
+                for pp_rank in range(self._prefill_pp_size):
+                    pp_rank_offset = pp_rank * prefill_tp_size
+                    local_tp_offset = self.tp_rank * num_group_pulls
+                    for remote_tp_offset in range(num_group_pulls):
+                        remote_rank = pp_rank_offset + local_tp_offset + remote_tp_offset
+                        add_group_pull(
+                            remote_rank,
+                            GroupPull(
+                                group_id=group_id,
+                                remote_tp_offset=remote_tp_offset,
+                                num_group_pulls=num_group_pulls,
+                                prefill_pp_rank=pp_rank,
+                                is_group_transfer_end=remote_tp_offset == num_group_pulls - 1,
+                            ),
+                        )
+                continue
+
+            num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
+            chosen_rank_list = self._get_attention_group_remote_rank(req_id, group_spec, prefill_tp_size)
+            assert len(chosen_rank_list) == num_group_pulls * self._prefill_pp_size, (
+                f"chosen_rank_list({chosen_rank_list}) does not match num_group_pulls({num_group_pulls}) "
+                f"and prefill pp size({self._prefill_pp_size})."
+            )
+            for rank_idx, remote_rank in enumerate(chosen_rank_list):
+                prefill_pp_rank = rank_idx // num_group_pulls
+                add_group_pull(
+                    remote_rank,
+                    GroupPull(
+                        group_id=group_id,
+                        remote_tp_offset=rank_idx % num_group_pulls,
+                        num_group_pulls=num_group_pulls,
+                        prefill_pp_rank=prefill_pp_rank,
+                        is_group_transfer_end=rank_idx % num_group_pulls == num_group_pulls - 1,
+                    ),
+                )
+
+        return list(rank_group_pulls), dict(rank_group_pulls)
+
+    def _get_group_pulls_metadata(
+        self,
+        req_id: str,
+        remote_handshake_port_list: list[list[int]],
+        prefill_tp_size: int,
+        remote_base_port: int,
+        remote_pcp_size: int = 1,
+        remote_dcp_size: int = 1,
+    ) -> list[list[list[GroupPull]]]:
+        """No-CP only (Phase 2). CP/PCP/DCP shard derivation is Phase 3."""
+        cp_transfer = remote_pcp_size * remote_dcp_size > 1
+        assert not cp_transfer, "HIXLConnector Phase 2 supports No-CP only (PCP/DCP is Phase 3)."
+        if self._is_hma_required:
+            # Non-CP: port = base + chosen_rank, one-to-one with table keys.
+            _, rank_group_pulls = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
+            return [
+                [rank_group_pulls[p - remote_base_port] for p in ports]
+                for ports in remote_handshake_port_list
+            ]
+
+        tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
+        group_ids = [group_id for group_id, (_, layer_indices) in self.kv_group2layeridx.items() if layer_indices]
+
+        def make_group_pulls(remote_tp_offset: int, prefill_pp_rank: int) -> list[GroupPull]:
+            return [
+                GroupPull(
+                    group_id=group_id,
+                    remote_tp_offset=remote_tp_offset,
+                    num_group_pulls=tp_num_need_pulls,
+                    prefill_pp_rank=prefill_pp_rank,
+                    is_group_transfer_end=remote_tp_offset == tp_num_need_pulls - 1,
+                )
+                for group_id in group_ids
+            ]
+
+        group_pulls_list: list[list[list[GroupPull]]] = []
+        for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
+            if len(remote_ports) == 1:
+                remote_tp_offsets = [pcp_dcp_rank % tp_num_need_pulls]
+                prefill_pp_ranks = [
+                    ((remote_ports[0] - remote_base_port) % (prefill_tp_size * self._prefill_pp_size))
+                    // prefill_tp_size
+                ]
+            else:
+                assert len(remote_ports) % tp_num_need_pulls == 0, (
+                    f"tp_num_need_pulls: {tp_num_need_pulls}, remote_ports: {remote_ports}"
+                )
+                remote_tp_offsets = [rank_idx % tp_num_need_pulls for rank_idx in range(len(remote_ports))]
+                prefill_pp_ranks = [
+                    ((remote_port - remote_base_port) % (prefill_tp_size * self._prefill_pp_size)) // prefill_tp_size
+                    for remote_port in remote_ports
+                ]
+            group_pulls_list.append(
+                [
+                    make_group_pulls(remote_tp_offset, prefill_pp_rank)
+                    for remote_tp_offset, prefill_pp_rank in zip(remote_tp_offsets, prefill_pp_ranks)
+                ]
+            )
+        return group_pulls_list
+
+    def _get_kv_split_metadata(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+    ) -> tuple[list[list[int]], list[BlockIds], list[BlockIds]]:
+        """No-CP per-shard ports and block ids (Phase 2).
+
+        Returns (remote_handshake_port_list, local_block_ids_list,
+        remote_block_ids_list). No-CP has a single shard; the inner port list
+        length is the number of P ranks to pull from for this D rank.
+        """
+        prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
+
+        # Phase 2: No-CP only.
+        if self._is_hma_required:
+            chosen_rank_list, _ = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
+        else:
+            chosen_rank_list = self._get_remote_rank(req_id, prefill_tp_size)
+
+        remote_handshake_port_list = [[x + meta.remote_port for x in chosen_rank_list]]
+        local_block_ids: list[list[int]] = [[] for _ in meta.local_block_ids]
+        remote_block_ids: list[list[int]] = [[] for _ in meta.remote_block_ids]
+        for group_idx, (group_spec, layer_indices) in self.kv_group2layeridx.items():
+            local_kernel_block_ids, remote_kernel_block_ids = self._get_kernel_block_ids(
+                layer_indices, meta, group_idx, group_spec
+            )
+            kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
+            local_block_ids[kv_cache_group_id] = local_kernel_block_ids
+            remote_block_ids[kv_cache_group_id] = remote_kernel_block_ids
+        local_block_ids_list = [tuple(local_block_ids) for _ in remote_handshake_port_list]  # type: ignore
+        remote_block_ids_list = [tuple(remote_block_ids) for _ in remote_handshake_port_list]  # type: ignore
+        return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
+
+    def _get_remote_host_info_by_port(
+        self,
+        base_port: int,
+        remote_handshake_port: int,
+        remote_host: str,
+        remote_engine_id: str,
+        remote_multi_nodes_meta_mapping: dict,
+    ):
+        if remote_multi_nodes_meta_mapping is None:
+            return remote_host, remote_engine_id
+        kv_port = self.vllm_config.kv_transfer_config.kv_port
+        rank = str(remote_handshake_port - kv_port)
+        info = remote_multi_nodes_meta_mapping.get(rank)
+        if info is None:
+            rank = str(remote_handshake_port - base_port)
+            info = remote_multi_nodes_meta_mapping.get(rank)
+        if info is None:
+            return remote_host, remote_engine_id
+        return info.get("host", remote_host), info.get("engine_id", remote_engine_id)
+
+    @staticmethod
+    def _expand_block_ids(block_ids, scale):
+        # Expand each logical block into its `scale` contiguous kernel blocks:
+        # logical block b -> [b*scale, b*scale+1, ..., b*scale+scale-1].
+        return [bid * scale + offset for bid in block_ids for offset in range(scale)]
+
+    @staticmethod
+    def _group_compress_ratio(group_spec):
+        # Tokens per KV slot for this group (>1 for compressed specs); defaults to 1.
+        compress_ratio = 1
+        kv_cache_spec = group_spec.get("kv_cache_spec")
+        if isinstance(kv_cache_spec, dict):
+            for spec in kv_cache_spec.values():
+                if isinstance(spec, dict) and isinstance(spec.get("compress_ratio"), int):
+                    compress_ratio = max(1, spec["compress_ratio"])
+                    break
+        return compress_ratio
+
+    @staticmethod
+    def _get_kv_cache_group_id(group_idx: int, group_spec: dict[str, Any]) -> int:
+        return group_spec.get("kv_cache_group_id", group_idx)
+
+    def _get_kernel_block_ids(self, layer_indices, meta: ReqMeta, group_idx: int, group_spec):
+        """No-CP per-group block ids at kernel granularity: (local, remote).
+
+        HIXL adaptation: block_size_scale is indexed [group_idx][0] (Phase 2
+        keeps scale==1, so expansion is a no-op). MLA/compress (scale>1) is
+        Phase 3. Mamba logical ids pass through unchanged (Phase 3 path).
+        """
+        kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
+        if group_spec["kv_cache_spec_type"] == "MambaSpec":
+            return list(meta.local_block_ids[kv_cache_group_id]), list(meta.remote_block_ids[kv_cache_group_id])
+
+        remote_block_size = meta.remote_block_size or self.block_size
+        local_scale = self.block_size_scale[group_idx][0]
+        kernel_size = self.block_size // local_scale
+        assert remote_block_size % kernel_size == 0, (
+            f"remote_block_size({remote_block_size}) not divisible by kernel_size({kernel_size})"
+        )
+        remote_scale = remote_block_size // kernel_size
+        kernel_local = self._expand_block_ids(list(meta.local_block_ids[kv_cache_group_id]), local_scale)
+        kernel_remote = self._expand_block_ids(list(meta.remote_block_ids[kv_cache_group_id]), remote_scale)
+        remote_kernel_token_size = kernel_size * self._group_compress_ratio(group_spec)
+        remote_start_idx = meta.num_computed_tokens // remote_kernel_token_size
+        kernel_remote = kernel_remote[remote_start_idx:]
+        num_kernel_blocks = min(len(kernel_remote), len(kernel_local))
+        return kernel_local[:num_kernel_blocks], kernel_remote[:num_kernel_blocks]
+
+    def _init_staging_caches(self) -> None:
+        """Allocate per-group staging Cache for TP>1 head reassembly (D side).
+
+        HIXL pull_blocks can only write whole blocks, not into a block's split
+        sub-range, so each P rank's head shard lands in a distinct staging
+        block (dst = local_block * tp_n + tp_offset). After all shards land, a
+        reformat transposes staging -> D real cache. Staging is a registered
+        Cache (remote_accessible=True, same as the D dst cache) because pull's
+        dst must be a Cache object. The backing tensors are retained on the
+        worker for the torch reformat. No-CP/No-Mamba/No-NZ only (Phase 2).
+        """
+        if self.kv_role != "kv_consumer":
+            return
+        from llm_datadist import CacheDesc, BlocksCacheKey, Placement
+
+        self.staging_tensors: dict[int, dict[str, list[torch.Tensor]]] = {}
+        self.staging_caches: dict[int, Any] = {}
+        prefill_tp_size = self._prefill_tp_size
+        for group_id, (group_spec, layer_indices) in self.kv_group2layeridx.items():
+            if not layer_indices or group_spec["kv_cache_spec_type"] == "MambaSpec":
+                continue
+            tp_n = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
+            if tp_n <= 1:
+                continue
+            kv_cache_group_id = self._get_kv_cache_group_id(group_id, group_spec)
+            layer_names = group_spec["layer_names"]
+            ref_k = self._as_kv_cache_tuple(self.kv_caches[layer_names[0]])[0]
+            num_d_heads = int(ref_k.shape[-2])
+            head_per_split = num_d_heads // tp_n
+            dim = int(ref_k.shape[-1])
+            staging_shape = [self.num_blocks * tp_n, self.block_size, head_per_split, dim]
+            addrs: list[int] = []
+            layer_staging: dict[str, list[torch.Tensor]] = {}
+            for layer_name in layer_names:
+                k_t = torch.zeros(staging_shape, dtype=ref_k.dtype, device=ref_k.device)
+                v_t = torch.zeros(staging_shape, dtype=ref_k.dtype, device=ref_k.device)
+                layer_staging[layer_name] = [k_t, v_t]
+                addrs.append(int(k_t.data_ptr()))
+                addrs.append(int(v_t.data_ptr()))
+            self.staging_tensors[kv_cache_group_id] = layer_staging
+            cache_desc = CacheDesc(
+                num_tensors=len(addrs),
+                shape=list(staging_shape),
+                data_type=_torch_dtype_to_llm_dtype(ref_k.dtype),
+                placement=Placement.DEVICE,
+            )
+            cache = self.cache_manager.register_blocks_cache(
+                cache_desc,
+                addrs,
+                BlocksCacheKey(self.cluster_id, self.model_id),
+                remote_accessible=True,
+            )
+            self.staging_caches[kv_cache_group_id] = cache
+            logger.info(
+                "HIXL staging register: group=%s tp_n=%s shape=%s num_tensors=%s",
+                kv_cache_group_id, tp_n, staging_shape, len(addrs),
+            )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register KV via HIXL register_blocks_cache (one Cache per group).
 
@@ -1156,6 +1823,23 @@ class HIXLConnectorWorker:
 
         self.kv_caches = kv_caches
         self.kv_group2layeridx = self._build_kv_group2layeridx()
+
+        # HMA: any non-FullAttention group (Mamba/compress/...) or attention groups
+        # with differing num_key_value_heads need per-group num_group_pulls. Mamba /
+        # compress / MLA paths are Phase 3; the per-group divergence path is wired
+        # now so multi-attention-group FullAttention works under TP>1.
+        self._is_hma_required = self._requires_group_aware_attention_transfer() or any(
+            spec["kv_cache_spec_type"] != "FullAttentionSpec"
+            for spec, _ in self.kv_group2layeridx.values()
+        )
+        # Per-rank num_group_pulls for the non-HMA uniform path. HMA recomputes
+        # this per group via _get_attention_group_num_need_pulls.
+        if self.vllm_config.model_config.is_deepseek_mla:
+            self.tp_num_need_pulls = 1
+        else:
+            num_d_block_heads = max(1, self.num_key_value_heads // self.tp_size)
+            num_p_block_heads = max(1, self.num_key_value_heads // self._prefill_tp_size)
+            self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads
 
         num_tensors_per_group: list[int] = []
         block_size_scale: list[list[int]] = []
@@ -1190,10 +1874,13 @@ class HIXLConnectorWorker:
             )
             num_tensors_per_group.append(num_tensors)
             # block_size_scale[group]: tensor num_blocks / logical num_blocks.
+            # Phase 2 keeps scale==1 (standard FullAttention, no MLA/compress/SWA).
+            # scale>1 needs kernel-block expansion (MC _get_kernel_block_ids) and
+            # is deferred to Phase 3 (MLA/compress groups).
             scale = ref_shape[0] // self.num_blocks
             assert scale == 1, (
-                f"HIXLConnector Phase 1 requires block_size_scale==1 (standard "
-                f"FullAttention), got {scale}."
+                f"HIXLConnector Phase 2 requires block_size_scale==1 (standard "
+                f"FullAttention); scale>1 (MLA/compress) is Phase 3. got {scale}."
             )
             block_size_scale.append([scale])
 
@@ -1224,6 +1911,11 @@ class HIXLConnectorWorker:
             self.group_caches[kv_cache_group_id] = cache
 
         self.block_size_scale = block_size_scale
+
+        # D-side staging caches for TP>1 head reassembly (no-op for producer).
+        self.staging_tensors: dict[int, dict[str, list[torch.Tensor]]] = {}
+        self.staging_caches: dict[int, Any] = {}
+        self._init_staging_caches()
 
         metadata = HixlAgentMetadata(
             engine_id=self.engine_id,
@@ -1275,6 +1967,13 @@ class HIXLConnectorWorker:
                 self.group_caches,
                 block_size_scale,
                 ready_event,
+                staging_tensors=self.staging_tensors,
+                staging_caches=self.staging_caches,
+                is_hma_required=self._is_hma_required,
+                prefill_tp_size=self._prefill_tp_size,
+                num_key_value_heads=self.num_key_value_heads,
+                num_blocks=self.num_blocks,
+                cluster_id=self.cluster_id,
             )
             self.kv_recv_thread.start()
 
@@ -1307,9 +2006,14 @@ class HIXLConnectorWorker:
         return set()
 
     def start_load_kv(self, metadata: HIXLConnectorMetadata):
-        """Phase 1 simplified shard metadata: TP=1 -> single P rank, single
-        shard, one GroupPull per group (num_group_pulls=1). No CP/PCP/DCP
-        port mapping (forked _get_kv_split_metadata CP branch dropped)."""
+        """Phase 2: per-P-rank add_request via _get_kv_split_metadata +
+        _get_group_pulls_metadata (No-CP).
+
+        One add_request targets one remote P rank. TP>1 means num_group_pulls>1
+        D-side ranks issue N add_request calls for the same request (one per P
+        rank); only the last call sets all_task_done=True so that
+        _handle_request triggers staging->local reformat once all shards land.
+        """
         for req_id in metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
                 self.kv_send_thread.task_tracker.add_req_to_process(req_id)
@@ -1318,31 +2022,40 @@ class HIXLConnectorWorker:
 
         for req_id, meta in metadata.requests.items():
             remote_req_id = meta.remote_request_id
-            # Phase 1: TP=1, single P rank == remote_port + tp_rank(0).
-            remote_handshake_port = meta.remote_port + self.tp_rank
-            group_pulls = [
-                GroupPull(
-                    group_id=gid,
-                    remote_tp_offset=0,
-                    num_group_pulls=1,
-                    is_group_transfer_end=True,
-                )
-                for gid, (spec, idxs) in self.kv_group2layeridx.items()
-                if idxs
-            ]
-            assert self.kv_recv_thread is not None
-            self.kv_recv_thread.add_request(
-                request_id=req_id,
-                remote_request_id=remote_req_id,
-                local_block_ids=meta.local_block_ids,
-                remote_block_ids=meta.remote_block_ids,
-                group_pulls=group_pulls,
-                remote_engine_id=meta.remote_engine_id,
-                remote_host=meta.remote_host,
-                remote_handshake_port=remote_handshake_port,
-                num_computed_tokens=meta.num_computed_tokens,
-                all_task_done=True,
+            prefill_tp_size = (
+                meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
             )
+            remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = (
+                self._get_kv_split_metadata(req_id, meta)
+            )
+            group_pulls_list = self._get_group_pulls_metadata(
+                req_id, remote_handshake_port_list, prefill_tp_size, meta.remote_port
+            )
+            assert self.kv_recv_thread is not None
+            for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
+                for remote_tp_offset, remote_handshake_port in enumerate(remote_ports):
+                    remote_host, remote_engine_id = self._get_remote_host_info_by_port(
+                        meta.remote_port,
+                        remote_handshake_port,
+                        meta.remote_host,
+                        meta.remote_engine_id,
+                        meta.remote_multi_nodes_meta_mapping,
+                    )
+                    self.kv_recv_thread.add_request(
+                        request_id=req_id,
+                        remote_request_id=remote_req_id,
+                        local_block_ids=local_block_ids_list[pcp_dcp_rank],
+                        remote_block_ids=remote_block_ids_list[pcp_dcp_rank],
+                        group_pulls=group_pulls_list[pcp_dcp_rank][remote_tp_offset],
+                        remote_engine_id=remote_engine_id,
+                        remote_host=remote_host,
+                        remote_handshake_port=remote_handshake_port,
+                        num_computed_tokens=meta.num_computed_tokens,
+                        all_task_done=(
+                            pcp_dcp_rank == len(remote_handshake_port_list) - 1
+                            and remote_tp_offset == len(remote_ports) - 1
+                        ),
+                    )
 
         if self.kv_send_thread is not None:
             for req_id, delay_start_time in metadata.requests_to_send.items():
