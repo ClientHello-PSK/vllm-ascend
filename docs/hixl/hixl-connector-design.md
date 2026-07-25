@@ -687,22 +687,23 @@ sequenceDiagram
     Note over PW: P 被动，显存被读，不主动推数据（P worker 不参与此步）
     DRT->>DRT: 写入 local_block_ids（dst_cache）
     DRT->>PST: ZMQ DONE：(DONE_RECVING_MSG, request_id=remote_request_id, remote_port_send_num)
-    PST->>PST: task_tracker.update_done_task_count（按 remote_port_send_num 计数达标后完成 + 移出 delayed_free）
+    Note over DRT,PST: D 通知 P：该请求的 KV 已全部拉取完毕
     PST-->>DRT: ACK
-    DW->>DS: post_forward: get_finished
+    DW->>DS: post_forward: get_finished（上报 recv 完成的请求集合 → done_recving）
     end
 
     rect rgb(255,255,230)
-    Note over PS,PW: 3. P 端收尾
-    PW->>PS: get_finished 上报 send 完成（收到 DONE）
-    Note over PS: 取消 delay_free，释放 block
+    Note over PS,PW: 3. P 端收尾（所有 DONE 收齐后）
+    PST->>PST: task_tracker.update_done_task_count（按 remote_port_send_num 计数达标 → 标记 send 完成）
+    PW->>PS: get_finished（上报 done_sending）
+    Note over PS: 取消 delay_free，释放本地 block
     end
 
     rect rgb(245,230,255)
     Note over DS,DW: 4. D 端 decode（Step C+，KV 已就绪）
-    Note over DS: schedule: get_num→(0,F) / num_computed_tokens 含拉来的 KV
-    DS->>DW: scheduler_output
-    Note over DW: forward: decode 用本地 KV
+    Note over DS: schedule: get_num_new_matched_tokens → (0, F)；num_computed_tokens 含已拉取的 KV
+    DS->>DW: scheduler_output(+meta)
+    Note over DW: forward: decode，直接读本地 KV（无跨节点传输）
     end
 ```
 
