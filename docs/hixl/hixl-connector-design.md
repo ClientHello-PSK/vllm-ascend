@@ -349,7 +349,7 @@ sequenceDiagram
     Note over DW: register_kv_caches（纯 worker 侧，无 scheduler 参与）
     DW->>DW: register_memory（同样按字节段注册本地 KV，作为 batch_transfer_sync_read 的 dst 地址空间）
     DW->>DW: 组装 MooncakeAgentMetadata → self.xfer_handshake_metadata 打包路由元数据
-    DW->>DRT: 起 KVCacheRecvingThread（内部用 zmq.REQ 主动连各 P 的 ROUTER，不 bind 监听）；阻塞等 ready_event
+    DW->>DRT: 起 KVCacheRecvingThread（不 bind、不预连 P；REQ 处理 request 时按需 connect 对应 P，socket 池复用）；阻塞等 ready_event
     Note over PS,PW: 框架把各 worker 握手汇总到 scheduler
     PW->>PS: get_handshake_metadata → set_xfer_handshake_metadata_from_workers
     Note over PS: 整理进 multi_nodes_meta_mapping{port_offset:{host,engine_id}}
@@ -362,11 +362,12 @@ sequenceDiagram
     PS->>PS: schedule: get_num_new_matched_tokens → (0, F)
     PS->>PS: schedule: allocate_slots（整段 prompt 分 block）
     PS->>PS: schedule: update_state_after_alloc → 入 _reqs_in_batch
-    PS->>PS: schedule: build_connector_meta（打包 _reqs_need_send + batch）
+    PS->>PS: schedule: build_connector_meta（打包 requests(_reqs_need_recv) + requests_to_send(_reqs_need_send) + batch(_reqs_in_batch)）
     PS->>PW: scheduler_output(+meta)
     PW->>PW: pre_forward: handle_preemptions(meta)
     PW->>PW: pre_forward: bind_connector_metadata(meta)
-    PW->>PST: pre_forward: start_load_kv → add_delayed_request(...)
+    PW->>PST: pre_forward: start_load_kv<br/>1-reqs_to_process<br/>2-delayed_free_requests
+    Note over PW: 注：2-delayed_free_requests 处理的是上一 step finished 的 req；本步 req 的 delayed_free 在下方 post_forward request_finished 后、于下一 step 的 start_load_kv 才登记
     Note over PW: forward: prefill 算 KV → 本地 block
     PW->>PS: post_forward: get_finished
     Note over PS: update_from_output: request_finished()
@@ -412,6 +413,7 @@ sequenceDiagram
 
     rect rgb(245,230,255)
     Note over DS,DW: 4. D 端 decode（Step C+，KV 已就绪）
+    Note over DS: schedule: _try_promote_blocked_waiting_request<br/>req 在 finished_recving_kv_req_ids → _update_waiting_for_remote_kv<br/>状态 WAITING_FOR_REMOTE_KV → WAITING
     Note over DS: schedule: get_num→(0,F) / num_computed_tokens 含拉来的 KV
     DS->>DW: scheduler_output
     Note over DW: forward: decode 用本地 KV
@@ -632,76 +634,74 @@ sequenceDiagram
     rect rgb(230,245,255)
     Note over PS,DW: 0. 启动期（一次性；register_kv_caches 纯 worker 侧，握手经框架汇总到 scheduler）
     Note over PW: register_kv_caches（纯 worker 侧，无 scheduler 参与）
-    PW->>PW: register_blocks_cache：按 group 把本地 KV 显存登记为 llm_datadist 的 block cache（remote_accessible=True）
-    PW->>PW: 组装 HixlAgentMetadata → self.xfer_handshake_metadata 打包路由元数据
-    PW->>PST: 起 ZMQ ROUTER 监听 tcp://side_channel_host:handshake_port（= side_channel_port + device_index）；阻塞等 ready_event
+    PW->>PW: register_blocks_cache<br/>按 group 把本地 KV 显存登记为 llm_datadist 的 block cache
+    PW->>PW: 组装 HixlAgentMetadata<br/>→ self.xfer_handshake_metadata 打包路由元数据
+    PW->>PST: 起 KVCacheSendingThread<br/>ZMQ监听控制面<br/>阻塞等 ready_event(ZMQ消息)
     Note over DW: register_kv_caches（纯 worker 侧，无 scheduler 参与）
-    DW->>DW: register_blocks_cache：按 group 把本地 KV 显存登记为 llm_datadist 的 block cache（remote_accessible=True）→ 作为 pull_blocks 的 dst cache
-    DW->>DW: 组装 HixlAgentMetadata → self.xfer_handshake_metadata 打包路由元数据
-    DW->>DRT: 起 KVCacheRecvingThread（内部用 zmq.REQ 主动连各 P 的 ROUTER，不 bind 监听）；阻塞等 ready_event
+    DW->>DW: register_blocks_cache<br/>按 group 把本地 KV 显存登记为 llm_datadist 的 block cache
+    DW->>DW: 组装 HixlAgentMetadata<br/>→ self.xfer_handshake_metadata 打包路由元数据
+    DW->>DRT: 起 KVCacheRecvingThread<br/>阻塞等 ready_event(request任务)
     Note over PS,PW: 框架把各 worker 握手汇总到 scheduler
-    PW->>PS: get_handshake_metadata → set_xfer_handshake_metadata_from_workers
-    Note over PS: 整理进 multi_nodes_meta_mapping{port_offset:{host,engine_id}}
-    DW->>DS: get_handshake_metadata → set_xfer_handshake_metadata
-    Note over DS: D 端同理收集（供自身路由用）
+    Note over DS,DW: 框架把各 worker 握手汇总到 scheduler
+    PW->>PS: W:get_handshake_metadata<br/>S:set_xfer_handshake_metadata_pp_aware
+    Note over PS: 入multi_nodes_meta_mapping
+    DW->>DS: W:get_handshake_metadata<br/>S:set_xfer_handshake_metadata_pp_aware
+    Note over DS: 入multi_nodes_meta_mapping
     end
 
     rect rgb(255,245,230)
     Note over PS,PW: 1. P 端 prefill（Step A，请求带 do_remote_decode=True）
-    PS->>PS: schedule: get_num_new_matched_tokens → (0, F)
-    PS->>PS: schedule: allocate_slots（整段 prompt 分 block）
-    PS->>PS: schedule: update_state_after_alloc → 入 _reqs_in_batch
-    PS->>PS: schedule: build_connector_meta（打包 _reqs_need_send + batch）
+    PS->>PS: get_num_new_matched_tokens<br/>(0, F)
+    PS->>PS: allocate_slots
+    PS->>PS: update_state_after_alloc
+    PS->>PS: build_connector_meta
     PS->>PW: scheduler_output(+meta)
     PW->>PW: pre_forward: handle_preemptions(meta)
     PW->>PW: pre_forward: bind_connector_metadata(meta)
-    PW->>PST: pre_forward: start_load_kv → add_delayed_request(...)
+    PW->>PST: pre_forward: start_load_kv<br/>1-reqs_to_process<br/>2-delayed_free_requests
+    Note over PW: 注：2-delayed_free_requests 处理的是上一 step finished 的 req；<br/>本步 req 的 delayed_free 在下一 step 的 start_load_kv 才登记
     Note over PW: forward: prefill 算 KV → 本地 block
     PW->>PS: post_forward: get_finished
-    Note over PS: update_from_output: request_finished()
-    Note over PS: 填 _reqs_need_send / 返回 (delay_free, params_dict)
-    Note over PS: params_dict = {do_remote_prefill=True, do_remote_decode=False,<br/>  remote_block_ids(computed_block_ids), remote_engine_id, remote_request_id, remote_host(=get_ip()),<br/>  remote_port(=side_channel_port), remote_ptp_size, last_token_id, remote_multi_nodes_meta_mapping,<br/>  num_prompt_blocks, remote_block_size}（remote_multi_nodes_meta_mapping 来自 0. 握手汇总）
-    Note over PS: delay_free → 不释放 block（D 还没拉走）
+    PS->>PS: update_from_output<br/>→ request_finished<br/>1-汇总_reqs_need_send<br/>2-组装params_dict<br/>3-设定delay_free
     end
 
     Note over PS,DS: params_dict 经 disaggregated router 路由到 D<br/>→ 成为 D 请求的 kv_transfer_params（do_remote_prefill=True）
 
     rect rgb(230,255,230)
     Note over DS,DW: 2. D 端拉取 KV（Step B，请求带 do_remote_prefill=True）
-    DS->>DS: schedule: get_num_new_matched_tokens → (count, T)
-    DS->>DS: schedule: num_new_tokens=0（load_kv_async，本步不算）
-    DS->>DS: schedule: allocate_slots（分接收 block）
-    DS->>DS: schedule: update_state_after_alloc → _reqs_need_recv[req_id]=(req, local_block_ids, num_external_tokens) + _reqs_in_batch；置 do_remote_prefill=False
-    DS->>DS: schedule: build_connector_meta（打包 requests(ReqMeta) + batch）
-    Note over DS: add_new_req 从 kv_transfer_params 提取 remote_block_ids/remote_engine_id/remote_request_id/<br/>  remote_host/remote_port/remote_ptp_size/num_prompt_blocks/remote_block_size/num_computed_tokens<br/>  + 本地 local_block_ids/num_external_tokens → ReqMeta
+    DS->>DS: get_num_new_matched_tokens<br/>(count, T)
+    DS->>DS: num_new_tokens=0<br/>load_kv_async，本步不算
+    DS->>DS: allocate_slots
+    DS->>DS: update_state_after_alloc
+    DS->>DS: build_connector_meta
     DS->>DW: scheduler_output(+meta)
     DW->>DW: pre_forward: handle_preemptions(meta)
     DW->>DW: pre_forward: bind_connector_metadata(meta)
-    DW->>DRT: pre_forward: start_load_kv → add_request(...)
-    Note over DW: remote_handshake_port = remote_port + tp_rank(0)；group_pulls = [GroupPull(group_id,<br/>  remote_tp_offset=0, num_group_pulls=1, is_group_transfer_end=True)] per group；入 request_queue
-    Note over DW: forward: 本请求不算（num_new_tokens=0）
+    DW->>DRT: pre_forward: start_load_kv<br/>1-remote_handshake_port<br/>2-group_pulls<br/>3-request_queue
+    Note over DW: forward: 本请求不算, 复用kvcache<br/>（num_new_tokens=0）
     DRT->>PST: ZMQ GET_META：(GET_META_MSG, "")
-    PST-->>DRT: HixlAgentMetadata（msgpack：cluster_id, listen_ip/port, num_tensors_per_group,<br/>  kv_group2layeridx, block_size, num_blocks, block_size_scale）
-    DRT->>DRT: ensure_linked(remote_cluster_id=cluster_id, remote_ip=listen_ip, remote_port=listen_port)
-    DRT->>DRT: cache_manager.pull_blocks(BlocksCacheKey(P.cluster_id, model_id), dst_cache(D 已注册),<br/>  src_blocks=P.block_ids, dst_blocks=D.block_ids, src/dst_layer_range=range(num_layers))（按连续 span 分块）→ RDMA 读 P 显存
-    Note over PW: P 被动，显存被读，不主动推数据（P worker 不参与此步）
-    DRT->>DRT: 写入 local_block_ids（dst_cache）
+    Note over DRT,PST: D从P拉取HixlAgentMetadata
+    PST-->>DRT: HixlAgentMetadata<br/>cluster_id, listen_ip/port, num_tensors_per_group,<br/>  kv_group2layeridx, block_size, num_blocks, block_size_scale
+    DRT->>DRT: ensure_linked<br/>(cluster_id, listen_ip, listen_port)
+    DRT->>DRT: cache_manager.pull_blocks<br/>→ RDMA 读 P 显存<br/>写入 local_block_ids（dst_cache）
+    Note over PW,DRT: P 被动，显存被读，不主动推数据（P worker 不参与此步）
     DRT->>PST: ZMQ DONE：(DONE_RECVING_MSG, request_id=remote_request_id, remote_port_send_num)
     Note over DRT,PST: D 通知 P：该请求的 KV 已全部拉取完毕
     PST-->>DRT: ACK
-    DW->>DS: post_forward: get_finished（上报 recv 完成的请求集合 → done_recving）
+    DW->>DS: post_forward: get_finished<br/>worker主动获取<br/>上报 done_recving
     end
 
     rect rgb(255,255,230)
-    Note over PS,PW: 3. P 端收尾（所有 DONE 收齐后）
-    PST->>PST: task_tracker.update_done_task_count（按 remote_port_send_num 计数达标 → 标记 send 完成）
-    PW->>PS: get_finished（上报 done_sending）
+    Note over PS,PST: 3. P 端收尾（所有 DONE 收齐后）
+    PST->>PST: task_tracker.update_done_task_count<br/>按 remote_port_send_num 计数达标 → 标记 send 完成<br/>（Phase 1 TP=1走 else 直接标记，不计数）
+    PW->>PS: get_finished, worker主动获取<br/>上报 done_sending
     Note over PS: 取消 delay_free，释放本地 block
     end
 
     rect rgb(245,230,255)
-    Note over DS,DW: 4. D 端 decode（Step C+，KV 已就绪）
-    Note over DS: schedule: get_num_new_matched_tokens → (0, F)；num_computed_tokens 含已拉取的 KV
+    Note over DS,DW: 4. D 端 decode（下一个Step，KV 已就绪）
+    Note over DS: schedule: _try_promote_blocked_waiting_request<br/>req 在 finished_recving_kv_req_ids → _update_waiting_for_remote_kv<br/>状态 WAITING_FOR_REMOTE_KV → WAITING
+    Note over DS: schedule: get_num_new_matched_tokens → (0, F)<br/>num_computed_tokens 含已拉取的 KV
     DS->>DW: scheduler_output(+meta)
     Note over DW: forward: decode，直接读本地 KV（无跨节点传输）
     end
