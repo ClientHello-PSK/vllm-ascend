@@ -2075,11 +2075,12 @@ class HIXLConnectorWorker:
         prefill_tp_size: int,
     ) -> tuple[list[list[int]], list[BlockIds], list[BlockIds]]:
         """Phase 3 subitem D4: CP per-shard ports and block ids (fork Mooncake
-        :2694-3058). Block-level: kernel expansion (_expand_block_ids /
-        _local_kernel_ids_for_shard / _get_kernel_block_ids) is dropped per
-        design G3; attention blocks are sliced directly. Under r_blk==1
-        (Bd==Bp, the common case) this matches Mooncake exactly; r_blk>1
-        local-block geometry needs NPU verification (Mooncake :3026-3038).
+        :2694-3058). Block-level kernel expansion (_expand_block_ids /
+        _local_kernel_ids_for_shard / _get_group_kernel_params) is now wired in
+        for MLA/compress (scale>1); attention blocks are expanded to kernel
+        granularity on both sides. Under scale==1 + r_blk==1 (Bd==Bp, the common
+        case) this matches Mooncake exactly; r_blk>1 needs MLA (use_mla) so
+        kernel_size divides Bp.
         """
         def context_parallel_parameters_check():
             assert (meta.remote_pcp_size * meta.remote_dcp_size) % (self.pcp_size * self.dcp_size) == 0
@@ -2211,16 +2212,20 @@ class HIXLConnectorWorker:
         remote_block_size, local_cp_rank, local_cp_size, remote_cp_size, r_blk = (
             self._get_local_remote_cp_params(meta)
         )
+        # Per attention group kernel-expansion params (local_scale, remote_scale,
+        # kernel_size). scale>1 (MLA/compress) is expanded to kernel blocks below;
+        # under scale==1 this degenerates to the original logical-slice geometry.
+        group_kernel_params = self._get_group_kernel_params(remote_block_size)
         # r_blk>1 (Bd>Bp) requires MLA/compress (block_size_scale>1) so that
-        # kernel_size = Bd/scale divides Bp; under scale==1 (Phase 3, no MLA)
-        # Mooncake's _local_kernel_ids_for_shard yields kernels_per_p_block =
-        # Bp//Bd == 0 (no transfer). I.e. r_blk>1 is unsupported without MLA,
-        # and MLA/compress is a separate track (phase3-plan §6/G4). Fail fast
-        # here rather than emit a wrong/empty shard.
+        # kernel_size = Bd/scale divides Bp; under scale==1 (no MLA) Mooncake's
+        # _local_kernel_ids_for_shard yields kernels_per_p_block = Bp//Bd == 0
+        # (no transfer). r_blk>1 is unsupported without MLA. scale>1 (use_mla)
+        # now flows through kernel expansion; fail fast otherwise rather than
+        # emit a wrong/empty shard.
         assert r_blk == 1 or self.use_mla, (
             "HIXL Phase 3 supports r_blk==1 (P/D same block_size) only; "
-            "r_blk>1 (Bd>Bp) needs MLA/compress (block_size_scale>1), which "
-            "is a separate track. See phase3-plan §6/G4."
+            "r_blk>1 (Bd>Bp) needs MLA/compress (block_size_scale>1). "
+            "See phase3-plan §6/G4."
         )
 
         if meta.remote_engine_id not in self.local_remote_block_port_mapping:
@@ -2320,21 +2325,34 @@ class HIXLConnectorWorker:
                     group_remote_block_ids.append(list(meta.remote_block_ids[group_idx]) if is_final_shard else [])
                     group_local_block_ids.append(list(meta.local_block_ids[group_idx]) if is_final_shard else [])
                     continue
-                # HIXL block-level: no kernel expansion (design G3). Slice
-                # remote blocks directly; local blocks mirror the shard's block
-                # range. Under r_blk==1 (Bd==Bp) this matches Mooncake's
-                # _local_kernel_ids_for_shard; r_blk>1 needs the full CP
-                # local-block geometry (Mooncake :3026-3038), left for NPU
-                # verification.
+                # Attention: expand to kernel blocks (fork Mooncake :3016-3042).
+                # Remote is sliced from remote_first (skips this rank's
+                # prefix-cached blocks) then expanded; local kernels are located
+                # directly from CP rank + block index via _local_kernel_ids_for_shard.
+                # Under scale==1 + r_blk==1 this degenerates to the original
+                # logical-slice behavior; scale>1 (MLA/compress) maps each logical
+                # block to `scale` kernel (tensor) blocks.
+                _, remote_scale, kernel_size = group_kernel_params[group_idx]
                 remote_logical = list(
                     meta.remote_block_ids[group_idx][remote_first : remote_first + num_blocks_to_pull]
                 )
-                local_logical = list(
-                    meta.local_block_ids[group_idx][first_d : first_d + len(remote_logical)]
+                kernel_remote = self._expand_block_ids(remote_logical, remote_scale)
+                kernel_local = self._local_kernel_ids_for_shard(
+                    remote_first,
+                    num_blocks_to_pull,
+                    shard_cp_rank,
+                    num_prefix_p_blocks,
+                    first_d,
+                    r_blk,
+                    local_cp_size,
+                    remote_cp_size,
+                    remote_block_size,
+                    kernel_size,
+                    list(meta.local_block_ids[group_idx]),
                 )
-                num_blocks = min(len(remote_logical), len(local_logical))
-                group_remote_block_ids.append(remote_logical[:num_blocks])
-                group_local_block_ids.append(local_logical[:num_blocks])
+                num_kernel_blocks = min(len(kernel_remote), len(kernel_local))
+                group_remote_block_ids.append(kernel_remote[:num_kernel_blocks])
+                group_local_block_ids.append(kernel_local[:num_kernel_blocks])
             remote_block_ids_list.append(tuple(group_remote_block_ids))  # type: ignore
             local_block_ids_list.append(tuple(group_local_block_ids))  # type: ignore
 
@@ -2394,9 +2412,11 @@ class HIXLConnectorWorker:
     def _get_kernel_block_ids(self, layer_indices, meta: ReqMeta, group_idx: int, group_spec):
         """No-CP per-group block ids at kernel granularity: (local, remote).
 
-        HIXL adaptation: block_size_scale is indexed [group_idx][0] (Phase 2
-        keeps scale==1, so expansion is a no-op). MLA/compress (scale>1) is
-        Phase 3. Mamba logical ids pass through unchanged (Phase 3 path).
+        HIXL adaptation: block_size_scale is indexed [group_idx][0] (one
+        transfer group shares one shape, hixl:2546-2550, so group-internal
+        scale is uniform). scale>1 (MLA/compress) expands each logical block
+        into `scale` kernel blocks via _expand_block_ids. Mamba logical ids
+        pass through unchanged.
         """
         kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
         if group_spec["kv_cache_spec_type"] == "MambaSpec":
@@ -2432,6 +2452,88 @@ class HIXLConnectorWorker:
         kernel_remote = kernel_remote[remote_start_idx:]
         num_kernel_blocks = min(len(kernel_remote), len(kernel_local))
         return kernel_local[:num_kernel_blocks], kernel_remote[:num_kernel_blocks]
+
+    def _get_group_kernel_params(self, remote_block_size):
+        # Per attention group kernel-expansion params: (local_scale, remote_scale, kernel_size).
+        # The kernel size is shared by both sides, so remote_scale is derived locally from it
+        # (no remote handshake scale needed). Mamba groups are not block-sharded and skipped.
+        # fork Mooncake :2618-2633; block_size_scale indexed per-group (hixl) vs per-layer (MC).
+        group_kernel_params: dict[int, tuple[int, int, int]] = {}
+        for group_idx, (group_spec, layer_indices) in self.kv_group2layeridx.items():
+            if group_spec["kv_cache_spec_type"] == "MambaSpec":
+                continue
+            local_scale = self.block_size_scale[group_idx][0]
+            kernel_size = self.block_size // local_scale
+            assert remote_block_size % kernel_size == 0, (
+                f"remote_block_size({remote_block_size}) not divisible by kernel_size({kernel_size})"
+            )
+            remote_scale = remote_block_size // kernel_size
+            group_kernel_params[group_idx] = (local_scale, remote_scale, kernel_size)
+        return group_kernel_params
+
+    def _local_kernel_ids_for_shard(
+        self,
+        shard_first_p_block,
+        num_blocks_to_pull,
+        shard_cp_rank,
+        num_prefix_p_blocks,
+        rank_first_d_block,
+        block_size_ratio,
+        local_cp_size,
+        remote_cp_size,
+        remote_block_size,
+        kernel_size,
+        local_block_ids,
+    ):
+        """Map this shard's pulled P-blocks straight to D-side kernel block ids.
+
+        fork Mooncake :2505-2567 (block-level,寻址无关可直接 fork). The shard
+        (CP rank ``shard_cp_rank``) pulls ``num_blocks_to_pull`` P-blocks starting
+        at this rank's local index ``shard_first_p_block``. The destination
+        kernel position is derived directly from the CP rank and the block
+        index. Under r_blk==1 + scale==1 this degenerates to the original
+        logical-slice behavior (kernels_per_d_block==1 -> kernel id == d_block).
+        """
+        # Number of kernel blocks contained in one D-block (Bd/kernel) and one P-block (Bp/kernel).
+        kernels_per_d_block = self.block_size // kernel_size
+        kernels_per_p_block = remote_block_size // kernel_size
+        # Tokens addressable by this rank's D-blocks; a kernel beyond this has no destination.
+        local_token_limit = len(local_block_ids) * self.block_size
+        kernel_block_ids: list[int] = []
+        for block_idx in range(num_blocks_to_pull):
+            # P-blocks are round-robin interleaved across the remote CP ranks, so this rank's
+            # block_idx-th pulled block maps to global prompt block (in P-units):
+            #   global_p_block = (shard_first_p_block + block_idx) * Rcp + shard_cp_rank
+            global_p_block = (shard_first_p_block + block_idx) * remote_cp_size + shard_cp_rank
+            if remote_block_size > self.block_size:
+                # Bp > Bd (only supported when D-side has no CP): one P-block spans multiple
+                # D-blocks, so walk it kernel by kernel via the absolute token offset within
+                # the external (post-prefix) zone: p_block_token_start = (p - P0) * Bp.
+                p_block_token_start = (global_p_block - num_prefix_p_blocks) * remote_block_size
+                for kernel_idx in range(kernels_per_p_block):
+                    token_offset = p_block_token_start + kernel_idx * kernel_size
+                    if token_offset >= local_token_limit:
+                        # P-side tail block is partial; its trailing kernels have no D token.
+                        break
+                    # Locate the D-block holding this token, then the kernel slot inside it.
+                    d_block = local_block_ids[token_offset // self.block_size]
+                    kernel_in_d_block = (token_offset % self.block_size) // kernel_size
+                    kernel_block_ids.append(d_block * kernels_per_d_block + kernel_in_d_block)
+            else:
+                # Bd >= Bp: the P-block falls entirely inside one D-block.
+                # Global D-block d = p // r (r = Bd/Bp); its index within this rank's local
+                # list is (d - rank_first_d_block) // Lcp. The P-block occupies a contiguous
+                # run of kernels_per_p_block kernels starting at intra-block kernel offset
+                # ((p % r) * Bp) / kernel.
+                d_block_local_idx = (global_p_block // block_size_ratio - rank_first_d_block) // local_cp_size
+                if d_block_local_idx >= len(local_block_ids):
+                    # Pairs with the remote-side truncation when the P-side tail block is partial.
+                    continue
+                d_block = local_block_ids[d_block_local_idx]
+                first_kernel_in_d_block = ((global_p_block % block_size_ratio) * remote_block_size) // kernel_size
+                for kernel_idx in range(kernels_per_p_block):
+                    kernel_block_ids.append(d_block * kernels_per_d_block + first_kernel_in_d_block + kernel_idx)
+        return kernel_block_ids
 
     def _init_staging_caches(self) -> None:
         """Allocate per-group staging Cache for TP>1 head reassembly (D side).
@@ -2555,13 +2657,13 @@ class HIXLConnectorWorker:
             )
             num_tensors_per_group.append(num_tensors)
             # block_size_scale[group]: tensor num_blocks / logical num_blocks.
-            # Phase 2 keeps scale==1 (standard FullAttention, no MLA/compress/SWA).
-            # scale>1 needs kernel-block expansion (MC _get_kernel_block_ids) and
-            # is deferred to Phase 3 (MLA/compress groups).
+            # scale>=1: scale==1 is standard FullAttention; scale>1 is MLA/compress
+            # (DeepseekV4), where one logical block spans `scale` kernel (tensor)
+            # blocks. Kernel-block expansion (_get_kernel_block_ids /
+            # _local_kernel_ids_for_shard) handles scale>1 (fork Mooncake).
             scale = ref_shape[0] // self.num_blocks
-            assert scale == 1, (
-                f"HIXLConnector Phase 2 requires block_size_scale==1 (standard "
-                f"FullAttention); scale>1 (MLA/compress) is Phase 3. got {scale}."
+            assert scale >= 1, (
+                f"block_size_scale must be >= 1 (MLA/compress scale); got {scale}."
             )
             block_size_scale.append([scale])
 
