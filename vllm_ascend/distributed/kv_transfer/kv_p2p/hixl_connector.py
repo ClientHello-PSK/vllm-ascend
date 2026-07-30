@@ -155,6 +155,26 @@ class HixlAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
 
 
 @dataclass
+class MambaCacheBundle:
+    """conv/ssm registered as two independent Caches (CacheDesc's single-shape
+    constraint can't hold heterogeneous state tensors: conv 2D vs ssm 3D).
+
+    conv+ssm are as_strided views of the same raw_tensor (model_runner_v1.py),
+    so they share one block table -> one block id. Pull reuses the same
+    src/dst block ids for both sub-caches with tensor_num_per_layer=1 (each
+    layer contributes exactly 1 conv / 1 ssm tensor). Forks Mooncake's per-
+    layer (conv_addr, ssm_addr) byte geometry under block addressing.
+    """
+    conv: Any
+    ssm: Any
+    num_layers: int = 0  # == len(conv addrs) == len(ssm addrs)
+
+    @property
+    def subcaches(self) -> tuple:
+        return (self.conv, self.ssm)
+
+
+@dataclass
 class ReqMeta:
     local_block_ids: BlockIds
     num_external_tokens: int
@@ -488,6 +508,10 @@ class KVCacheRecvingThread(threading.Thread):
         assert vllm_config is not None
         self.vllm_config: VllmConfig = vllm_config
         self.block_size = self.vllm_config.cache_config.block_size
+        # G3: NZ layout (MLA D-node only, AscendConfig.enable_kv_nz). D cache is
+        # physically NZ-ordered; pull_blocks writes ND into it, so a ND->NZ
+        # reformat is needed after pull (fork Mooncake reformat_kv_cache:1244-1317).
+        self.enable_kv_nz = bool(getattr(get_ascend_config(), "enable_kv_nz", False))
 
         self.proc_not_transfer_request: dict[str, bool] = {}
         self.proc_not_transfer_request_lock = threading.Lock()
@@ -772,7 +796,45 @@ class KVCacheRecvingThread(threading.Thread):
             # the real cache (fork Mooncake :841).
             is_state_group = group_spec.get("kv_cache_spec_type") == "MambaSpec"
 
-            if tp_n > 1 and not is_state_group:
+            if is_state_group:
+                # G2: mamba conv/ssm registered as two sub-caches (MambaCacheBundle).
+                # conv+ssm share one block table -> reuse one src/dst block id for
+                # both, with tensor_num_per_layer=1 (1 conv / 1 ssm per layer).
+                # Forks Mooncake per-layer (conv_addr, ssm_addr) byte geometry
+                # (MC:1142-1154) under block addressing.
+                bundle = self.group_caches.get(kv_cache_group_id)
+                if not isinstance(bundle, MambaCacheBundle):
+                    logger.error(
+                        "HIXL mamba group %s has no MambaCacheBundle; skip.",
+                        kv_cache_group_id,
+                    )
+                    continue
+                assert tp_n == 1, (
+                    "mamba TP>1 head-shard via block API unsupported; "
+                    "require prefill_tp==decode_tp (G2 R3)."
+                )
+                grouped_remote, grouped_local = group_concurrent_contiguous(
+                    src_blocks, dst_logical,
+                )
+                for sub_cache in bundle.subcaches:
+                    num_layers = sub_cache.cache_desc.num_tensors
+                    for cr, cl in zip(grouped_remote, grouped_local):
+                        self.cache_manager.pull_blocks(
+                            BlocksCacheKey(remote_cluster_id, self.model_id),
+                            sub_cache,
+                            src_blocks=cr,
+                            dst_blocks=cl,
+                            src_layer_range=range(num_layers),
+                            dst_layer_range=range(num_layers),
+                            tensor_num_per_layer=1,
+                        )
+                logger.debug(
+                    "HIXL mamba pull ok. request=%s group=%s src=%s dst=%s",
+                    remote_request_id, group_idx, src_blocks, dst_logical,
+                )
+                continue
+
+            if tp_n > 1:
                 staging_cache = self.staging_caches.get(kv_cache_group_id)
                 if staging_cache is None:
                     logger.error(
@@ -834,6 +896,17 @@ class KVCacheRecvingThread(threading.Thread):
                 "HIXL pull ok. request=%s group=%s remote_cluster=%s src=%s dst=%s",
                 remote_request_id, group_idx, remote_cluster_id, src_blocks, dst_blocks,
             )
+
+            # G3: NZ reformat. enable_kv_nz (MLA D-node only) stores D cache in
+            # NZ physical layout; pull_blocks just wrote ND into it, so reformat
+            # ND -> NZ via npu_paged_cache_load + npu_scatter_pa_kv_cache (fork
+            # Mooncake reformat_kv_cache:1244-1317). TP=1 only: MLA NZ has
+            # num_kv_heads==1 -> tp_n==1; TP>1+NZ needs a staging NZ scatter
+            # branch (unsupported). Mamba groups (is_state_group) already
+            # `continue`d above and are not NZ-ordered.
+            if self.enable_kv_nz and tp_n == 1 and not is_state_group:
+                group_kv = self._get_group_kv_caches(group_idx, layer_indices)
+                self._reformat_kv_cache_nz(group_kv, dst_logical)
 
             if tp_n > 1 and not is_state_group:
                 ready_attention_group_reformat_block_ids.append(
@@ -966,6 +1039,101 @@ class KVCacheRecvingThread(threading.Thread):
                 k_d = v_d = d_cache
             _transpose(k_s, k_d)
             _transpose(v_s, v_d)
+
+    def _reformat_kv_cache_nz(
+        self,
+        group_kv: dict[str, Any],
+        block_ids: list[int],
+    ) -> None:
+        """G3: ND -> NZ reformat of D real cache after pull (fork Mooncake
+        reformat_kv_cache:1244-1317, NZ branch only).
+
+        pull_blocks writes ND into the D cache; under enable_kv_nz the D cache
+        is physically NZ-ordered (attention writes via npu_scatter_pa_kv_cache,
+        mla_v1.py:1413). Load each layer's ND block range out of the D cache,
+        then scatter it back into the D cache's NZ view. TP=1 only: MLA NZ has
+        num_kv_heads==1 -> tp_n==1; TP>1+NZ needs a staging NZ scatter branch
+        (left unsupported).
+        """
+        if not block_ids:
+            return
+        first_cache = next(iter(group_kv.values()))
+        if isinstance(first_cache, (list, tuple)):
+            k_ref, v_ref = first_cache[0], first_cache[1]
+        else:
+            k_ref = v_ref = first_cache
+        dtype = k_ref.dtype
+        device = k_ref.device
+        num_kv_heads = int(k_ref.shape[-2])
+        k_head_dim = int(k_ref.shape[-1])
+        v_head_dim = int(v_ref.shape[-1])
+
+        num_blocks = len(block_ids)
+        num_tokens = num_blocks * self.block_size
+        block_ids_tensor = torch.tensor(block_ids, dtype=torch.int32, device=device)
+        block_table = block_ids_tensor.view(1, -1)
+        block_len_tensor = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+        seq_start_tensor = torch.tensor([0], dtype=torch.int32, device=device)
+        # slot_mapping = intra-block offset + block_id * block_size (MC:1273-1276).
+        block_offsets = torch.arange(0, self.block_size, dtype=torch.int32, device=device)
+        slot_mapping = (
+            block_offsets.reshape((1, self.block_size))
+            + block_ids_tensor.reshape((num_blocks, 1)) * self.block_size
+        ).flatten()
+        k_buffer = torch.empty((num_tokens, num_kv_heads, k_head_dim), dtype=dtype, device=device)
+        v_buffer = torch.empty((num_tokens, num_kv_heads, v_head_dim), dtype=dtype, device=device)
+        # FIXME: skipping sync crashes in GQA (MC:1278-1281); root cause unknown.
+        torch.npu.synchronize()
+        for d_cache in group_kv.values():
+            if isinstance(d_cache, (list, tuple)):
+                k_cache_layer, v_cache_layer = d_cache[0], d_cache[1]
+            else:
+                k_cache_layer = v_cache_layer = d_cache
+            torch_npu.atb.npu_paged_cache_load(
+                k_cache_layer,
+                v_cache_layer,
+                block_table,
+                block_len_tensor,
+                seq_starts=seq_start_tensor,
+                key=k_buffer,
+                value=v_buffer,
+            )
+            self._nz_kv_cache(
+                k_cache_layer,
+                v_cache_layer,
+                k_buffer,
+                v_buffer,
+                slot_mapping,
+                num_kv_heads,
+                k_head_dim,
+                v_head_dim,
+            )
+
+    def _nz_kv_cache(
+        self,
+        k_cache_layer,
+        v_cache_layer,
+        k_buffer,
+        v_buffer,
+        slot_mapping,
+        num_kv_heads: int,
+        k_head_dim: int,
+        v_head_dim: int,
+    ):
+        # fork Mooncake :1347-1365. nz_fmt_last_dim=16 (MLA NZ, aligns
+        # attention/mla_v1.py:1413; Mooncake uses 16 too).
+        nz_fmt_last_dim = 16
+        k_cache_layer = k_cache_layer.view(
+            -1, k_head_dim * num_kv_heads // nz_fmt_last_dim,
+            self.block_size, nz_fmt_last_dim,
+        )
+        v_cache_layer = v_cache_layer.view(
+            -1, v_head_dim * num_kv_heads // nz_fmt_last_dim,
+            self.block_size, nz_fmt_last_dim,
+        )
+        torch_npu.npu_scatter_pa_kv_cache(
+            k_buffer, v_buffer, k_cache_layer, v_cache_layer, slot_mapping,
+        )
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -2635,6 +2803,76 @@ class HIXLConnectorWorker:
         for group_id, (group_spec, layer_indices) in self.kv_group2layeridx.items():
             kv_cache_group_id = group_spec.get("kv_cache_group_id", group_id)
             layer_names = group_spec["layer_names"]
+            if group_spec["kv_cache_spec_type"] == "MambaSpec":
+                # G2: conv/ssm registered as two independent Caches. CacheDesc's
+                # single-shape constraint cannot hold heterogeneous state tensors
+                # (conv 2D vs ssm 3D), and the old uniform-shape / *2 asserts
+                # (:2648/:2655 below) only hold for attention K+V. conv+ssm share
+                # one block table (same raw_tensor), so pull reuses one block id
+                # for both sub-caches with tensor_num_per_layer=1. Forks Mooncake
+                # per-layer (conv_addr, ssm_addr) byte geometry (MC:1131-1154).
+                conv_addrs: list[int] = []
+                ssm_addrs: list[int] = []
+                conv_shape = ssm_shape = None
+                conv_dtype = ssm_dtype = None
+                for layer_name in layer_names:
+                    states = self._as_kv_cache_tuple(self.kv_caches[layer_name])
+                    assert len(states) == 2, (
+                        f"mamba layer {layer_name} expects [conv, ssm]; got {len(states)}"
+                    )
+                    c, s = states[0], states[1]
+                    conv_addrs.append(int(c.data_ptr()))
+                    ssm_addrs.append(int(s.data_ptr()))
+                    if conv_shape is None:
+                        conv_shape, conv_dtype = tuple(c.shape), c.dtype
+                        ssm_shape, ssm_dtype = tuple(s.shape), s.dtype
+                    else:
+                        assert tuple(c.shape) == conv_shape, (
+                            f"mamba conv shape mismatch: {layer_name} "
+                            f"{tuple(c.shape)} != {conv_shape}"
+                        )
+                        assert tuple(s.shape) == ssm_shape, (
+                            f"mamba ssm shape mismatch: {layer_name} "
+                            f"{tuple(s.shape)} != {ssm_shape}"
+                        )
+                # mamba has no compress: scale (tensor num_blocks / logical) == 1.
+                conv_scale = conv_shape[0] // self.num_blocks
+                ssm_scale = ssm_shape[0] // self.num_blocks
+                assert conv_scale == 1 and ssm_scale == 1, (
+                    f"mamba block_size_scale must be 1 (no compress); "
+                    f"conv={conv_scale} ssm={ssm_scale}"
+                )
+                block_size_scale.append([conv_scale, ssm_scale])
+                num_tensors_per_group.append(len(conv_addrs) + len(ssm_addrs))
+                key = BlocksCacheKey(self.cluster_id, self.model_id)
+                conv_desc = CacheDesc(
+                    num_tensors=len(conv_addrs),
+                    shape=list(conv_shape),
+                    data_type=_torch_dtype_to_llm_dtype(conv_dtype),
+                    placement=Placement.DEVICE,
+                )
+                ssm_desc = CacheDesc(
+                    num_tensors=len(ssm_addrs),
+                    shape=list(ssm_shape),
+                    data_type=_torch_dtype_to_llm_dtype(ssm_dtype),
+                    placement=Placement.DEVICE,
+                )
+                conv_cache = self.cache_manager.register_blocks_cache(
+                    conv_desc, conv_addrs, key, remote_accessible=True,
+                )
+                ssm_cache = self.cache_manager.register_blocks_cache(
+                    ssm_desc, ssm_addrs, key, remote_accessible=True,
+                )
+                self.group_caches[kv_cache_group_id] = MambaCacheBundle(
+                    conv=conv_cache, ssm=ssm_cache, num_layers=len(conv_addrs),
+                )
+                logger.info(
+                    "HIXL DEBUG register mamba: group=%s conv_shape=%s ssm_shape=%s "
+                    "num_layers=%s kv_role=%s",
+                    kv_cache_group_id, conv_shape, ssm_shape, len(conv_addrs),
+                    self.kv_role,
+                )
+                continue
             addrs: list[int] = []
             ref_shape = None
             ref_dtype = None
