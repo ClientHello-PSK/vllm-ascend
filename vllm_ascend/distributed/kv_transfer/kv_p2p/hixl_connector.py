@@ -11,6 +11,7 @@ See docs/vllm-ascend-hixl-connector-design.md for the full design. Phase 2/3
 will add TP>1 staging, HMA multi-group, PP/PCP/DCP and Mamba.
 """
 import contextlib
+import copy
 import hashlib
 import logging
 import math
@@ -41,11 +42,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed import get_pcp_group
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -59,6 +62,10 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.kv_transfer.utils.hixl_datadist import (
     get_datadist,
     shutdown_datadist,
+)
+from vllm_ascend.distributed.utils import (
+    get_decode_context_model_parallel_rank,
+    get_decode_context_model_parallel_world_size,
 )
 
 # isort: off
@@ -93,6 +100,27 @@ def _torch_dtype_to_llm_dtype(dtype: torch.dtype):
     if dtype == torch.int8:
         return DataType.DT_INT8
     raise ValueError(f"Unsupported kv cache dtype for HIXLConnector: {dtype}")
+
+
+# ---------------------------------------------------------------------------
+# Prefill-PP layer segment helper (forked from Mooncake :3752).
+# ---------------------------------------------------------------------------
+def get_prefill_pp_indices(
+    num_hidden_layers: int, pp_rank: int, pp_size: int, partition_list_str: str | None = None
+) -> tuple[int, int]:
+    if partition_list_str is None:
+        return get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+    try:
+        partitions = [int(layer) for layer in partition_list_str.split(",")]
+    except ValueError as err:
+        raise ValueError("Invalid partition string: {}".format(partition_list_str)) from err
+    if len(partitions) != pp_size:
+        raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
+    if sum(partitions) != num_hidden_layers:
+        raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
+    start_layer = sum(partitions[:pp_rank])
+    end_layer = start_layer + partitions[pp_rank]
+    return (start_layer, end_layer)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +168,10 @@ class ReqMeta:
     remote_ptp_size: int
     num_prompt_blocks: int
     remote_block_size: int
+    # Phase 3 subitem D2: P-side CP geometry forwarded to D for CP shard
+    # derivation (fork Mooncake :121-122). Default 1 (No-CP).
+    remote_pcp_size: int = 1
+    remote_dcp_size: int = 1
     remote_multi_nodes_meta_mapping: dict[str, Any] | None = None
 
 
@@ -152,6 +184,16 @@ class GroupPull:
     # _get_hybrid_remote_rank_group_pulls constructors. Always 0 under PP=1.
     prefill_pp_rank: int = 0
     is_group_transfer_end: bool = False
+
+
+@dataclass
+class GroupTransferInfo:
+    """Per-group transfer metadata (forked from Mooncake, byte-address fields
+    dropped). State groups (Mamba) are not context-block aligned with attention
+    KV, so they are kept intact during MTP extra-block clipping."""
+
+    tokens_per_block: int = 0
+    is_state_group: bool = False
 
 
 @dataclass
@@ -256,12 +298,13 @@ class KVCacheSendingThread(threading.Thread):
         ready_event: threading.Event,
         kv_caches: dict[str, Any],
         pcp_rank: int,
+        pcp_size: int = 1,
     ):
         super().__init__(daemon=True, name="HIXLKCacheSendingThread")
         self.tp_rank = tp_rank
         self.prefill_tp_size = prefill_tp_size
         self.pp_rank = get_pp_group().rank_in_group
-        self.pcp_size = 1  # Phase 1: no PCP
+        self.pcp_size = pcp_size
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.tp_size = get_tensor_model_parallel_world_size()
         self.local_engine_id = local_engine_id
@@ -465,6 +508,7 @@ class KVCacheRecvingThread(threading.Thread):
         remote_port_send_num: dict[int, RemotePortInfo] | None = None,
         num_computed_tokens: int = 0,
         all_task_done: bool = False,
+        shard_idx: int = 0,
     ):
         if remote_port_send_num is None:
             remote_port_send_num = {}
@@ -480,6 +524,7 @@ class KVCacheRecvingThread(threading.Thread):
             "num_computed_tokens": num_computed_tokens,
             "remote_port_send_num": remote_port_send_num,
             "all_task_done": all_task_done,
+            "shard_idx": shard_idx,
         }
         self.request_queue.put(trans_info)
 
@@ -622,6 +667,12 @@ class KVCacheRecvingThread(threading.Thread):
                     self.proc_not_transfer_request.pop(remote_request_id, None)
                 self._clear_failed_recv_request(request_id)
             self.request_queue.task_done()
+            # Bug 4 fix: free P ports with num==0 (mapped but not pulled by
+            # this D rank) so P-side delayed_free doesn't wait for timeout
+            # (fork Mooncake :751).
+            self._send_done_signal_to_free_remote_port(remote_request_id, remote_port_send_num)
+            # Always send the done signal to the remote host to ensure proper
+            # resource cleanup. Failing to do so may cause a memory leak.
             self._send_done_recv_signal(remote_request_id, remote_host, remote_handshake_port, remote_port_send_num)
 
     def _get_remote_metadata(self, remote_host: str, remote_handshake_port: int) -> None:
@@ -714,7 +765,14 @@ class KVCacheRecvingThread(threading.Thread):
             if not src_blocks or not dst_logical:
                 continue
 
-            if tp_n > 1:
+            # Phase 3 subitem C3: Mamba state is not head-sharded. Its
+            # num_group_pulls is the P-rank count (prefill_tp/decode_tp), not a
+            # head-split count, so it must NOT go through staging/reformat
+            # (which reassembles head shards). State groups land directly in
+            # the real cache (fork Mooncake :841).
+            is_state_group = group_spec.get("kv_cache_spec_type") == "MambaSpec"
+
+            if tp_n > 1 and not is_state_group:
                 staging_cache = self.staging_caches.get(kv_cache_group_id)
                 if staging_cache is None:
                     logger.error(
@@ -745,7 +803,17 @@ class KVCacheRecvingThread(threading.Thread):
                 remote_cluster_id, dst_cache.cache_id, dst_cache.cache_desc.shape,
                 dst_cache.cache_desc.num_tensors, tp_n, tp_offset, src_blocks, dst_blocks,
             )
+            # Phase 3 subitem B: each PP rank's registered cache contains only
+            # that rank's layer segment (vLLM PP isolates per-rank kv tensors),
+            # so pulling the full local range [0, num_layers) transfers exactly
+            # this rank's segment. prefill_pp_rank selects the P rank (Phase 2
+            # PP dimension in _get_remote_ranks_for_req); it does not index a
+            # global layer range here, unlike Mooncake's byte-addressed
+            # predicate filter (Mooncake :820-830). Draft layers are pulled
+            # automatically when they reside in this rank's cache.
             num_layers = dst_cache.cache_desc.num_tensors // 2
+            src_layer_range = range(num_layers)
+            dst_layer_range = range(num_layers)
             for chunk_remote, chunk_local in zip(grouped_remote, grouped_local):
                 try:
                     self.cache_manager.pull_blocks(
@@ -753,8 +821,8 @@ class KVCacheRecvingThread(threading.Thread):
                         dst_cache,
                         src_blocks=chunk_remote,
                         dst_blocks=chunk_local,
-                        src_layer_range=range(num_layers),
-                        dst_layer_range=range(num_layers),
+                        src_layer_range=src_layer_range,
+                        dst_layer_range=dst_layer_range,
                     )
                 except LLMException as e:
                     logger.error(
@@ -767,7 +835,7 @@ class KVCacheRecvingThread(threading.Thread):
                 remote_request_id, group_idx, remote_cluster_id, src_blocks, dst_blocks,
             )
 
-            if tp_n > 1:
+            if tp_n > 1 and not is_state_group:
                 ready_attention_group_reformat_block_ids.append(
                     (
                         (group_idx, reformat_local, tp_n, layer_indices),
@@ -782,17 +850,22 @@ class KVCacheRecvingThread(threading.Thread):
             if is_end
         ]
         if ready:
-            # No-CP: single shard index 0.
-            self._stash_pending_reformat(request_id, 0, ready)
+            # Bug 3 fix: stash per shard_idx (CP shards reformat independently),
+            # not hardcoded 0 (which overwrote earlier shards' reformat meta).
+            self._stash_pending_reformat(request_id, req_meta["shard_idx"], ready)
 
     def _get_group_kv_caches(self, group_idx: int, layer_indices: list[int] | None = None) -> dict[str, Any]:
         if layer_indices is None:
             _, layer_indices = self.kv_group2layeridx[group_idx]
         layer_index_set = set(layer_indices)
-        num_attn_module = 1
+        num_attn_module = 2 if self.vllm_config.model_config.hf_text_config.model_type == "longcat_flash" else 1
         from vllm.v1.worker.utils import extract_layer_index
 
         def layer_in_group(layer_name: str) -> bool:
+            # Phase 3 subitem A: MTP layers belong to the group whose layer
+            # indices fall in the draft region (>= num_layers).
+            if "mtp" in layer_name:
+                return any(layer_idx >= self.num_layers for layer_idx in layer_index_set)
             return extract_layer_index(layer_name, num_attn_module) in layer_index_set
 
         return {
@@ -894,6 +967,28 @@ class KVCacheRecvingThread(threading.Thread):
             _transpose(k_s, k_d)
             _transpose(v_s, v_d)
 
+    def _send_done_signal_to_free_remote_port(
+        self, request_id: str, remote_port_send_num: dict[int, RemotePortInfo]
+    ):
+        """Bug 4 fix (fork Mooncake :757-772): free P ports with num==0
+        (mapped into remote_port_send_num but not pulled by this D rank) so
+        P-side delayed_free does not wait for timeout. Only device_index==0
+        (side_channel_port == local_handshake_port) sends to dedup across
+        D ranks that share the same P port set."""
+        if self.side_channel_port != self.local_handshake_port or not remote_port_send_num:
+            return
+        with self.proc_not_transfer_request_lock:
+            if request_id not in self.proc_not_transfer_request:
+                self.proc_not_transfer_request[request_id] = True
+            should_send = self.proc_not_transfer_request[request_id]
+            if should_send:
+                self.proc_not_transfer_request[request_id] = False
+        if should_send:
+            for remote_port in remote_port_send_num:
+                if remote_port_send_num[remote_port]["num"] == 0:
+                    remote_host_ = remote_port_send_num[remote_port]["host"]
+                    self._send_done_recv_signal(request_id, remote_host_, remote_port, remote_port_send_num)
+
     def _send_done_recv_signal(
         self,
         request_id: str,
@@ -965,6 +1060,8 @@ class HIXLConnectorMetadata(KVConnectorMetadata):
             remote_ptp_size=kv_transfer_params.get("remote_ptp_size", 1),
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
             remote_block_size=kv_transfer_params.get("remote_block_size", 0),
+            remote_pcp_size=kv_transfer_params.get("remote_pcp_size", 1),
+            remote_dcp_size=kv_transfer_params.get("remote_dcp_size", 1),
             remote_multi_nodes_meta_mapping=kv_transfer_params.get("remote_multi_nodes_meta_mapping", {}),
         )
 
@@ -1072,11 +1169,18 @@ class HIXLConnectorScheduler:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         logger.info("Initializing HIXL Scheduler %s", engine_id)
 
+        # Phase 3 subitem D1: PCP/DCP geometry must precede side_channel_port
+        # (which scales by pcp_size). Bug 2 fix: Scheduler side_channel_port
+        # must match Worker (both * pcp_size), else PCP>1 D connects to wrong
+        # P port (remote_port base != P listening base).
+        self.pcp_size = get_pcp_group().world_size
+        self.dcp_size = get_decode_context_model_parallel_world_size()
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port
             + vllm_config.parallel_config.data_parallel_rank
             * vllm_config.parallel_config.tensor_parallel_size
             * vllm_config.parallel_config.pipeline_parallel_size
+            * self.pcp_size
         )
         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, int]] = {}
         self._reqs_need_send: dict[str, float] = {}
@@ -1084,16 +1188,72 @@ class HIXLConnectorScheduler:
 
         self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
         self.kv_cache_groups = kv_cache_config.kv_cache_groups
+        # Phase 3 subitem A/C: per-group transfer info. is_state_group (Mamba)
+        # keeps state blocks intact during MTP extra-block clipping (A4);
+        # need_truncate drives Mamba last-token recompute (subitem C2).
+        self.group_transfer_info: list[GroupTransferInfo] = [
+            self._get_group_transfer_info(group) for group in self.kv_cache_groups
+        ]
+        self.use_compress = self._model_uses_compress()
+        self.need_truncate = self.use_compress or any(
+            info.is_state_group for info in self.group_transfer_info
+        )
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_prefill"):
+            # Remote prefill: pull all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
-            count = max(len(token_ids) - num_computed_tokens, 0)
+            # Phase 3 subitem C2: D-side Mamba last-token recompute. The
+            # decoder always recomputes the last token, so it must start from
+            # h(N-1) -> pull N-1 prompt tokens worth of KV (fork Mooncake :1810).
+            actual = self._state_prefill_token_count(len(token_ids))
             params["num_computed_tokens"] = num_computed_tokens
+            count = max(actual - num_computed_tokens, 0)
             if count > 0:
                 return count, True
+
+        # Phase 3 subitem C2: P-side Mamba last-token truncation. Drop the last
+        # prompt token so the prefiller computes h(N-1); the decoder recomputes
+        # the last token to derive h(N) (fork Mooncake :1816-1817).
+        if params is not None and params.get("do_remote_decode") and self.need_truncate:
+            self._truncate_request_for_prefill(request)
+
         return 0, False
+
+    def _model_uses_compress(self) -> bool:
+        hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
+        compress_ratios = getattr(hf_config, "compress_ratios", None)
+        return isinstance(compress_ratios, (list, tuple, dict))
+
+    def _state_prefill_token_count(self, num_prompt_tokens: int) -> int:
+        """D-side only. Returns N-1 for Mamba models since the decoder always
+        recomputes the last token and must start from h(N-1)."""
+        if self.need_truncate and num_prompt_tokens > 1:
+            return num_prompt_tokens - 1
+        return num_prompt_tokens
+
+    def _truncate_request_for_prefill(self, request: "Request") -> None:
+        """P-side only: drop the last prompt token so the prefiller computes
+        h(N-1) instead of h(N). The decoder recomputes the last token to derive
+        h(N) correctly. Guarded by _p_side_truncated to avoid repeated
+        truncation if the request is preempted and rescheduled."""
+        params = request.kv_transfer_params
+        if (
+            params is not None
+            and not params.get("_p_side_truncated")
+            and request.num_prompt_tokens > 1
+        ):
+            if request.prompt_token_ids is not None:
+                request.prompt_token_ids.pop()
+            elif request.prompt_embeds is not None:
+                request.prompt_embeds = request.prompt_embeds[:-1]
+            else:
+                return
+            request._all_token_ids.pop()
+            request.num_prompt_tokens -= 1
+            request.max_tokens = 1
+            params["_p_side_truncated"] = True
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         params = request.kv_transfer_params
@@ -1141,7 +1301,9 @@ class HIXLConnectorScheduler:
             return False, None
 
         num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
-        computed_block_ids = block_ids
+        computed_block_ids = self._get_transfer_block_ids(
+            block_ids, len(request.prompt_token_ids)
+        )
         # Phase 1 single group: just take group 0 length.
         computed_block_lens = [len(bid_list) for bid_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0
@@ -1158,11 +1320,65 @@ class HIXLConnectorScheduler:
             remote_host=self.side_channel_host,
             remote_port=self.side_channel_port,
             remote_ptp_size=self.tp_size,
+            remote_pcp_size=self.pcp_size,
+            remote_dcp_size=self.dcp_size,
             last_token_id=request.output_token_ids[-1],
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
             remote_block_size=self.block_size,
         )
+
+    def _get_group_unique_specs(self, group: Any) -> list[Any]:
+        if not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+            return [group.kv_cache_spec]
+        specs: list[Any] = []
+        for layer_name in group.layer_names:
+            layer_spec = group.kv_cache_spec.kv_cache_specs[layer_name]
+            if layer_spec not in specs:
+                specs.append(layer_spec)
+        return specs
+
+    def _get_group_transfer_info(self, group: Any) -> GroupTransferInfo:
+        specs = self._get_group_unique_specs(group)
+        first_spec = specs[0] if specs else group.kv_cache_spec
+        block_size = getattr(
+            group.kv_cache_spec, "block_size",
+            getattr(first_spec, "block_size", self.block_size),
+        )
+        is_state_group = any(type(spec).__name__ == "MambaSpec" for spec in specs)
+        compress_ratio = 1
+        for spec in specs:
+            if hasattr(spec, "compress_ratio"):
+                compress_ratio = spec.compress_ratio
+        return GroupTransferInfo(
+            tokens_per_block=block_size * max(1, int(compress_ratio)),
+            is_state_group=is_state_group,
+        )
+
+    def _get_transfer_block_ids(self, block_ids: BlockIds, prompt_len: int) -> BlockIds:
+        """Return blocks that contain prompt KV, dropping MTP extra blocks.
+
+        State groups (Mamba) are not context-block aligned with attention KV,
+        so keep them unchanged; only clip attention-like groups. Block-level
+        clipping is native to HIXL's block addressing (no byte sub-range
+        needed), so this forks Mooncake's _get_transfer_block_ids verbatim.
+        """
+        if len(block_ids) == 0:
+            return block_ids
+        assert len(block_ids) == len(self.group_transfer_info), (
+            "Number of KV cache groups must match"
+        )
+        transfer_block_ids: list = []
+        cp_size = max(1, self.pcp_size * self.dcp_size)
+        for blocks, group_info in zip(block_ids, self.group_transfer_info):
+            if group_info.is_state_group:
+                transfer_block_ids.append(blocks)
+            else:
+                num_prompt_blocks = math.ceil(
+                    prompt_len / (group_info.tokens_per_block * cp_size)
+                )
+                transfer_block_ids.append(blocks[:num_prompt_blocks])
+        return tuple(transfer_block_ids)
 
     def _port_offset_from_handshake_metadata(
         self, rank_metadata: KVConnectorHandshakeMetadata, metadata_key: int | tuple[int, ...]
@@ -1217,9 +1433,41 @@ class HIXLConnectorWorker:
         self.side_channel_host = get_ip()
         self.total_layers = vllm_config.model_config.get_total_num_hidden_layers()
         self.num_key_value_heads = vllm_config.model_config.hf_text_config.num_key_value_heads
+        # Phase 3 subitem A: MTP/Eagle draft-layer KV transfer. Draft layer
+        # indices start from total_layers (layer-index semantics, orthogonal to
+        # block addressing). MTP shares one KV layer (transfer once); Eagle has
+        # independent draft layers (count = draft_model num_hidden_layers).
+        self.num_layers = vllm_config.model_config.hf_text_config.num_hidden_layers
+        self.num_speculative_tokens = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config is not None
+            else 0
+        )
+        self.num_draft_layers = 0
+        if vllm_config.speculative_config is not None:
+            if vllm_config.speculative_config.method == "mtp":
+                self.num_draft_layers = 1
+            elif (
+                hasattr(vllm_config.speculative_config, "draft_model_config")
+                and getattr(
+                    getattr(vllm_config.speculative_config.draft_model_config, "hf_config", None),
+                    "num_hidden_layers", None) is not None
+            ):
+                self.num_draft_layers = (
+                    vllm_config.speculative_config.draft_model_config.hf_config.num_hidden_layers
+                )
 
-        # Phase 2: TP>1 staging + reformat is supported. PP/PCP/DCP stay Phase 3.
-        assert self.pp_size == 1, "HIXLConnector Phase 2 supports PP=1 only (PP>1 is Phase 3)."
+        # Phase 3 subitem D1: PCP/DCP parallel geometry (fork Mooncake :1999-2005).
+        self.pcp_size = get_pcp_group().world_size
+        self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
+        self.dcp_size = get_decode_context_model_parallel_world_size()
+        self.dcp_rank = (
+            get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
+        )
+        # Phase 3 subitem B: PP and PCP are mutually exclusive (fork Mooncake :2002).
+        assert not (self.pp_size > 1 and self.pcp_size > 1), (
+            "HIXLConnector: pp and pcp cannot be enabled at the same time."
+        )
 
         self.kv_cache_config = kv_cache_config
         self.num_blocks: int = kv_cache_config.num_blocks
@@ -1232,6 +1480,14 @@ class HIXLConnectorWorker:
         # decoder pulls num_group_pulls = prefill_tp // decode_tp P-rank shards
         # per attention group to reassemble the full head dim).
         self._get_prefill_decode_size(vllm_config)
+        # Phase 3 subitem B: prefill-PP layer segments per rank (fork Mooncake
+        # :529-532). Draft layers extend the last rank's end (subitem A5).
+        self.pp_layer_indices = {
+            rank: get_prefill_pp_indices(
+                self.num_layers, rank, self._prefill_pp_size, self._prefill_pp_layer_partition
+            )
+            for rank in range(self._prefill_pp_size)
+        }
         self._is_hma_required: bool = False  # finalized in register_kv_caches
         self.tp_num_need_pulls: int = 1
 
@@ -1240,8 +1496,13 @@ class HIXLConnectorWorker:
             + vllm_config.parallel_config.data_parallel_rank
             * vllm_config.parallel_config.tensor_parallel_size
             * vllm_config.parallel_config.pipeline_parallel_size
+            * self.pcp_size
         )
-        device_index = self.tp_rank  # pp=1, pcp=1, tp=1 -> 0
+        # Phase 3 subitem D1: device_index embeds the PCP rank between PP and
+        # TP so every (pp, pcp, tp) tuple maps to a unique port offset (fork
+        # Mooncake :2035). PP and PCP are mutually exclusive, so the
+        # pp_rank*pcp_size term degenerates when pcp>1 (pp_rank==0).
+        device_index = (self.pp_rank * self.pcp_size + self.pcp_rank) * self.tp_size + self.tp_rank
         self.handshake_port = self.side_channel_port + device_index
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
@@ -1265,6 +1526,12 @@ class HIXLConnectorWorker:
         self.listen_port = listen_port
         self.model_id = extra.get("model_id", 0)
         self.group_caches: dict[int, Any] = {}  # kv_cache_group_id -> registered Cache
+        # Phase 3 subitem D: CP geometry state (fork Mooncake). use_sparse is
+        # False (HIXL has no sparse path); use_mla mirrors Mooncake :515.
+        self.use_mla = vllm_config.model_config.is_deepseek_mla
+        self.use_sparse = False
+        self.local_remote_block_port_mapping: dict[str, Any] = {}
+        self.remote_port_send_num: dict[str, Any] = {}
 
         self.kv_send_thread: KVCacheSendingThread | None = None
         self.kv_recv_thread: KVCacheRecvingThread | None = None
@@ -1289,8 +1556,10 @@ class HIXLConnectorWorker:
             "extra_config['hixl']['cluster_id_base'] is required (P/D must use disjoint bases)."
         )
         listen_port_base = extra.get("listen_port_base", self.vllm_config.kv_transfer_config.kv_port + 1000)
-        device_index = (self.pp_rank * 1 + 0) * self.tp_size + self.tp_rank  # pcp=1, pcp_rank=0
-        offset = self.dp_rank * (self.tp_size * self.pp_size) + device_index
+        # Phase 3 subitem D1: device_index embeds PCP rank; offset spans
+        # dp*(tp*pp*pcp) so P/D disjoint cluster_id bases stay collision-free.
+        device_index = (self.pp_rank * self.pcp_size + self.pcp_rank) * self.tp_size + self.tp_rank
+        offset = self.dp_rank * (self.tp_size * self.pp_size * self.pcp_size) + device_index
         return int(cluster_id_base) + offset, self.side_channel_host, int(listen_port_base) + offset
 
     @staticmethod
@@ -1329,11 +1598,31 @@ class HIXLConnectorWorker:
                 return repr(value)
 
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] = {}
-        num_attn_module = 1
+        # Phase 3 subitem A: longcat_flash has two attn modules per layer
+        # (num_attn_module=2); others are 1. Affects layer-name parsing stride.
+        num_attn_module = 2 if self.vllm_config.model_config.hf_text_config.model_type == "longcat_flash" else 1
+        # Phase 3 subitem A: draft (MTP/Eagle) layers get indices starting from
+        # total_layers. MTP layers are identified by "mtp" in the name; Eagle3
+        # layer names lack "mtp" but collide with target-model layer ids (upstream
+        # assigns PP-sliced ids), so a colliding/rolled-back id marks an Eagle
+        # layer and is re-assigned from total_layers.
+        next_mtp_layer_idx = self.total_layers
         transfer_group_id = 0
         for kv_cache_group_id, group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
             layer_names = list(group_spec.layer_names)
-            layer_indices = [extract_layer_index(name, num_attn_module) for name in layer_names]
+            assigned_indices: set[int] = set()
+            layer_indices: list[int] = []
+            for name in layer_names:
+                if "mtp" in name:
+                    layer_idx = next_mtp_layer_idx
+                    next_mtp_layer_idx += 1
+                else:
+                    layer_idx = extract_layer_index(name, num_attn_module)
+                    if (assigned_indices and layer_idx < min(assigned_indices)) or (layer_idx in assigned_indices):
+                        layer_idx = next_mtp_layer_idx
+                        next_mtp_layer_idx += 1
+                assigned_indices.add(layer_idx)
+                layer_indices.append(layer_idx)
             spec = group_spec.kv_cache_spec
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 spec = {n: spec.kv_cache_specs[n] for n in layer_names}
@@ -1374,6 +1663,7 @@ class HIXLConnectorWorker:
         self._prefill_tp_size = int(prefill_parallel_config.get("tp_size", self.tp_size))
         self._prefill_dp_size = int(prefill_parallel_config.get("dp_size", self.dp_rank + 1))
         self._prefill_pp_size = int(prefill_parallel_config.get("pp_size", 1))
+        self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
         self._decode_tp_size = self.tp_size
         # num_group_pulls = prefill_tp // decode_tp; TP>1 staging requires
         # prefill_tp >= decode_tp so each D rank reassembles >=1 P-rank shard.
@@ -1547,7 +1837,12 @@ class HIXLConnectorWorker:
                 continue
 
             if group_spec["kv_cache_spec_type"] == "MambaSpec":
-                # Phase 3: Mamba state is not head-sharded; kept for parity.
+                # Phase 3 subitem C4: Mamba state is not head-sharded; each D
+                # rank pulls num_group_pulls = prefill_tp/decode_tp P-rank
+                # state shards. State transfer goes through pull_blocks in the
+                # real-cache (else) branch of _transfer (subitem C3), NOT
+                # through Mooncake's byte-addressed _append_mamba_transfer_meta
+                # (which has no block-addressed counterpart and is dropped).
                 assert prefill_tp_size % self.tp_size == 0, (
                     f"Hybrid Mamba prefill tp size({prefill_tp_size}) must be divisible by "
                     f"decode tp size({self.tp_size})."
@@ -1591,6 +1886,84 @@ class HIXLConnectorWorker:
 
         return list(rank_group_pulls), dict(rank_group_pulls)
 
+    def _get_local_remote_cp_params(self, meta: ReqMeta):
+        """Resolve CP geometry (fork Mooncake :2635-2660, address-agnostic).
+
+        Returns (remote_block_size, local_cp_rank, local_cp_size,
+        remote_cp_size, r_blk) where r_blk = Bd/Bp (>=1) is the D/P
+        block-size ratio.
+        """
+        remote_block_size = meta.remote_block_size or self.block_size
+        local_cp_rank = self.dcp_rank + self.pcp_rank * self.dcp_size
+        local_cp_size = self.dcp_size * self.pcp_size
+        remote_cp_size = meta.remote_pcp_size * meta.remote_dcp_size
+        if remote_block_size != self.block_size:
+            assert self.block_size % remote_block_size == 0 or remote_block_size % self.block_size == 0, (
+                f"Block sizes of P ({remote_block_size}) and D ({self.block_size}) must be divisible by each other."
+            )
+            if local_cp_size > 1:
+                assert self.block_size % remote_block_size == 0, (
+                    f"D node DCP not support P node block_size({remote_block_size}) > D block_size({self.block_size})"
+                )
+                assert (remote_cp_size // local_cp_size) % (self.block_size // remote_block_size) == 0, (
+                    f"remote_cp_size({remote_cp_size}) must be an integer multiple of"
+                    f"r({self.block_size // remote_block_size}) * local_cp_size({local_cp_size})"
+                )
+        r_blk = self.block_size // remote_block_size if self.block_size > remote_block_size else 1
+        return remote_block_size, local_cp_rank, local_cp_size, remote_cp_size, r_blk
+
+    def _get_cp_shard_pulls(self, remote_handshake_port_list, prefill_tp_size, remote_base_port, remote_pcp_size):
+        """CP case: group_pulls derived from port (fork Mooncake :3060-3109,
+        address-agnostic). The port already encodes the random TP choice, so
+        no table lookup is needed."""
+        mamba_num = prefill_tp_size // self.tp_size
+        attn_num = self._get_tp_num_need_pulls(prefill_tp_size)
+        attn_gids = [
+            g for g, (spec, li) in self.kv_group2layeridx.items()
+            if li and spec["kv_cache_spec_type"] != "MambaSpec"
+        ]
+        mamba_gids = [
+            g for g, (spec, li) in self.kv_group2layeridx.items()
+            if li and spec["kv_cache_spec_type"] == "MambaSpec"
+        ]
+        num_shards = len(remote_handshake_port_list)
+        result = []
+        for shard_idx, ports in enumerate(remote_handshake_port_list):
+            is_final = shard_idx == num_shards - 1
+            shard_pulls = []
+            for port_idx, port in enumerate(ports):
+                pulls = []
+                port_tp = (port - remote_base_port) % prefill_tp_size
+                # PCP and PP are mutually exclusive; when PCP>1, pp_rank==0.
+                pp_rank = 0 if remote_pcp_size > 1 else (port - remote_base_port) // prefill_tp_size
+                if port_idx < attn_num:
+                    pulls += [
+                        GroupPull(
+                            group_id=g,
+                            remote_tp_offset=port_idx,
+                            num_group_pulls=attn_num,
+                            prefill_pp_rank=pp_rank,
+                            is_group_transfer_end=port_idx == attn_num - 1,
+                        )
+                        for g in attn_gids
+                    ]
+                if is_final:
+                    m_off = port_tp - self.tp_rank * mamba_num
+                    if 0 <= m_off < mamba_num:
+                        pulls += [
+                            GroupPull(
+                                group_id=g,
+                                remote_tp_offset=m_off,
+                                num_group_pulls=mamba_num,
+                                prefill_pp_rank=pp_rank,
+                                is_group_transfer_end=m_off == mamba_num - 1,
+                            )
+                            for g in mamba_gids
+                        ]
+                shard_pulls.append(pulls)
+            result.append(shard_pulls)
+        return result
+
     def _get_group_pulls_metadata(
         self,
         req_id: str,
@@ -1600,9 +1973,15 @@ class HIXLConnectorWorker:
         remote_pcp_size: int = 1,
         remote_dcp_size: int = 1,
     ) -> list[list[list[GroupPull]]]:
-        """No-CP only (Phase 2). CP/PCP/DCP shard derivation is Phase 3."""
+        """Per-port group pull descriptors. No-CP (Phase 2) and CP (Phase 3
+        subitem D3) branches. CP branch derives group_pulls from ports (fork
+        Mooncake _get_cp_shard_pulls, address-agnostic)."""
         cp_transfer = remote_pcp_size * remote_dcp_size > 1
-        assert not cp_transfer, "HIXLConnector Phase 2 supports No-CP only (PCP/DCP is Phase 3)."
+        if cp_transfer:
+            # Phase 3 subitem D3: CP group_pulls derived from port.
+            return self._get_cp_shard_pulls(
+                remote_handshake_port_list, prefill_tp_size, remote_base_port, remote_pcp_size
+            )
         if self._is_hma_required:
             # Non-CP: port = base + chosen_rank, one-to-one with table keys.
             _, rank_group_pulls = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
@@ -1664,6 +2043,11 @@ class HIXLConnectorWorker:
         """
         prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
 
+        # Phase 3 subitem D4: CP branch. When any side has CP>1, delegate to the
+        # CP path (fork Mooncake :2694-3058, block-level per design G3).
+        if meta.remote_pcp_size * meta.remote_dcp_size * self.pcp_size * self.dcp_size != 1:
+            return self._get_kv_split_metadata_cp(req_id, meta, prefill_tp_size)
+
         # Phase 2: No-CP only.
         if self._is_hma_required:
             chosen_rank_list, _ = self._get_hybrid_remote_rank_group_pulls(req_id, prefill_tp_size)
@@ -1682,6 +2066,287 @@ class HIXLConnectorWorker:
             remote_block_ids[kv_cache_group_id] = remote_kernel_block_ids
         local_block_ids_list = [tuple(local_block_ids) for _ in remote_handshake_port_list]  # type: ignore
         remote_block_ids_list = [tuple(remote_block_ids) for _ in remote_handshake_port_list]  # type: ignore
+        return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
+
+    def _get_kv_split_metadata_cp(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        prefill_tp_size: int,
+    ) -> tuple[list[list[int]], list[BlockIds], list[BlockIds]]:
+        """Phase 3 subitem D4: CP per-shard ports and block ids (fork Mooncake
+        :2694-3058). Block-level: kernel expansion (_expand_block_ids /
+        _local_kernel_ids_for_shard / _get_kernel_block_ids) is dropped per
+        design G3; attention blocks are sliced directly. Under r_blk==1
+        (Bd==Bp, the common case) this matches Mooncake exactly; r_blk>1
+        local-block geometry needs NPU verification (Mooncake :3026-3038).
+        """
+        def context_parallel_parameters_check():
+            assert (meta.remote_pcp_size * meta.remote_dcp_size) % (self.pcp_size * self.dcp_size) == 0
+            if not (self.use_mla or self.use_sparse):
+                p_node_heads_per_rank = math.ceil(self.num_key_value_heads / prefill_tp_size)
+                d_node_heads_per_rank = math.ceil(self.num_key_value_heads / self.tp_size)
+                assert d_node_heads_per_rank % p_node_heads_per_rank == 0
+
+        def get_kv_head_groups(tp_size):
+            if self.use_mla or self.use_sparse:
+                return [(0,)]
+            if self.num_key_value_heads // tp_size >= 1:
+                kv_head_groups = []
+                for tp_rank in range(tp_size):
+                    kv_head_ids = [
+                        head_idx + tp_rank * (self.num_key_value_heads // tp_size)
+                        for head_idx in range(self.num_key_value_heads // tp_size)
+                    ]
+                    kv_head_groups.append(tuple(kv_head_ids))
+                return kv_head_groups
+            if tp_size // self.num_key_value_heads > 1:
+                return [(i,) for i in range(self.num_key_value_heads)]
+            return [(0,)]
+
+        def get_cp_group_meta(tp_size, pcp_size, dcp_size, port_base):
+            cp_group_meta: dict = {}
+            kv_head_groups = get_kv_head_groups(tp_size)
+            dcp_repeat_num = tp_size // len(kv_head_groups) // dcp_size
+            for kv_head_group_idx, kv_head_group in enumerate(kv_head_groups):
+                if kv_head_group not in cp_group_meta:
+                    cp_group_meta[kv_head_group] = {"cp_groups": [], "select_cp_groups_id": 0}
+                kv_head_group_offset = tp_size // len(kv_head_groups) * kv_head_group_idx
+                for dcp_repeat_idx in range(dcp_repeat_num):
+                    cp_group = []
+                    dcp_repeat_offset = dcp_size * dcp_repeat_idx
+                    for pcp_rank in range(pcp_size):
+                        pcp_rank_offset = tp_size * pcp_rank
+                        for dcp_rank in range(dcp_size):
+                            cp_group.append(
+                                dcp_rank + port_base + pcp_rank_offset
+                                + dcp_repeat_offset + kv_head_group_offset
+                            )
+                    cp_group_meta[kv_head_group]["cp_groups"].append(cp_group)
+            return cp_group_meta
+
+        def get_local_remote_block_port_mappings():
+            context_parallel_parameters_check()
+            p_node_cp_group_meta = get_cp_group_meta(
+                prefill_tp_size, meta.remote_pcp_size, meta.remote_dcp_size, meta.remote_port
+            )
+            d_node_cp_group_meta = get_cp_group_meta(
+                self.tp_size, self.pcp_size, self.dcp_size, self.side_channel_port
+            )
+            local_remote_block_port_mappings: dict[int, list[list[int]]] = {}
+            for d_node_head_key in d_node_cp_group_meta:
+                for p_node_head_key in p_node_cp_group_meta:
+                    if not set(p_node_head_key).issubset(set(d_node_head_key)):
+                        continue
+                    d_node_head_group = d_node_cp_group_meta[d_node_head_key]
+                    p_node_head_group = p_node_cp_group_meta[p_node_head_key]
+                    for d_cp_group in d_node_head_group["cp_groups"]:
+                        select_cp_groups_id = p_node_head_group["select_cp_groups_id"]
+                        p_cp_groups = p_node_head_group["cp_groups"]
+                        p_cp_group = p_cp_groups[select_cp_groups_id]
+                        p_node_head_group["select_cp_groups_id"] = (
+                            select_cp_groups_id + 1
+                            if select_cp_groups_id + 1 < len(p_cp_groups) else 0
+                        )
+                        for d_idx, d_port in enumerate(d_cp_group):
+                            if d_port not in local_remote_block_port_mappings:
+                                local_remote_block_port_mappings[d_port] = []
+                            p_port_remote_list = []
+                            for p_idx, p_port in enumerate(p_cp_group):
+                                if (p_idx // r_blk) % len(d_cp_group) == d_idx:
+                                    p_port_remote_list.append(p_port)
+                            local_remote_block_port_mappings[d_port].append(p_port_remote_list)
+            return local_remote_block_port_mappings
+
+        def get_remote_port_send_num(local_remote_block_port_mappings):
+            remote_port_send_num: dict[int, RemotePortInfo] = {}
+            remote_ports: set[int] = set(
+                range(meta.remote_port, meta.remote_port + prefill_tp_size * meta.remote_pcp_size)
+            )
+            kv_port = self.vllm_config.kv_transfer_config.kv_port
+            for key, remote_host_info in (meta.remote_multi_nodes_meta_mapping or {}).items():
+                remote_ports.add(int(remote_host_info.get("handshake_port", kv_port + int(key))))
+            for remote_port_head_list in local_remote_block_port_mappings.values():
+                for remote_port_list in remote_port_head_list:
+                    for remote_port in remote_port_list:
+                        remote_ports.add(remote_port)
+            for remote_port in remote_ports:
+                remote_host, _ = self._get_remote_host_info_by_port(
+                    meta.remote_port, remote_port, meta.remote_host,
+                    meta.remote_engine_id, meta.remote_multi_nodes_meta_mapping,
+                )
+                remote_port_send_num[remote_port] = {"num": 0, "host": remote_host}
+            for remote_port_head_list in local_remote_block_port_mappings.values():
+                for remote_port_list in remote_port_head_list:
+                    for remote_port in remote_port_list:
+                        remote_port_send_num[remote_port]["num"] += 1
+            return remote_port_send_num
+
+        def _set_hma_shared_port(remote_handshake_port_list):
+            if self._is_hma_required and not (self.use_mla or self.use_sparse):
+                remote_dcp = max(meta.remote_dcp_size, 1)
+                group_span = prefill_tp_size // len(get_kv_head_groups(prefill_tp_size))
+                n_replica = max(group_span // remote_dcp, 1)
+                chosen_tp_list = self._get_remote_rank(req_id, prefill_tp_size)
+                if n_replica > 1:
+                    for shard_ports in remote_handshake_port_list:
+                        for i in range(len(shard_ports)):
+                            tp_off = (shard_ports[i] - meta.remote_port) % prefill_tp_size
+                            pcp_seg = (shard_ports[i] - meta.remote_port) - tp_off
+                            group_off = tp_off // group_span * group_span
+                            dcp_part = (tp_off - group_off) % remote_dcp
+                            replica = (chosen_tp_list[i % len(chosen_tp_list)] // remote_dcp) % n_replica
+                            shard_ports[i] = (
+                                meta.remote_port + pcp_seg + group_off + replica * remote_dcp + dcp_part
+                            )
+                k = prefill_tp_size // self.tp_size
+                final_ports = remote_handshake_port_list[-1]
+                pcp_seg = (final_ports[0] - meta.remote_port) // prefill_tp_size * prefill_tp_size
+                for j in range(k):
+                    p = meta.remote_port + pcp_seg + self.tp_rank * k + j
+                    if p not in final_ports:
+                        final_ports.append(p)
+            return remote_handshake_port_list
+
+        remote_block_size, local_cp_rank, local_cp_size, remote_cp_size, r_blk = (
+            self._get_local_remote_cp_params(meta)
+        )
+        # r_blk>1 (Bd>Bp) requires MLA/compress (block_size_scale>1) so that
+        # kernel_size = Bd/scale divides Bp; under scale==1 (Phase 3, no MLA)
+        # Mooncake's _local_kernel_ids_for_shard yields kernels_per_p_block =
+        # Bp//Bd == 0 (no transfer). I.e. r_blk>1 is unsupported without MLA,
+        # and MLA/compress is a separate track (phase3-plan §6/G4). Fail fast
+        # here rather than emit a wrong/empty shard.
+        assert r_blk == 1 or self.use_mla, (
+            "HIXL Phase 3 supports r_blk==1 (P/D same block_size) only; "
+            "r_blk>1 (Bd>Bp) needs MLA/compress (block_size_scale>1), which "
+            "is a separate track. See phase3-plan §6/G4."
+        )
+
+        if meta.remote_engine_id not in self.local_remote_block_port_mapping:
+            self.local_remote_block_port_mapping[meta.remote_engine_id] = None
+        if self.local_remote_block_port_mapping[meta.remote_engine_id] is None:
+            local_remote_block_port_mappings = get_local_remote_block_port_mappings()
+            self.local_remote_block_port_mapping[meta.remote_engine_id] = local_remote_block_port_mappings[
+                self.handshake_port
+            ]
+            self.remote_port_send_num[meta.remote_engine_id] = get_remote_port_send_num(
+                local_remote_block_port_mappings
+            )
+        local_remote_block_port_mapping = copy.deepcopy(
+            self.local_remote_block_port_mapping[meta.remote_engine_id]
+        )
+
+        num_external_blocks = math.ceil(meta.num_external_tokens / self.block_size)
+        num_external_blocks_p = math.ceil(meta.num_external_tokens / remote_block_size)
+        kv_group_items = list(self.kv_group2layeridx.items())
+        sequence_group_idx = next(
+            (
+                group_spec.get("kv_cache_group_id", group_idx)
+                for group_idx, (group_spec, _) in kv_group_items
+                if group_spec["kv_cache_spec_type"] != "MambaSpec"
+            ),
+            0,
+        )
+        assert math.ceil(num_external_blocks / (self.pcp_size * self.dcp_size)) == len(
+            meta.local_block_ids[sequence_group_idx]
+        ), (
+            f"num_external_blocks({num_external_blocks}), cp_size({self.pcp_size * self.dcp_size}), "
+            f"local_block_ids_len ({len(meta.local_block_ids[sequence_group_idx])})"
+        )
+        assert meta.num_prompt_blocks >= num_external_blocks_p, (
+            f"meta.num_prompt_blocks({meta.num_prompt_blocks}), num_external_blocks({num_external_blocks})"
+        )
+
+        remote_block_nums_all = [meta.num_prompt_blocks // remote_cp_size] * remote_cp_size
+        num_remain_blocks = meta.num_prompt_blocks % remote_cp_size
+        for i in range(num_remain_blocks):
+            remote_block_nums_all[i] += 1
+        last_block_location = (num_remain_blocks + remote_cp_size - 1) % remote_cp_size
+
+        # Considering prefix cache, the remote_block_nums_all should be revised
+        num_prefix_cached_blocks = meta.num_prompt_blocks - num_external_blocks_p
+        remote_block_nums_all = [num - num_prefix_cached_blocks // remote_cp_size for num in remote_block_nums_all]
+        num_remain_blocks = num_prefix_cached_blocks % remote_cp_size
+        for i in range(num_remain_blocks):
+            remote_block_nums_all[i] -= 1
+
+        remote_block_nums: list[int] = []
+        shard_cp_ranks: list[int] = []
+        final_block_idx: int | None = None
+        for cp_rank, block_num in enumerate(remote_block_nums_all):
+            if (cp_rank // r_blk) % local_cp_size == local_cp_rank:
+                if last_block_location == cp_rank:
+                    final_block_idx = len(remote_block_nums)
+                remote_block_nums.append(block_num)
+                shard_cp_ranks.append(cp_rank)
+
+        assert local_remote_block_port_mapping is not None
+        if final_block_idx is not None:
+            final_block_num = remote_block_nums.pop(final_block_idx)
+            shard_cp_ranks.append(shard_cp_ranks.pop(final_block_idx))
+            remote_block_nums.append(final_block_num)
+            for mapping in local_remote_block_port_mapping:
+                final_block_port = mapping.pop(final_block_idx)
+                mapping.append(final_block_port)
+
+        num_prefix_p_blocks = num_prefix_cached_blocks
+        if r_blk > 1:
+            assert num_prefix_p_blocks % r_blk == 0, (
+                f"P0({num_prefix_p_blocks}) should be r_blk({r_blk}) integer multiple"
+            )
+        num_prefix_d_blocks = num_prefix_p_blocks // r_blk
+        first_d = num_prefix_d_blocks + ((local_cp_rank - num_prefix_d_blocks) % local_cp_size)
+
+        remote_handshake_port_list, local_block_ids_list, remote_block_ids_list = [], [], []
+        for idx in range(len(local_remote_block_port_mapping[0])):
+            mapping_list = []
+            for mapping in local_remote_block_port_mapping:
+                mapping_list.append(mapping[idx])
+            remote_handshake_port_list.append(mapping_list)
+        remote_handshake_port_list = _set_hma_shared_port(remote_handshake_port_list)
+
+        for remote_kv_id in range(len(remote_handshake_port_list)):
+            num_blocks_to_pull = remote_block_nums[remote_kv_id]
+            shard_cp_rank = shard_cp_ranks[remote_kv_id]
+            remote_first = (num_prefix_p_blocks - shard_cp_rank + remote_cp_size - 1) // remote_cp_size
+            group_remote_block_ids: list[list[int]] = []
+            group_local_block_ids: list[list[int]] = []
+            is_final_shard = remote_kv_id == len(remote_handshake_port_list) - 1
+            for group_idx, (group_spec, _) in kv_group_items:
+                if group_spec["kv_cache_spec_type"] == "MambaSpec":
+                    # Mamba state is not context-block sharded; transfer from
+                    # the final PCP/DCP shard only (fork Mooncake :3010-3015).
+                    group_remote_block_ids.append(list(meta.remote_block_ids[group_idx]) if is_final_shard else [])
+                    group_local_block_ids.append(list(meta.local_block_ids[group_idx]) if is_final_shard else [])
+                    continue
+                # HIXL block-level: no kernel expansion (design G3). Slice
+                # remote blocks directly; local blocks mirror the shard's block
+                # range. Under r_blk==1 (Bd==Bp) this matches Mooncake's
+                # _local_kernel_ids_for_shard; r_blk>1 needs the full CP
+                # local-block geometry (Mooncake :3026-3038), left for NPU
+                # verification.
+                remote_logical = list(
+                    meta.remote_block_ids[group_idx][remote_first : remote_first + num_blocks_to_pull]
+                )
+                local_logical = list(
+                    meta.local_block_ids[group_idx][first_d : first_d + len(remote_logical)]
+                )
+                num_blocks = min(len(remote_logical), len(local_logical))
+                group_remote_block_ids.append(remote_logical[:num_blocks])
+                group_local_block_ids.append(local_logical[:num_blocks])
+            remote_block_ids_list.append(tuple(group_remote_block_ids))  # type: ignore
+            local_block_ids_list.append(tuple(group_local_block_ids))  # type: ignore
+
+        tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
+        if self._is_hma_required:
+            assert len(remote_handshake_port_list[0]) >= tp_num_need_pulls, (
+                f"tp_num_need_pulls: {tp_num_need_pulls}, remote_handshake_port_list: {remote_handshake_port_list}"
+            )
+        else:
+            assert tp_num_need_pulls == len(remote_handshake_port_list[0]), (
+                f"tp_num_need_pulls: {tp_num_need_pulls}, remote_handshake_port_list: {remote_handshake_port_list}"
+            )
         return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
 
     def _get_remote_host_info_by_port(
@@ -1735,7 +2400,23 @@ class HIXLConnectorWorker:
         """
         kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
         if group_spec["kv_cache_spec_type"] == "MambaSpec":
-            return list(meta.local_block_ids[kv_cache_group_id]), list(meta.remote_block_ids[kv_cache_group_id])
+            # align mode: the block table is position-indexed over max_len but
+            # only 2+num_speculative_blocks state blocks are resident; earlier
+            # blocks are nulled (MambaSpec :731-737). Pull just the final
+            # resident state block — remote picks the live SSM block at
+            # len - num_speculative_tokens - 1, local picks the freshly
+            # allocated block 0 (fork Mooncake :867-869). all mode would pull
+            # every block, but align is the Qwen3.6 default.
+            remote_blocks = list(meta.remote_block_ids[kv_cache_group_id])
+            local_blocks = list(meta.local_block_ids[kv_cache_group_id])
+            if remote_blocks:
+                transfer_block_idx = len(remote_blocks) - self.num_speculative_tokens - 1
+                if transfer_block_idx < 0:
+                    transfer_block_idx = 0
+                remote_blocks = [remote_blocks[transfer_block_idx]]
+            if local_blocks:
+                local_blocks = [local_blocks[0]]
+            return local_blocks, remote_blocks
 
         remote_block_size = meta.remote_block_size or self.block_size
         local_scale = self.block_size_scale[group_idx][0]
@@ -1949,7 +2630,8 @@ class HIXLConnectorWorker:
                 metadata,
                 ready_event,
                 self.kv_caches,
-                0,  # pcp_rank
+                self.pcp_rank,
+                pcp_size=self.pcp_size,
             )
             self.kv_send_thread.start()
         else:
@@ -2029,9 +2711,18 @@ class HIXLConnectorWorker:
                 self._get_kv_split_metadata(req_id, meta)
             )
             group_pulls_list = self._get_group_pulls_metadata(
-                req_id, remote_handshake_port_list, prefill_tp_size, meta.remote_port
+                req_id, remote_handshake_port_list, prefill_tp_size, meta.remote_port,
+                remote_pcp_size=meta.remote_pcp_size,
+                remote_dcp_size=meta.remote_dcp_size,
             )
             assert self.kv_recv_thread is not None
+            # Bug 1 fix: forward remote_port_send_num for CP multi-port so P-side
+            # done counting waits for all D ranks pulling the same P port.
+            cp_active = meta.remote_pcp_size * meta.remote_dcp_size > 1
+            remote_port_send_num = (
+                self.remote_port_send_num.get(meta.remote_engine_id)
+                if cp_active else None
+            )
             for pcp_dcp_rank, remote_ports in enumerate(remote_handshake_port_list):
                 for remote_tp_offset, remote_handshake_port in enumerate(remote_ports):
                     remote_host, remote_engine_id = self._get_remote_host_info_by_port(
@@ -2050,11 +2741,14 @@ class HIXLConnectorWorker:
                         remote_engine_id=remote_engine_id,
                         remote_host=remote_host,
                         remote_handshake_port=remote_handshake_port,
+                        remote_port_send_num=remote_port_send_num,
                         num_computed_tokens=meta.num_computed_tokens,
                         all_task_done=(
                             pcp_dcp_rank == len(remote_handshake_port_list) - 1
                             and remote_tp_offset == len(remote_ports) - 1
                         ),
+                        # Bug 3 fix: per-shard reformat stash (CP shards).
+                        shard_idx=pcp_dcp_rank,
                     )
 
         if self.kv_send_thread is not None:

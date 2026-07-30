@@ -5,6 +5,8 @@
 > 生成日期：2026-07-24
 > 代码引用用 `文件:行`（相对仓库根）。`hixl_connector.py` = [`vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py`](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py)；`mooncake_connector.py` = [`vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py`](../../vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py)。
 
+> **状态（2026-07-28）**：Phase 2 已完整落地（staging `remote_accessible=True` 非 §1.3/§4.4 所述 False；握手载荷未扩为列表，靠每 P rank 各发一份 HixlAgentMetadata）。本文为 Phase 2 计划历史记录，行号已偏移。最新状态见 [`hixl-connector-implementation.md` §0](./hixl-connector-implementation.md)。
+
 ---
 
 ## 1. 范围与现状

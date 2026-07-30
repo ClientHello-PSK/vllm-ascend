@@ -4,6 +4,8 @@
 > 生成日期：2026-07-17
 > 代码引用统一用 `文件:行号`（相对各自仓库根），便于跨仓库跳转。
 
+> **状态（2026-07-28）**：Phase 1/2/3（除 MLA/compress）已落地，`hixl_connector.py` ~2785 行。§3.8 实施分期、§3.9.2 "HIXL 现状"列为 Phase 1/2 状态，**已过时**；最新状态见 [`hixl-connector-implementation.md` §0](./hixl-connector-implementation.md) 与 [`hixl-connector-phase3-plan.md` §0](./hixl-connector-phase3-plan.md)。剩余缺口见 [`hixl-connector-gap-design.md`](./hixl-connector-gap-design.md)。行号均为旧值，已偏移。
+
 ---
 
 # 第一部分：vLLM 的 KV Cache 传输机制（`KVConnectorBase_V1`）
@@ -809,7 +811,7 @@ KVConnectorFactory.register_connector(
 
 - **Phase 1（✅ 已实现，最小集）**：TP=1、单 FullAttention group、PP=1。四个改造点（§3.2.1）+ ZMQ 控制面已落实；reformat/staging/Mamba/PCP/DCP/HMA 未做。[`hixl_connector.py`](../../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py) ~780 行 + 注册 `HIXLConnectorV1`。Phase 1 assert 约束：`tp_size==1`、`pp_size==1`、`block_size_scale==1`、`num_group_pulls==1`、同 group K/V shape 一致。
 - **Phase 2**：TP>1 staging + reformat；HMA 多 group。
-- **Phase 3**：PP/PCP/DCP + Mamba。
+- **Phase 3**：PP/PCP/DCP + Mamba；**+ MTP/Eagle 草稿层 KV 转移**（§3.9）。MTP/Eagle 与 PP/CP 无强依赖，可作为 Phase 3 的**独立先落地子项**（仅层范围扩展 + block 裁剪，不涉及几何分片）。
 
 **验收**：每期与 `MooncakeConnectorV1` 同 P/D 几何输出逐位对齐。
 
@@ -819,3 +821,69 @@ KVConnectorFactory.register_connector(
 3. ✅ HIXL 独有路径：多 tensor 独立 `register_blocks_cache`（Bug 6 修复后 pull 成功）、`pull_blocks` 整块写入字节布局（输出正确）。
 
 > **隐含前提**：第 3 项验证成立的前提是 reformat 为 no-op（TP=1 + 非 NZ + 标准 FullAttention，shape 本就对称、不拼 head）。Phase 2 上 staging + 真做 reformat transpose 时，"`pull_blocks` 整块写 → staging → reformat" 字节布局需作为首个冒烟用例**二次验证**。
+
+---
+
+## 3.9 Phase 3 子项：MTP / Eagle 草稿层 KV 转移设计
+
+> 草稿层（speculative decoding draft model）的 KV **随主模型 KV 在同一 P→D transfer 链路转移**，不另建通道。本节设计 HIXL 在 block 寻址下如何接入。
+> 生成日期：2026-07-28。锚点 `文件:行`；mooncake 行号仅作对照，实施前需复核。
+
+### 3.9.1 范围与定位
+
+| 项 | 含义 | mooncake num_draft_layers |
+|---|---|---|
+| MTP（`method=="mtp"`） | 所有 draft 层**共享同一 KV 层**，只传一次 | 1 |
+| Eagle / eagle3 | draft 层有独立 KV，层名**无 "mtp"** | `draft_model_config.num_hidden_layers` |
+
+- **与 PP/PCP/DCP/Mamba 无强依赖**：MTP/Eagle 本质是"层范围扩展 + 推测 block 裁剪"，不涉及几何分片。PP=1 即可落地，可作为 Phase 3 的独立先落地子项，先于 PP/PCP/DCP。
+- MTP 因 `num_draft_layers=1`，转移开销近似为零；Eagle 需传全部 draft 层 KV。
+
+### 3.9.2 mooncake 锚点（对照）
+
+| 能力 | mooncake 实现 | HIXL 现状 |
+|---|---|---|
+| 识别 spec 配置 | `num_speculative_tokens`/`num_draft_layers`（`:510,539-551`） | **无** `speculative_config` 处理 |
+| draft 层纳入拉取范围 | `pp_layer_indices` 末 rank `end_layer_index += num_draft_layers`（`:822-824`） | 无（PP=1 时 draft 层本就在本 rank，需显式纳入层集合） |
+| 裁推测多余 block | `_get_transfer_block_ids` "dropping MTP extra blocks"（`:1710-1711`）；`transfer_block_idx = len - num_speculative_tokens - 1`（`:867`） | `request_finished` 直接用 `block_ids`（`:1132-1165`），**无裁剪** |
+| mtp 层索引识别 | `_build_kv_group2layeridx`：`"mtp" in layer_name` → idx 从 `total_layers` 起（`:2195-2197`） | **无** mtp/eagle 分支 |
+| eagle3 层索引识别 | 层名无 "mtp"，靠"层 id 已被占用"判定 → 赋 idx 从 `total_layers` 起（`:2188-2202`） | **无** |
+| longcat_flash 双 attn module | `num_attn_module=2`（`:1200,2183`） | **硬编码 1**（`:792,1332`）——静默错配风险 |
+| mtp 层归属判定 | `layer_in_group`：mtp 层用 `layer_idx >= num_layers`（`:1204-1205`） | **无** mtp 分支 |
+| draft 层 kv heads | `_get_spec_total_num_kv_heads`：draft 层用 `draft_model_config`（`:2164-2177`） | **无** |
+| mtp 层 conv padding 对齐 | `_get_registered_kv_tensor_buffers`：`has_mtp → base_addr -= conv_padding`（`:2283,2292-2293`） | **无**（HIXL block 寻址无字节基址对齐，此项可能不适用，见 §3.9.4） |
+
+### 3.9.3 HIXL 适配设计（block 寻址）
+
+按依赖序：
+
+1. **`__init__` 识别 spec 配置**（`hixl_connector.py` `__init__` 附近 `:1204`）：fork mooncake `:510,539-551`，算 `self.num_speculative_tokens` / `self.num_draft_layers`。MTP method → 1；eagle → `draft_model_config.num_hidden_layers`。
+2. **`_build_kv_group2layeridx` 补 mtp/eagle 层索引**（`:1313`）：fork mooncake `:2179-2204` 全段——含 `next_mtp_layer_idx = total_layers` 递增、eagle3 "层 id 已占用"判定、`longcat_flash` `num_attn_module=2`。**此项同时修复 longcat_flash 静默错配**。
+3. **`_get_group_kv_caches` 补 mtp 归属 + `num_attn_module`**（`:788-800`）：fork mooncake `:1203-1206` 的 `layer_in_group`——mtp 层走 `layer_idx >= num_layers`，非 mtp 走 `extract_layer_index`，并把 `num_attn_module` 从硬编码 1 改为按 `model_type` 取 2/1。
+4. **`request_finished`（P 侧）裁掉推测 block**（`:1132-1165`）：P 侧算出 prompt 占的 block 后，对 attention-like group 裁掉末尾 `num_speculative_tokens` 个推测 block（MTP 推测会多算这几个 block，但 P→D 只需传真实 prompt KV）。state group（Mamba）不裁。fork mooncake `_get_transfer_block_ids`（`:1710`）。
+5. **拉取层范围纳入 draft 层**：PP=1 时 draft 层本就在本 rank 的层集合内，由步 2/3 自动纳入 `kv_group2layeridx`，无需 `pp_layer_indices` 扩展。PP>1 时末 rank `end_layer_index += num_draft_layers`（随 PP Phase 3 主线，本期 PP=1 不涉及）。
+
+### 3.9.4 与已有 Phase 2/3 机制的复用与适配
+
+- **block 裁剪天然兼容**：MTP 裁剪是裁 **block 数**（整块），与 HIXL block 寻址一致——比 mooncake 的字节 sub-range 裁剪（`split_if_not_byte_contiguous`）更简单，**无需**字节级裁剪逻辑。
+- **staging/reformat 复用**：draft 层若 TP>1，走 Phase 2 既有 staging Cache + `_reformat_staging_to_local`，无需新增路径。MTP 共享 KV（`num_draft_layers=1`）时仅一个 draft 层，staging 开销极小。
+- **HMA / spec-key 拆 group**：若 draft 层 spec（block_size / kv_heads）与主模型不同，按 spec-key 拆为独立 transfer group，独立 `register_blocks_cache`。MTP 共享 KV 则并入主 group。
+- **`block_size_scale`**：draft 层若是标准 FullAttention，`scale` 仍=1，无需放开 `assert scale==1`（§4.1 认知一致）。仅 draft 层用 MLA/compress 才需放开（归 MLA 专项）。
+- **conv padding（Mamba+MTP 对齐）**：mooncake `:2292` 的 `base_addr -= conv_padding` 是**字节寻址**下的基址对齐 trick。HIXL block 寻址无裸字节基址，**该 trick 不适用**——若 draft 层与 Mamba 同 group，由 §3.x Mamba 专项的 block 级对齐处理，不在此项。
+
+### 3.9.5 HIXL 特有风险
+
+| 风险 | 说明 | 缓解 |
+|---|---|---|
+| longcat_flash 静默错配 | 当前 `num_attn_module=1` 硬编码，longcat_flash 模型会算错层索引而不报错 | 步 2/3 一并修（即使不做 MTP 也该修） |
+| draft 层 block_size 与主模型不同 | 若 draft 用更小 block_size，与主模型同 group 会越界 | 按 spec-key 拆独立 group + 独立 Cache |
+| MTP 裁剪误裁 state group | Mamba state group 不按 block 对齐，不能裁 | `is_state_group` 判定，仅裁 attention-like group（fork `:1725`） |
+| Eagle3 层名无 "mtp" | 无法靠层名识别，须靠"层 id 冲突"判定 | fork mooncake `assigned_indices` 逻辑（`:2193-2202`） |
+
+### 3.9.6 验收
+
+1. **冒烟**：MTP 配置下，P 侧裁剪后 block 数 = `prompt_blocks - num_speculative_tokens`，与 mooncake 同配置逐位对齐。
+2. **端到端**：`--kv-transfer-config kv_connector=HIXLConnectorV1` + `speculative_config={method:mtp/eagle}`，与 mooncake 同配置 P/D 输出逐位对齐，`External prefix cache hit rate: 100.0%`。
+3. **draft 层 KV 字节对齐**：D 侧拉到的 draft 层 KV 与 P 侧对应层 KV 逐字节一致。
+
+> 注：本设计基于 mooncake 代码静态分析，未在 NPU 上实测。行号为 `vllm-ascend-v0.23.0` 当前状态，实施前需复核。

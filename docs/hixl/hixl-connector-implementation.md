@@ -6,6 +6,23 @@
 
 ---
 
+## 0. 状态更新（2026-07-28，Phase 3 完成后）
+
+> 本文原写于 Phase 1（2026-07-17，~780 行）。Phase 2/3 已全部落地，当前 `hixl_connector.py` ~2785 行。下方 §6/§7 为 Phase 1 历史状态，**已过时**；以本节为准。
+
+- **已实施**：Phase 2（TP>1 staging+reformat、HMA 多 group）、Phase 3（A MTP/Eagle、B PP、C Mamba state、D PCP/DCP）。
+- **当前 assert 约束**（替代 §6.2）：仅保留 `scale==1`（行 2527，MLA/compress 专项）、`r_blk==1 or use_mla`（行 2185，r_blk>1 限 MLA）、`not(pp>1 and pcp>1)`（行 1433）、`prefill_tp>=decode_tp`（行 1635）。`tp_size==1`/`pp_size==1`/`num_group_pulls==1` assert 均已删除。
+- **三处设计偏离/修复**（文档原未记录）：
+  1. **B3 layer_range**：保留 `range(num_layers)`（行 806），非计划 §3.5 的 `range(pp_first,pp_end)`。因每 PP rank 注册 cache 仅含本段层（vLLM PP 隔离），pull 全部本段层即等价。`pp_layer_indices` 建而未用。
+  2. **r_blk>1 assert**（行 2185）：r_blk>1（Bd>Bp）限 MLA/compress（scale>1 使 kernel_size 整除 Bp），非 MLA 下 fail fast。mooncake 同样不支持 scale=1 下 r_blk>1。
+  3. **Mamba align final state block**（行 2367-2384，`_get_kernel_block_ids` Mamba 分支）：align 模式只拉 final resident state block（remote 索引 `len-num_speculative_tokens-1`，local 索引 0，fork mooncake :867-869）。
+- **staging remote_accessible**：实际为 `True`（行 2451），非 §5/§3.2 所述 False。llm_datadist PullCacheByGet 路径要求 dst cache 也 remote_accessible（行 2462-2467 注释）。
+- **`_append_mamba_transfer_meta`**：显式 drop（行 1809-1810 注释），block 寻址无对应物，Mamba state 由 `_transfer` 的 `pull_blocks` 统一处理。
+- **剩余缺口**：见 [`hixl-connector-gap-design.md`](./hixl-connector-gap-design.md)（MLA/compress、SWA、sparse、NZ、SFA、conv_padding 等）。
+- **行号**：本文及他文档的 `:行号` 引用均为 Phase 1/2 旧值，Phase 3 后已偏移，以代码为准。
+
+---
+
 ## 1. 文件与符号清单（fork 策略）
 
 fork 自 `mooncake_connector.py`。完整 V1 目标的符号处理：
