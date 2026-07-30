@@ -1341,8 +1341,12 @@ class HIXLConnectorScheduler:
         # (which scales by pcp_size). Bug 2 fix: Scheduler side_channel_port
         # must match Worker (both * pcp_size), else PCP>1 D connects to wrong
         # P port (remote_port base != P listening base).
-        self.pcp_size = get_pcp_group().world_size
-        self.dcp_size = get_decode_context_model_parallel_world_size()
+        # Read from config (not get_pcp_group()/get_dcp_group()) because the
+        # EngineCore/scheduler process does not initialize the PCP/DCP parallel
+        # state groups; calling get_*_group() here asserts _PCP/_DCP is None.
+        # Mirrors MooncakeConnectorScheduler (:1638).
+        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.side_channel_port = (
             vllm_config.kv_transfer_config.kv_port
             + vllm_config.parallel_config.data_parallel_rank
