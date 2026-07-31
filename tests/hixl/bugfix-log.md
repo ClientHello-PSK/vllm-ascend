@@ -1,7 +1,7 @@
 # HIXL Connector 调试 Bug 记录
 
 > 记录 HIXL connector 在 v0.23.0（及 dss v0.24.0）部署调试中遇到的 bug 及修复。
-> 日期：2026-07-22 ~ 2026-07-23
+> 日期：2026-07-22 ~ 2026-07-23，2026-07-30 ~ 2026-07-31
 
 ---
 
@@ -123,6 +123,76 @@ INFO:     ... "POST /v1/completions HTTP/1.1" 500 Internal Server Error
 
 ---
 
+### Bug 7: HIXLConnectorScheduler 调 `get_pcp_group()` 断言失败（PD 分离 P 节点 EngineCore 进程）
+
+**错误**：
+```
+AssertionError: prefill context parallel group is not initialized
+  File "hixl_connector.py", line 1344, in HIXLConnectorScheduler.__init__
+    self.pcp_size = get_pcp_group().world_size
+  File "vllm/distributed/parallel_state.py", line 1425, in get_pcp_group
+    assert _PCP is not None, "prefill context parallel group is not initialized"
+```
+
+**根因**：`HIXLConnectorScheduler.__init__` 直接调 `get_pcp_group()` / `get_decode_context_model_parallel_world_size()` 取 PCP/DCP size。但 PCP/DCP 这些 parallel state group 只在 **Worker 进程**初始化，EngineCore（scheduler 进程）不初始化，`_PCP`/`_DCP` 为 `None` → assert 崩。日志里 Worker_TP0/TP1 正常注册并起发送线程，只有 EngineCore 创建 scheduler 时崩。
+
+对比 Mooncake 的 `MooncakeConnectorScheduler`（`mooncake_connector.py:1638-1639`）是从 `vllm_config.parallel_config.prefill_context_parallel_size` / `decode_context_parallel_size` 直接读 config，不依赖 `get_*_group()`。HIXL scheduler 从 Mooncake fork 时误用了 Worker 侧的 `get_*_group()` 写法。
+
+**解决**：[hixl_connector.py:1344-1349](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1344) 改为从 config 读取：
+```python
+self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+```
+与 Mooncake Scheduler 一致。Worker 侧（`hixl_connector.py:1633` 附近）不改——Worker 进程里 group 已初始化，`get_*_group()` 可用；相应 import 保留。
+
+**影响文件**：`hixl_connector.py`（v0.23.0），`HIXLConnectorScheduler.__init__`（2 行）。dss 副本按需同步。
+
+---
+
+### Bug 8: 多组同 `BlocksCacheKey` 注册 → `pull_blocks` 报 `LLM_FAILED`（hybrid 模型根因）
+
+**错误**：
+```
+HIXL DEBUG pull: remote_cluster=1001 dst_shape=[6012, 128, 2, 256] num_tensors=34 tp_n=1
+  src=[636,637,...,647] dst=[12,13,...,23]
+llm_datadist.status.LLMException: [pull_blocks] failed, error code is LLMStatusCode.LLM_FAILED,
+  src_cache_key = BlocksCacheKey(cluster_id=1001, model_id=0).
+```
+随后 EngineCore 触发**次生崩溃**：
+```
+ValueError: too many values to unpack (expected 1)
+  scheduler.py:2293  (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+```
+
+**根因**：`BlocksCacheKey` 只有 `(cluster_id, model_id)` 两维，没有 group 维度。Qwen3.6-27B 是 hybrid（1 attention + 3 mamba，mamba 又拆 conv/ssm，共 7 个 blocks cache，形状各异无法合并成一个 cache）。连接器把它们**全部**用同一个 `BlocksCacheKey(cluster_id, model_id=0)` 注册。
+
+native 侧 `cache_manager.cc` 的 `AddCacheIndices` 对 blocks cache 是：
+```cpp
+cache_key_to_id_[data_cache_key] = cache_id;   // 直接赋值，last-wins
+```
+且 `register_blocks_cache` 走 `RegisterCacheEntry` **不查重**（只有 `Allocate` 才查，`CheckCacheKeys`），所以多次同 key 注册不报错、静默覆盖。
+
+结果：key 最终指向**最后注册的 mamba-ssm cache**（501 blocks、16 tensors）。D 侧 attention 的 pull（src block 636、`tensor_num_per_layer=2` × 17 层 = 34 个 tensor 索引）打过去，block 636 ≥ 501 越界、tensor 索引 ≥ 16 越界 → `pull_cache_v2` 返回 `LLM_FAILED`。
+
+**次生崩溃**：pull 失败 → invalid block → vLLM core `_update_requests_with_invalid_blocks`（`scheduler.py:2293`，带 `# TODO(davidb): add support for hybrid memory allocator`）做 `(req_block_ids,) = get_block_ids(req_id)` 单组 unpack，hybrid 返回多组 → `ValueError`。这是 vLLM core 的 hybrid 支持缺口，只在"有 invalid block"时触发；pull 通了不会引爆。
+
+**解决**（根因）：给每个注册的 blocks cache 分配**唯一 `model_id`**（P/D 同配置同序，确定性一致），pull 用对应组的 model_id 精确定位 src cache。改动均在 `hixl_connector.py`（v0.23.0）：
+
+1. `MambaCacheBundle` 加 `conv_model_id` / `ssm_model_id` 字段。
+2. worker `__init__` 加 `_next_model_id` 计数器 + `_group_model_ids` 字典。
+3. `_alloc_model_id()` helper（顺序分配，P/D 一致）。
+4. 三处 register 改用唯一 model_id：staging、mamba conv/ssm、attention。
+5. `KVCacheRecvingThread` 加 `group_model_ids` 参数，worker 传入。
+6. 两处 pull 改用对应 model_id：mamba 按 sub_cache（`bundle.conv_model_id`/`ssm_model_id`），attention 按 group（`self.group_model_ids[kv_cache_group_id]`）。
+
+**验证**：修复后 D 侧 `HIXL DEBUG pull src=[1104..1115] dst=[636..647]` 无 `LLM_FAILED`；`External prefix cache hit rate: 66.7%`（= (N-1)/N = 2/3，mamba 末位 token 重算的设计行为，非 bug）；MTP `Mean acceptance length: 2.60`；请求 200 OK 输出正确。
+
+**未保留的尝试**：曾先修次生崩溃（在 `recompute_scheduler.py` override `_update_requests_with_invalid_blocks` 做多组 flatten + 降级重算），但那只是 graceful fallback、不解决传输，**已回退**，改为直击 pull 根因。该 unpack 崩溃仍是独立 latent 雷（见"已知限制"）。
+
+**影响文件**：`hixl_connector.py`（v0.23.0），`MambaCacheBundle` + `HIXLConnectorWorker.__init__`/`register_kv_caches` + `KVCacheRecvingThread.__init__` + 两处 pull 站点。dss 副本按需同步。
+
+---
+
 ## 开发自查修正（编码时发现，未触发运行报错）
 
 这些是写 `hixl_connector.py` 时自查发现并修复的，没等到运行报错：
@@ -137,27 +207,38 @@ INFO:     ... "POST /v1/completions HTTP/1.1" 500 Internal Server Error
 
 ---
 
-## 已知限制 / 后续路径（2026-07-23 复核状态）
+## 已知限制 / 后续路径（2026-07-31 复核状态）
 
-Phase 1（TP=1 + 标准 FullAttention + PP=1）全链路已跑通。下表为历史"待验证"项的最终状态：
+Phase 1（TP=1 + 标准 FullAttention + PP=1）全链路已跑通。2026-07-31 已扩展到 **hybrid 模型（Qwen3.6-27B：attention + mamba + MTP）PD 分离 + 多组 KV 传输**跑通（见 Bug 8）。下表为历史"待验证"项的最终状态：
 
 | 项 | 状态 | 说明 |
 |---|---|---|
 | `register_blocks_cache` 多 tensor 独立注册 | ✅ 已验证 | Bug 6 修复后 pull 成功（mooncake 走合并 region，HIXL 每 tensor 独立 addr，已验证可行） |
-| `pull_blocks` 整块写入字节布局 | ✅ 已验证 | `External prefix cache hit rate: 100.0%`，输出正确（TP=1 + 非 NZ 下 no-op reformat 成立） |
+| `pull_blocks` 整块写入字节布局 | ✅ 已验证 | `External prefix cache hit rate: 100.0%`（TP=1 + 非 NZ 下 no-op reformat 成立）；hybrid 下 66.7%（mamba 末位重算，设计值） |
 | `ensure_linked` 时序 | ✅ 已验证 | D 单边 link 到 P 即可 pull，无需 P 反向 link |
-| `llm_datadist` 库依赖 | ⚪ 非问题 | 仍懒加载 import（`hixl_connector.py:84/638/1155`），属部署前置条件，现环境（CANN HIXL）已满足，无需改 |
-| TP>1 / PP>1 / compress(SWA) / NZ / Mamba | 🔴 设计性限制 | Phase 1 未覆盖，**有硬 assert 把关**，遇到会直接报错而非静默错传 |
+| `llm_datadist` 库依赖 | ⚪ 非问题 | 仍懒加载 import，属部署前置条件，现环境（CANN HIXL）已满足，无需改 |
+| hybrid 多组同 `BlocksCacheKey` 注册 | ✅ 已解决 | Bug 8：每组唯一 `model_id`，避免 native `cache_key_to_id_` last-wins 覆盖 |
+| mamba 末位 token 重算 | ✅ 已实现 | `_state_prefill_token_count` 返回 N-1，P/D 协同截断末位；external hit = (N-1)/N |
+| TP>1 / PP>1 / compress(SWA) / NZ | 🟡 部分支持 | TP>1 staging/reformat、PP>1 layer_range、compress scale>1、NZ 均已 fork Mooncake 实现（代码在位），待覆盖测试 |
+| **hybrid invalid-blocks 容错** | 🔴 latent 雷 | 见下"仍存在的限制" |
 
-### 仍存在的限制（第 5 项展开）
+### 仍存在的限制
 
-只要保持 TP=1 / PP=1 / 标准 FullAttention（Qwen2.5 这类模型）就不会碰到。以下场景需实现 Phase 2/3 才支持：
+**1. hybrid invalid-blocks 路径未容错（latent 雷）**
 
-| 场景 | 触发点（assert） | 计划 |
+vLLM core `scheduler.py:_update_requests_with_invalid_blocks`（带 `# TODO(davidb): add support for hybrid memory allocator`）做 `(req_block_ids,) = get_block_ids(req_id)` 单组 unpack，hybrid 多组返回 → `ValueError` 把引擎搞崩。只在"有 invalid block"时触发（pull 失败、网络抖动、P 侧 block 已释放等）。
+
+当前 PD 链路可用（pull 正常时不引爆）。偶发 pull 失败仍会致命。规避方案（未落地）：在 `recompute_scheduler.py` override `_update_requests_with_invalid_blocks` 做多组 flatten + 降级本地重算。本轮曾实现后回退（优先修 pull 根因）。
+
+**2. Phase 2/3 未覆盖场景（历史项）**
+
+只要不触发就可用，遇新报错按前文格式追加。
+
+| 场景 | 触发点 | 计划 |
 |---|---|---|
-| TP>1 | `hixl_connector.py:1016` `assert self.tp_size == 1`；`:645` `assert num_group_pulls == 1`（需 staging） | Phase 2 |
-| PP>1 | `hixl_connector.py:1017` `assert self.pp_size == 1`（需 layer_range） | Phase 2 |
-| compress / SWA 等 block_size_scale≠1 | `hixl_connector.py:1195` `assert scale == 1` | Phase 2 |
-| GQA/NZ reformat、Mamba/NZ 路径 | `hixl_connector.py:688-690`（当前 no-op，Phase 3 做 Mamba/NZ） | Phase 3 |
+| TP>1 staging reformat | `hixl_connector.py` staging 路径（已实现，待测） | 覆盖测试 |
+| PP>1 layer_range | `pull_blocks(src_layer_range, dst_layer_range)`（已实现，待测） | 覆盖测试 |
+| compress / SWA 等 block_size_scale≠1 | `_get_kernel_block_ids` kernel 展开（已实现，待测） | 覆盖测试 |
+| GQA/NZ reformat | `reformat_kv_cache`（已 fork Mooncake，待测） | 覆盖测试 |
 
 **当前不阻塞使用。** 遇到新报错，按前文格式追加到本文档。
