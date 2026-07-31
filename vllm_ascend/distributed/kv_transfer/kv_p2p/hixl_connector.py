@@ -168,6 +168,13 @@ class MambaCacheBundle:
     conv: Any
     ssm: Any
     num_layers: int = 0  # == len(conv addrs) == len(ssm addrs)
+    # Per-sub-cache model_id for BlocksCacheKey. conv and ssm are independent
+    # registered caches and must NOT share a BlocksCacheKey: native
+    # AddCacheIndices overwrites cache_key_to_id_[key] = cache_id (last-wins),
+    # so a shared key silently re-points pulls to whichever cache registered
+    # last (see HIXL pull_blocks LLM_FAILED root cause).
+    conv_model_id: int = 0
+    ssm_model_id: int = 0
 
     @property
     def subcaches(self) -> tuple:
@@ -427,6 +434,7 @@ class KVCacheRecvingThread(threading.Thread):
         kv_caches: dict[str, Any],
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]],
         group_caches: dict[int, Any],  # kv_cache_group_id -> registered Cache
+        group_model_ids: dict[int, int] | None = None,  # kv_cache_group_id -> model_id
         block_size_scale: list[list[int]] | None = None,
         ready_event: threading.Event | None = None,
         staging_tensors: dict[int, dict[str, list[torch.Tensor]]] | None = None,
@@ -453,6 +461,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.kv_group2layeridx = kv_group2layeridx
         self.group_caches = group_caches  # kv_cache_group_id -> Cache
+        self.group_model_ids = group_model_ids or {}  # kv_cache_group_id -> model_id
         self.block_size_scale = block_size_scale or []
         # Phase 2: staging + reformat (TP>1 head reassembly).
         self.staging_tensors = staging_tensors or {}
@@ -816,11 +825,16 @@ class KVCacheRecvingThread(threading.Thread):
                 grouped_remote, grouped_local = group_concurrent_contiguous(
                     src_blocks, dst_logical,
                 )
-                for sub_cache in bundle.subcaches:
+                # Each sub-cache (conv/ssm) has its own BlocksCacheKey on P;
+                # pull with the matching model_id so the src resolves to the
+                # right cache instead of whichever registered last.
+                for sub_cache, sub_model_id in zip(
+                    bundle.subcaches, (bundle.conv_model_id, bundle.ssm_model_id)
+                ):
                     num_layers = sub_cache.cache_desc.num_tensors
                     for cr, cl in zip(grouped_remote, grouped_local):
                         self.cache_manager.pull_blocks(
-                            BlocksCacheKey(remote_cluster_id, self.model_id),
+                            BlocksCacheKey(remote_cluster_id, sub_model_id),
                             sub_cache,
                             src_blocks=cr,
                             dst_blocks=cl,
@@ -879,7 +893,10 @@ class KVCacheRecvingThread(threading.Thread):
             for chunk_remote, chunk_local in zip(grouped_remote, grouped_local):
                 try:
                     self.cache_manager.pull_blocks(
-                        BlocksCacheKey(remote_cluster_id, self.model_id),
+                        BlocksCacheKey(
+                            remote_cluster_id,
+                            self.group_model_ids[kv_cache_group_id],
+                        ),
                         dst_cache,
                         src_blocks=chunk_remote,
                         dst_blocks=chunk_local,
@@ -1698,6 +1715,13 @@ class HIXLConnectorWorker:
         self.listen_port = listen_port
         self.model_id = extra.get("model_id", 0)
         self.group_caches: dict[int, Any] = {}  # kv_cache_group_id -> registered Cache
+        # Per-cache model_id allocator. Each registered blocks cache MUST get a
+        # unique BlocksCacheKey: native cache_key_to_id_ overwrites on duplicate
+        # (last-wins), so a shared (cluster_id, model_id) across groups re-points
+        # all pulls to the last-registered cache. P and D iterate kv_cache_groups
+        # in the same order from the same config, so the assigned ids match.
+        self._next_model_id: int = self.model_id
+        self._group_model_ids: dict[int, int] = {}  # kv_cache_group_id -> model_id
         # Phase 3 subitem D: CP geometry state (fork Mooncake). use_sparse is
         # False (HIXL has no sparse path); use_mla mirrors Mooncake :515.
         self.use_mla = vllm_config.model_config.is_deepseek_mla
@@ -2707,6 +2731,18 @@ class HIXLConnectorWorker:
                     kernel_block_ids.append(d_block * kernels_per_d_block + first_kernel_in_d_block + kernel_idx)
         return kernel_block_ids
 
+    def _alloc_model_id(self) -> int:
+        """Allocate a unique model_id for one registered blocks cache.
+
+        Each blocks cache gets its own BlocksCacheKey so native cache_key_to_id_
+        does not overwrite a sibling group's key (last-wins) and pull_blocks
+        resolves the intended src cache. Deterministic on P and D since both
+        walk kv_cache_groups in the same order.
+        """
+        mid = self._next_model_id
+        self._next_model_id += 1
+        return mid
+
     def _init_staging_caches(self) -> None:
         """Allocate per-group staging Cache for TP>1 head reassembly (D side).
 
@@ -2756,7 +2792,7 @@ class HIXLConnectorWorker:
             cache = self.cache_manager.register_blocks_cache(
                 cache_desc,
                 addrs,
-                BlocksCacheKey(self.cluster_id, self.model_id),
+                BlocksCacheKey(self.cluster_id, self._alloc_model_id()),
                 remote_accessible=True,
             )
             self.staging_caches[kv_cache_group_id] = cache
@@ -2848,7 +2884,12 @@ class HIXLConnectorWorker:
                 )
                 block_size_scale.append([conv_scale, ssm_scale])
                 num_tensors_per_group.append(len(conv_addrs) + len(ssm_addrs))
-                key = BlocksCacheKey(self.cluster_id, self.model_id)
+                # conv and ssm are independent caches with different shapes; give
+                # each a unique BlocksCacheKey so pull_blocks can target them
+                # separately (a shared key is last-wins overwritten by the native
+                # cache_key_to_id_ map).
+                conv_model_id = self._alloc_model_id()
+                ssm_model_id = self._alloc_model_id()
                 conv_desc = CacheDesc(
                     num_tensors=len(conv_addrs),
                     shape=list(conv_shape),
@@ -2862,13 +2903,18 @@ class HIXLConnectorWorker:
                     placement=Placement.DEVICE,
                 )
                 conv_cache = self.cache_manager.register_blocks_cache(
-                    conv_desc, conv_addrs, key, remote_accessible=True,
+                    conv_desc, conv_addrs,
+                    BlocksCacheKey(self.cluster_id, conv_model_id),
+                    remote_accessible=True,
                 )
                 ssm_cache = self.cache_manager.register_blocks_cache(
-                    ssm_desc, ssm_addrs, key, remote_accessible=True,
+                    ssm_desc, ssm_addrs,
+                    BlocksCacheKey(self.cluster_id, ssm_model_id),
+                    remote_accessible=True,
                 )
                 self.group_caches[kv_cache_group_id] = MambaCacheBundle(
                     conv=conv_cache, ssm=ssm_cache, num_layers=len(conv_addrs),
+                    conv_model_id=conv_model_id, ssm_model_id=ssm_model_id,
                 )
                 logger.info(
                     "HIXL DEBUG register mamba: group=%s conv_shape=%s ssm_shape=%s "
@@ -2921,16 +2967,18 @@ class HIXLConnectorWorker:
             # the local dst cache to be remote_accessible too, else
             # pull_blocks returns LLM_PARAM_INVALID.
             remote_accessible = True
+            attn_model_id = self._alloc_model_id()
+            self._group_model_ids[kv_cache_group_id] = attn_model_id
             cache = self.cache_manager.register_blocks_cache(
                 cache_desc,
                 addrs,
-                BlocksCacheKey(self.cluster_id, self.model_id),
+                BlocksCacheKey(self.cluster_id, attn_model_id),
                 remote_accessible=remote_accessible,
             )
             logger.info(
                 "HIXL DEBUG register: cluster_id=%s model_id=%s shape=%s num_tensors=%s "
                 "num_blocks=%s remote_accessible=%s kv_role=%s",
-                self.cluster_id, self.model_id, cache_desc.shape, cache_desc.num_tensors,
+                self.cluster_id, attn_model_id, cache_desc.shape, cache_desc.num_tensors,
                 ref_shape[0], remote_accessible, self.kv_role,
             )
             self.group_caches[kv_cache_group_id] = cache
@@ -2991,6 +3039,7 @@ class HIXLConnectorWorker:
                 self.kv_caches,
                 self.kv_group2layeridx,
                 self.group_caches,
+                self._group_model_ids,
                 block_size_scale,
                 ready_event,
                 staging_tensors=self.staging_tensors,
