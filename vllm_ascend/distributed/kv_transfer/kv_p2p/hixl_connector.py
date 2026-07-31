@@ -720,11 +720,11 @@ class KVCacheRecvingThread(threading.Thread):
             ensure_zmq_send(sock, self.encoder.encode((GET_META_MSG, "")), f"{remote_host}:{remote_handshake_port}")
             metadata_bytes = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
             agent_meta = self.decoder.decode(metadata_bytes)
-            logger.info(
-                "HIXL DEBUG D got meta: cluster_id=%s listen=%s:%s num_tensors_per_group=%s",
-                agent_meta.cluster_id, agent_meta.listen_ip, agent_meta.listen_port,
-                agent_meta.num_tensors_per_group,
-            )
+            # logger.info(
+            #     "HIXL DEBUG D got meta: cluster_id=%s listen=%s:%s num_tensors_per_group=%s",
+            #     agent_meta.cluster_id, agent_meta.listen_ip, agent_meta.listen_port,
+            #     agent_meta.num_tensors_per_group,
+            # )
             engine_id = agent_meta.engine_id
             assert engine_id != self.local_engine_id, (
                 f"Conflict engine id {engine_id} with local {self.local_engine_id}."
@@ -873,12 +873,12 @@ class KVCacheRecvingThread(threading.Thread):
                 grouped_remote, grouped_local = group_concurrent_contiguous(src_blocks, dst_blocks)
                 reformat_local = grouped_local
 
-            logger.info(
-                "HIXL DEBUG pull: remote_cluster=%s dst_cache_id=%s dst_shape=%s "
-                "num_tensors=%s tp_n=%s tp_offset=%s src=%s dst=%s",
-                remote_cluster_id, dst_cache.cache_id, dst_cache.cache_desc.shape,
-                dst_cache.cache_desc.num_tensors, tp_n, tp_offset, src_blocks, dst_blocks,
-            )
+            # logger.info(
+            #     "HIXL DEBUG pull: remote_cluster=%s dst_cache_id=%s dst_shape=%s "
+            #     "num_tensors=%s tp_n=%s tp_offset=%s src=%s dst=%s",
+            #     remote_cluster_id, dst_cache.cache_id, dst_cache.cache_desc.shape,
+            #     dst_cache.cache_desc.num_tensors, tp_n, tp_offset, src_blocks, dst_blocks,
+            # )
             # Phase 3 subitem B: each PP rank's registered cache contains only
             # that rank's layer segment (vLLM PP isolates per-rank kv tensors),
             # so pulling the full local range [0, num_layers) transfers exactly
@@ -2916,12 +2916,12 @@ class HIXLConnectorWorker:
                     conv=conv_cache, ssm=ssm_cache, num_layers=len(conv_addrs),
                     conv_model_id=conv_model_id, ssm_model_id=ssm_model_id,
                 )
-                logger.info(
-                    "HIXL DEBUG register mamba: group=%s conv_shape=%s ssm_shape=%s "
-                    "num_layers=%s kv_role=%s",
-                    kv_cache_group_id, conv_shape, ssm_shape, len(conv_addrs),
-                    self.kv_role,
-                )
+                # logger.info(
+                #     "HIXL DEBUG register mamba: group=%s conv_shape=%s ssm_shape=%s "
+                #     "num_layers=%s kv_role=%s",
+                #     kv_cache_group_id, conv_shape, ssm_shape, len(conv_addrs),
+                #     self.kv_role,
+                # )
                 continue
             addrs: list[int] = []
             ref_shape = None
@@ -2975,12 +2975,12 @@ class HIXLConnectorWorker:
                 BlocksCacheKey(self.cluster_id, attn_model_id),
                 remote_accessible=remote_accessible,
             )
-            logger.info(
-                "HIXL DEBUG register: cluster_id=%s model_id=%s shape=%s num_tensors=%s "
-                "num_blocks=%s remote_accessible=%s kv_role=%s",
-                self.cluster_id, attn_model_id, cache_desc.shape, cache_desc.num_tensors,
-                ref_shape[0], remote_accessible, self.kv_role,
-            )
+            # logger.info(
+            #     "HIXL DEBUG register: cluster_id=%s model_id=%s shape=%s num_tensors=%s "
+            #     "num_blocks=%s remote_accessible=%s kv_role=%s",
+            #     self.cluster_id, attn_model_id, cache_desc.shape, cache_desc.num_tensors,
+            #     ref_shape[0], remote_accessible, self.kv_role,
+            # )
             self.group_caches[kv_cache_group_id] = cache
 
         self.block_size_scale = block_size_scale
@@ -3004,10 +3004,10 @@ class HIXLConnectorWorker:
             local_ip=get_ip(),
             handshake_port=self.handshake_port,
         )
-        logger.info(
-            "HIXL DEBUG P metadata: cluster_id=%s listen=%s:%s num_tensors_per_group=%s",
-            self.cluster_id, self.listen_ip, self.listen_port, num_tensors_per_group,
-        )
+        # logger.info(
+        #     "HIXL DEBUG P metadata: cluster_id=%s listen=%s:%s num_tensors_per_group=%s",
+        #     self.cluster_id, self.listen_ip, self.listen_port, num_tensors_per_group,
+        # )
         self.xfer_handshake_metadata = metadata
 
         ready_event = threading.Event()
