@@ -1,271 +1,221 @@
-# HIXL 性能分析报告
+# HIXL Connector 性能分析报告
 
-> 生成日期：2026-07-31
-> 分析范围：`hixl/src/llm_datadist`、`hixl/src/hixl`（cs/engine/proxy/fabric_mem）、`hixl/src/ops/hixl_kernel`，以及 vllm-ascend 集成层 `vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py`。
-> 信息来源：HIXLCS性能分析.md、HIXL传输profiling分析.md、vllm-ascend-hixl-connector-design.md，以及对上述代码的只读探索（文件行号均附）。
-> 说明：实测数据来自 wiki 性能样例；优化后数值为基于代码开销占比的推断，需 NPU 验证，非实测。
-
----
-
-## 1. 性能基线（实测）
-
-基于 HIXLCS性能分析.md 的 128MB / 2GB Device 单边通信样例（第二轮正式结果，HIXL CS PERF 打点口径）。
-
-### 1.1 建链阶段
-
-| 指标 | 128MB 样例 | 2GB 样例 |
-|---|---|---|
-| `connect_total` | 57.204 ms | 55.540 ms |
-| `local_create_channel` | 55.586 ms | 54.204 ms |
-| `server_create_channel` | 55.785 ms | 53.891 ms |
-| `tcp_connect` | 101 µs | 98 µs |
-| `match_endpoint` | 223 µs | 244 µs |
-| `get_remote_mem_total` | 938 µs | 831 µs |
-
-**结论**：建链 ~95% 耗时在双端 `CreateChannel`（底层 HCCL/HCOMM 资源创建）；TCP 建连、Endpoint 匹配、远端内存导入导出均在 µs~1ms，非瓶颈。
-
-### 1.2 传输阶段
-
-128MB 场景（总数据量固定，list_num 从 128→4）：
-
-| Block | List | transfer_sync_device | device_sync_wait | 端到端吞吐 |
-|---|---|---|---|---|
-| 1 MB | 128 | 3778 µs | 3449 µs | 33.086 GB/s |
-| 16 MB | 8 | 3048 µs | 2728 µs | 41.010 GB/s |
-| 32 MB | 4 | 3025 µs | 2702 µs | 41.322 GB/s |
-
-2GB 场景（已进入稳定高带宽区间）：
-
-| Block | List | transfer_sync_device | device_sync_wait | 端到端吞吐 |
-|---|---|---|---|---|
-| 16 MB | 128 | 43753 µs | 43381 µs | 45.711 GB/s |
-| 512 MB | 4 | 43040 µs | 42649 µs | 46.468 GB/s |
-
-**关键观察**：
-- `device_sync_wait` 占 `transfer_sync_device` 的 90%+，是绝对主耗时（实际数据搬运）。
-- 准备/启动阶段（`device_prepare_batch` ~246µs、`device_fill_args` ~113µs、`device_launch` ~20-38µs）均为亚毫秒级。
-- 小包场景对分片数敏感（per-op 开销占比大）；大包场景已近带宽上限，放大 block 收益收敛。
-- **物理上限**：UBDMA 本身约 72ms/2GB ≈ 27.7 GB/s 是硬下限，软件优化无法突破；2GB 场景已达 ~46 GB/s。
-
-### 1.3 带宽预期差距
-
-profiling 样例显示当前部分档位（尤其 H2rD 场景 ~27.7 GB/s）仍低于预期 30+ GB/s，差距需从底层 / 环境分析，非纯软件层面。
+> 生成日期：2026-08-03
+> 分析范围：仅 [hixl_connector.py](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py)（vllm-ascend 的 HIXL KV connector，Python，约 3223 行）。
+> 场景：P/D 分离下 D 端经 HIXL `pull_blocks` 拉取 KV cache 的集成层（P 端 ROUTER 握手 + D 端 REQ 拉取）。
+> 信息来源：对 hixl_connector.py 全文的只读通读（行号见正文）。无实测基线（connector 层无性能打点日志），所有收益量级为基于代码逻辑的推断，需 NPU 验证。
+> 说明：本报告不含 hixl C++ 库（`src/llm_datadist`、`src/hixl`）的优化分析，仅聚焦 vllm-ascend 集成层。
 
 ---
 
-## 2. 优化点总览（按收益排序）
+## 1. 架构与热路径
 
-### 2.1 锁串行化 —— 头号瓶颈
+### 1.1 角色与线程模型
+- **P 端（kv_producer）**：`KVCacheSendingThread` 单线程 ZMQ ROUTER（[365-411](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L365)），处理 `GET_META_MSG`（回元数据）与 `DONE_RECVING_MSG`（记账 + 回 ACK）。
+- **D 端（kv_consumer）**：`KVCacheRecvingThread` 主循环 `request_queue.get()`（[586-596](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L586)）→ `_submit_request` → `ThreadPoolExecutor(max_workers=32)` → `_handle_peer_requests`（per-peer 串行）→ `_handle_request` → `_transfer_kv_cache_all_groups` → `cache_manager.pull_blocks`（同步阻塞）。
 
-| 位置 | 问题 | 影响 |
-|---|---|---|
-| [comm_entity_manager.cc:111-137](../../../hixl/src/llm_datadist/link_mgr/comm_entity_manager.cc#L111) | FSM 单线程持全局 `mutex_` 跑完整传输 job，`AddEntity`/`Query` 全阻塞 | 串行所有 entity；CPU 100% 忙循环 |
-| [hixl_cs_client.cc:937,975,1056](../../../hixl/src/hixl/cs/hixl_cs_client.cc#L937) | `HixlCSClient` 单一 `mutex_` 串行提交/查状态/注册 | **异步提交与完成轮询互斥**，直接压并发吞吐 |
-| [comm_entity.cc:40,173-182](../../../hixl/src/llm_datadist/link_mgr/comm_entity.cc#L173) | `HcclCommInitClusterInfoMemConfig` 进程级 `g_mutex_` 串行所有建链 | 抵消 16 线程池并行 |
-| [llm_mem_pool.cc:53-74](../../../hixl/src/llm_datadist/common/llm_mem_pool.cc#L53) | `LlmMemPool` 单 `mutex` + `std::map` 串行所有 alloc/free，Free 在锁内做 buddy 合并 | 并发分配瓶颈 |
-| [cache_manager.h:72-78](../../../hixl/src/llm_datadist/cache_mgr/cache_manager.h#L72) | `CacheManager` 五张 `std::map` + 单 `mu_`，`UpdateCacheTable`(设备 memcpy)在锁内执行 | 读多写少场景未用读写锁 |
+### 1.2 关键约束
+- **per-peer 串行**：同一 peer_key（host,port）同时仅一个 `_handle_peer_requests` 在跑（[610-635](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L610)）。设计上 `_submit_request` 每 peer_key 仅 submit 一个 worker（[607-608](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L607)），worker 内 while 循环顺序处理（[612-624](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L612)）；且该路径用的 ZMQ REQ socket（[1209](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1209)）严格 req-rep 交替，亦不可并发收发，两层约束共同决定 per-peer 串行。
+- **pull_blocks 同步阻塞**：底层 `llm_datadist` 无 async task，`pull_blocks` 同步（[836](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L836)/[895](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L895)），占住 executor 线程，同 peer 后续 req 排队（head-of-line blocking）。
+- **ACK 必要**：P 端 `update_done_task_count` 依赖收到 DONE 才释放 delayed_free，故 DONE 的 ACK 往返不可去除。
 
-**优化方向**：FSM 状态推进与传输下发解耦（传输 job 下发到独立线程/流）；HixlCSClient 按职责拆锁（传输锁 vs 完成状态锁 vs 注册锁）；`std::map` → `std::unordered_map` + `shared_mutex` 读写分离。
-
-### 2.2 序列化膨胀
-
-| 位置 | 问题 |
-|---|---|
-| [hixl_cs_server.cc:427-441](../../../hixl/src/hixl/cs/hixl_cs_server.cc#L427) + [mem_msg_handler.cc:135-172](../../../hixl/src/hixl/cs/mem_msg_handler.cc#L135) | 二进制 `export_desc` 被逐字节展开成 JSON 整数数组，KB 级描述符百倍膨胀+逐元素解析 |
-| [comm_link_manager.cc:51-99](../../../hixl/src/llm_datadist/link_mgr/comm_link_manager.cc#L51) | `ExchangeMem` 用 JSON 序列化内存信息（dump + parse） |
-| [conn_msg_handler.cc:19-27](../../../hixl/src/hixl/cs/conn_msg_handler.cc#L19) | 每条 ctrl 消息 3 次 `Send`（header/type/body），可 `writev` 合并 |
-| [msg_handler.cc:73-96](../../../hixl/src/hixl/cs/msg_handler.cc#L73) | epoll 与线程池间单消费者线程串行分发 + per-task `SetCurrentContext` |
-
-**优化方向**：`export_desc` 改二进制 framing / base64；定长内存信息改二进制结构体；合并 send 为 `writev`。
-
-### 2.3 自旋 / 忙等烧 CPU
-
-| 位置 | 问题 |
-|---|---|
-| [data_transfer_client.cc:184-201](../../../hixl/src/llm_datadist/data_transfer/data_transfer_client.cc#L184) | `SynchronizeStreamTask` 先 `aclrtSynchronizeStreamWithTimeout` 再自旋读 volatile flag，自旋段无 `yield`/`sleep` |
-| [comm_entity_manager.cc:131-137](../../../hixl/src/llm_datadist/link_mgr/comm_entity_manager.cc#L131) | FSM `HandleCacheRequest` 无睡眠忙循环，占用一个核 100% |
-| [hixl_cs_client.cc:908-933](../../../hixl/src/hixl/cs/hixl_cs_client.cc#L908) | `BatchTransferHostSync` 10µs 紧轮询 + 持锁 |
-| [transfer_context_manager.h:35-46](../../../hixl/src/ops/hixl_kernel/transfer_context_manager.h#L35) | `TransferContext` 无退避自旋锁 |
-| [hixl_cs_client.cc:426-474](../../../hixl/src/hixl/cs/hixl_cs_client.cc#L426) | EAGAIN 重试无退避忙循环 |
-| [comm_link_manager.cc:384-400](../../../hixl/src/llm_datadist/link_mgr/comm_link_manager.cc#L384) | `Unlink` 1ms sleep 轮询 |
-| [transfer_pool.cc:616](../../../hixl/src/hixl/cs/transfer_pool.cc#L616) | `SyncContextsLocked` 失败时 100ms 重试，abort 路径延迟最高 30s |
-
-**优化方向**：统一改条件变量 / event wait / 带指数退避的轮询。
-
-### 2.4 批处理不足 / 每次重分配
-
-| 位置 | 问题 |
-|---|---|
-| [comm_entity.cc:35](../../../hixl/src/llm_datadist/link_mgr/comm_entity.cc#L35) | `BatchPut` 上限 64（`kMaxOpDescNum`，data_transfer/comm_entity 路径；`adxl/comm_channel.cc:31` 另有 `kMaxOpDescNum=256`） |
-| [comm_entity.cc:635-638,666-670](../../../hixl/src/llm_datadist/link_mgr/comm_entity.cc#L635) | 请求 desc 与 flag 分两次 `BatchPutAsync`，可合并 |
-| [hixl_cs_client.cc:476-492](../../../hixl/src/hixl/cs/hixl_cs_client.cc#L476) | Host 异步路径 N 次单条 NBI，未用 `HcommBatchTransferOnThread` |
-| [hixl_cs_client.cc:717-726](../../../hixl/src/hixl/cs/hixl_cs_client.cc#L717) | 设备异步每次 `aclrtMalloc` + H2D memcpy 描述符 buffer，应池化 |
-| [direct_client_handler.cc:81-86,106-111](../../../hixl/src/hixl/engine/direct_client_handler.cc#L81) | 每次传输拷贝 `HixlOneSideOpDesc` vector |
-| [data_transfer_utils.cc:19-32](../../../hixl/src/llm_datadist/data_transfer/data_transfer_utils.cc#L19) | `SendBatchCache` 每 64 项 `std::vector` 拷贝构造；list→vector 无谓转换 |
-| [cache_manager.cc:81,445,474](../../../hixl/src/llm_datadist/cache_mgr/cache_manager.cc#L445) + [swap_impl.cc:117](../../../hixl/src/llm_datadist/cache_mgr/swap_impl.cc#L117) | **每次 Copy/Swap 都新建 4 线程的线程池** |
-| [hixl_transfer_engine.cc:158,193](../../../hixl/src/llm_datadist/transfer_engine/hixl_transfer_engine.cc#L158) + [llm_link_manager.cc:46,77](../../../hixl/src/llm_datadist/link_mgr/llm_link_manager.cc#L46) | 建链每次新建/销毁 `LLMThreadPool(16)` |
-
-**优化方向**：提高批次上限；合并 desc+flag 为单次 batch；设备 desc buffer 池化复用；线程池进程级常驻复用。
-
-### 2.5 数据结构选型
-
-| 位置 | 问题 |
-|---|---|
-| [cache_manager.cc:284-307,573-580](../../../hixl/src/llm_datadist/cache_mgr/cache_manager.cc#L284) | `RemoveCacheIndices` 跨 4 张 map O(N) 扫描删除；缺反向索引 |
-| [comm_entity.cc:93-113](../../../hixl/src/llm_datadist/link_mgr/comm_entity.cc#L93) | `RegBufferPool` `std::map` O(n) 扫描 + 固定 512 不扩容 |
-| [virtual_memory_manager.cc:137-174](../../../hixl/src/hixl/fabric_mem/virtual_memory_manager.cc#L137) | 32768 块线性首次适配位图 + 全局锁（`ReserveMemory` 为 fabric mem 注册期调用，非传输热路径） |
-| [fabric_mem_transfer_service.cc:510-522](../../../hixl/src/hixl/fabric_mem/fabric_mem_transfer_service.cc#L510) | `TransOpAddr` 线性扫描所有注册段 |
-| [fabric_mem_memory.cc:75-96](../../../hixl/src/hixl/fabric_mem/fabric_mem_memory.cc#L75) | `FindExistingHandleForOverlap` 每次重建 `std::map` 做重叠检查 |
-| [fabric_mem_transfer_service.cc:239,307](../../../hixl/src/hixl/fabric_mem/fabric_mem_transfer_service.cc#L239) | 每次传输按值拷贝 `op_descs` 向量（**必要拷贝**：`ResolveTransferAddrs` 非 const 就地修改地址，入参为 const，不可零拷贝消除） |
-| [fabric_mem_slot_pool.cc:236-251](../../../hixl/src/hixl/fabric_mem/fabric_mem_slot_pool.cc#L236) | `ReleaseSlotEntryLocked` 线性查找槽位 |
-| [span_layer_lut.h:56,66-75](../../../hixl/src/llm_datadist/memory/span/span_layer_lut.h#L56) | `SpanLayerLut` 用 `std::set`，每次增删 span 红黑树堆分配 |
-
-**优化方向**：`std::map` → `unordered_map`；线性扫描 → free-list / 区间树 / 位图；维护反向索引与持久化有序区间结构。
-
-### 2.6 热路径杂项
-
-| 位置 | 问题 |
-|---|---|
-| [comm_entity.cc:489-517](../../../hixl/src/llm_datadist/link_mgr/comm_entity.cc#L489) | `BatchPutAsync` 每次进 `info_mutex_` + 两次 `steady_clock::now()` |
-| [hccl_adapter.cc:191-195](../../../hixl/src/hixl/datadist/hccl/hccl_adapter.cc#L191) | `HcclBatchGet` 不计时、不统计（与 Put 不一致） |
-| [scalable_allocator.cc:23-35](../../../hixl/src/llm_datadist/memory/allocator/scalable_allocator.cc#L23) | 每次 Alloc/Free 无条件 INFO 日志（无 `LlmIsLogEnable` 短路） |
-| [hixl_batch_transfer.cc:74-95](../../../hixl/src/ops/hixl_kernel/hixl_batch_transfer.cc#L74) | fallback 单条传输循环内打 INFO 日志 |
-| [connect_pool_executor.cc:143-197](../../../hixl/src/hixl/engine/connect_pool_executor.cc#L143) | `cv_wait_func` 唤醒谓词 O(n) 扫整表 |
-| [hcomm_proxy.cc](../../../hixl/src/hixl/proxy/hcomm_proxy.cc) | 弱符号每次空指针检查 + 间接跳转 |
-| [hccp_proxy.cc:82-107](../../../hixl/src/hixl/proxy/hccp_proxy.cc#L82) | `RaGetNotifyBaseAddr` 1ms 固定轮询，可指数退避 |
-| [d2h_data_transfer_job.cc:615-625](../../../hixl/src/llm_datadist/data_transfer/d2h_data_transfer_job.cc#L615) | 同步 `aclrtMemcpy` 可改 `aclrtMemcpyAsync` + event |
+### 1.3 非热点（已排除）
+- [ensure_zmq_send/recv](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L3197) 的 `time.sleep(0.1)` 是 ZMQ 异常重试（max 3 次，仅失败时），非热路径。
+- [启动 `time.sleep(3)`](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L3058) 是等待线程就绪，启动期非热路径（但可零风险改 `event.wait`）。
+- RecvingThread 主循环 `queue.get()` 阻塞，非忙轮询。
 
 ---
 
-## 3. vllm-ascend 集成层（架构性）
+## 2. 优化点（按收益排序）
 
-来源：[vllm-ascend-hixl-connector-design.md](../../docs/hixl/../vllm-ascend-hixl-connector-design.md)。
+### 2.1 【高收益 / 低风险】P 端 ACK 10ms 忙轮询阻塞 ROUTER 主循环
 
-| 项 | 现状 | 影响 |
+**位置**：[406-411](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L406)
+```python
+while True:
+    try:
+        sock.send_multipart((identity, b"", b"ACK"), flags=zmq.NOBLOCK)
+        break
+    except zmq.Again:
+        time.sleep(0.01)
+```
+**问题**：P 端 ROUTER 回 ACK 时若对端 HWM 满/未及时收，`NOBLOCK` 抛 `zmq.Again`，每 10ms 重试。P 端是**单线程** ROUTER，此忙轮询会阻塞 `run_busy_loop`（374-415），把同一 sock 上后续 `GET_META`/`DONE` 全部 stall，放大到所有 D rank 的首次握手延迟。
+
+**改动思路**：用 `zmq.Poller` 等 `POLLOUT` 可写后再 send，或直接阻塞 send（ROUTER 设 `SNDTIMEO`）。仅影响 P 端 send 时序。
+
+**风险**：低。
+
+### 2.2 【高收益 / 中风险】pull_blocks 同步阻塞 + reformat 全串行（HOL blocking）
+
+**位置**：[658-702 `_handle_request`](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L658)、[755-945 `_transfer_kv_cache_all_groups`](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L755)、[974-1011 reformat 触发](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L974)
+
+**问题**：
+- `_handle_request`→`_transfer_kv_cache_all_groups`→`pull_blocks` 同步，期间该 worker 线程被占，同 peer 后续 req 排队（§1.2）。
+- `for group_pull in group_pulls`（788）串行遍历 group；多 group（HMA/多 attention group）无法并发。
+- reformat（`_apply_kv_cache_reformat` [984-1011](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L984) → `_reformat_staging_to_local` [1013+](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1013)）在 `finally` 中、`all_tasks_done` 后才跑，且需全部 shard 落地才能 transpose，无法与本 req 下一 group 或下一 req 的 pull overlap。
+
+**改动思路**：
+1. per-group 并发 submit pull（不同 group 的 cache 独立，可并发，需确认 `cache_manager.pull_blocks` 线程安全；**额外约束**：TP>1 时多 group 共写同一 `staging_caches`/`staging_tensors`（[852](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L852)），并发需保证 staging block 写入隔离，避免与同 req reformat 的 transpose 竞争）；
+2. reformat 下沉到 per-group-ready 触发（`_stash_pending_reformat` 已 per-shard，把 `_reformat_pending_kv_caches` 改 group 粒度事件驱动）；
+3. 下一 req 的 `_get_remote_metadata`（ZMQ GET_META，独立 socket）与当前 req pull overlap。
+
+**风险**：中（并发 pull 需验证线程安全；per-group reformat 需保证 staging block 复用时机）。
+
+### 2.3 【高收益 / 高风险】NZ reformat 的 `torch.npu.synchronize()`
+
+**位置**：[1102-1103](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1102)
+```python
+# FIXME: skipping sync crashes in GQA (MC:1278-1281); root cause unknown.
+torch.npu.synchronize()
+```
+**问题**：`enable_kv_nz` 路径每 req 每 group 全设备同步，阻塞 RecvingThread 直到 NPU 空闲，与 pull 重叠失败。注释 FIXME 标注根因未知（已知待解）。
+
+**改动思路**：查清 GQA crash 根因（推测 pull_blocks 异步 DMA 与 `npu_paged_cache_load` 读同 buffer 竞争），改 `torch.npu.current_stream().synchronize()` 或事件等待。
+
+**风险**：高，需复现并验证 GQA 场景。
+
+### 2.4 【中-高收益 / 中风险】`remote_sockets_lock` 内建连慢 IO
+
+**位置**：[1203-1212](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1203)
+**问题**：`_get_remote_socket` 池空时在锁内 `make_zmq_socket`（TCP connect，慢），串行化所有并发线程的首次拉取。
+**改动思路**：锁内只查池；池空释放锁，锁外建连，建完双重检查再归池。
+**风险**：中（需避免同 path 并发建多个 socket，无害但浪费 fd）。
+
+### 2.5 【中收益 / 低风险】`group_concurrent_contiguous` 用 numpy 过重
+
+**位置**：[3174-3187](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L3174)，调用点 [825](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L825)/[873](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L873)
+**问题**：每 group 一次 `np.array` + `np.diff` + `np.split` + `tolist()`。block 数通常 <100，numpy 启动开销 > 纯 Python。TP=1 主路径每 group 一次。
+**改动思路**：改纯 Python 单遍历合并连续段。
+**风险**：低，纯计算逻辑替换。
+
+### 2.6 【中收益 / 低风险】`_get_group_kv_caches` 每 req 重建 + 重复字符串解析
+
+**位置**：[947-963](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L947)，调用点 [925](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L925)/[1008](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1008)
+**问题**：reformat 路径每 req 每 group 重建 dict + 对每层调 `extract_layer_index`（含字符串解析，[962](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L962)）。NZ 路径（[925](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L925)）与 reformat 路径（[1008](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1008)）各 per-group 调一次。
+**改动思路**：注册时（`register_kv_caches`）预计算缓存 `group_idx → {layer_name: cache}` 映射。
+**风险**：低，纯缓存。
+
+### 2.7 【中收益 / 低风险】`copy.deepcopy` 端口映射
+
+**位置**：[2437-2439](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L2437)
+**问题**：CP 路径每 req deepcopy 嵌套 `list[list[int]]`（per-engine 固定映射，deepcopy 仅为防 2490-2492 的 `pop`/`append` 污染缓存）。开销与端口数成正比（TP 大时显著）。
+**改动思路**：浅拷贝 + 按需复制被修改的子 list（仅 `final_block_idx` 分支才改）。
+**风险**：低（需确认 2490-2492 修改路径）。
+
+### 2.8 【中收益 / 中风险】DONE 信号逐端口串行往返
+
+**位置**：[1155-1201](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1155)，调用点 [706-709](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L706)
+**问题**：`_send_done_signal_to_free_remote_port` 对 `num==0` 的端口逐个调 `_send_done_recv_signal`，每端口一次 ZMQ req-rep 往返。CP 多端口时串行多次 RTT。
+**改动思路**：(a) `num==0` 多端口 DONE 并发 submit 到 executor（不同端口 socket 独立）；(b) 多 req DONE 合并多帧 send + 单次 ACK 往返（需改 P 端解析 392-405）。
+**风险**：中（方案 b 改 P 端协议）。
+
+---
+
+## 3. 低收益 / 零风险（顺手改）
+
+| 项 | 行号 | 改动 |
 |---|---|---|
-| `pull_blocks` 同步阻塞 | 无 async task，与 mooncake `batch_transfer_sync_read` 语义一致 | 无法与计算 overlap |
-| 控制面 3 个 Python gap | 服务监听 / 端点发现 / 完成通知无 Python 绑定 | 必须保留 ZMQ，引入额外 socket + 序列化开销 |
-| `hixl_connector.py` 轮询 | `time.sleep(0.01)` ACK 忙轮询、`ThreadPoolExecutor(32)` + 多锁、3s/0.1s 等待轮询 | CPU 空转 + 尾延迟 |
-| TP>1 staging | 额外 staging buffer + reformat | 额外内存 + 拷贝 |
-
-**演进方向**：给 `hixl.h` 的 `SendNotify`/`GetNotifies`、`hixl_cs.h` 的 `HixlCSClientGetRemoteMem`/`HixlCSServerListen` 补 Python 绑定，去除 ZMQ。
+| `ready_event.wait()` 替换 3s 轮询 | [3058-3063](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L3058) | `event.wait(timeout=...)` 为主，但需保留原 `thread.is_alive()` 检查与 5 分钟超时（非纯替换） |
+| `remote_metadata_lock` 循环外读 cluster_id | [792-793](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L792) | 一个 req 多 group_pull 时循环外读一次缓存局部变量 |
+| `done_task_lock` 内 `.copy()` 改 swap | [280](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L280) | 锁内 swap 出引用，锁外合并/清理 |
+| `peer_request_queues_lock` 出队批量化 | [610-635](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L610) | 持锁一次 popleft 一批（≤5）到本地，处理完再判重提交，减锁次数 |
+| `MAX_REQUESTS_PER_PEER_HANDLER` 短路 yield | [634-635](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L634) | peers < max_workers 时跳过 yield resubmit |
 
 ---
 
 ## 4. 收益估算
 
-> 实测部分来自 HIXLCS性能分析.md；优化后数值为基于代码开销占比的推断，非实测，需 NPU 验证。
+> 无 connector 层实测基线，以下为基于代码逻辑的推断，需 NPU 验证。
 
-### 4.1 单次传输带宽
+| 优化 | 收益类型 | 量级（推断） |
+|---|---|---|
+| 2.1 ACK 忙轮询 | P 端主循环 stall | 消除 10ms 量级旋转，避免 GET_META/DONE 被单次慢 ACK 串行阻塞；高并发握手场景收益明显 |
+| 2.2 并发 pull + 流式 reformat | 并发吞吐（非单次延迟） | 多 group / 多 req 场景吞吐 +30~100%（HOL 解除） |
+| 2.3 NZ sync | RecvingThread 阻塞 | 每 req 每 group 省一次全设备同步（NPU 空闲等待），尾延迟改善 |
+| 2.4 socket 建连移出锁 | 首次并发拉取 | 消除首次多 peer 并发建连串行化（建连 ms 级 × N） |
+| 2.5 纯 Python 合并 | CPU | 每 group 省一次 numpy 启动（µs 级 × group 数） |
+| 2.6 group_kv 缓存 | CPU | reformat 路径每层省字符串解析 |
+| 2.7 deepcopy → 浅拷贝 | CPU | CP 多端口每 req 省一次 deepcopy（与端口数成正比） |
+| 2.8 DONE 并发/批量 | 尾延迟 | CP 多端口省串行 RTT（每端口 ms 级） |
 
-带宽受 UBDMA 物理下限约束，无法突破。
+**总体判断**：
+- 真正带宽/延迟瓶颈在底层 HIXL（`pull_blocks` 同步、UBDMA 物理上限），connector 层无法改单次延迟；
+- connector 层主收益在**并发调度**（2.2 解 HOL、2.1 解 P 端 stall、2.4 解建连串行），多 group/多 peer/CP 场景吞吐提升 30~100% 量级；
+- 2.5/2.6/2.7 为 CPU 微优化，负载叠加场景有价值。
 
-| 场景 | 当前（实测） | 优化后（推断） | 说明 |
+---
+
+## 5. 风险评估
+
+### 5.1 安全（纯实现，语义不变）
+- 2.5 纯 Python 合并连续段、2.6 `_get_group_kv_caches` 缓存、3 节部分项（循环外读 cluster_id、`.copy()` 改 swap）。
+
+### 5.2 需谨慎（行为应等价但有边界）
+- `ready_event.wait()` 替换 3s 轮询（3 节）：需保留 `thread.is_alive()` 与 5 分钟超时，非纯替换；
+- 2.1 ACK 改 Poller/阻塞 send：需保证 SNDTIMEO 设置，避免永久阻塞；
+- 2.4 socket 建连移出锁：需双重检查避免重复建连；
+- 2.7 deepcopy → 浅拷贝：需确认 2490-2492 修改路径不污染缓存；
+- 2.8 DONE 并发：不同端口 socket 独立可并发，但批量多帧方案需改 P 端协议解析。
+
+### 5.3 有功能风险（需重新设计）
+- 2.2 并发 pull + 流式 reformat：并发正确性（`pull_blocks` 线程安全、staging block 复用时机、reformat 依赖全部 shard）；非简单改锁，需并发模型设计 + NPU 验证；
+- 2.3 NZ `torch.npu.synchronize()`：FIXME 标注根因未知，去掉会触发 GQA crash，**必须先查清根因**，不可直接改。
+
+---
+
+## 6. 推进建议
+
+按收益/风险比推进：
+1. **先做 2.1 + 2.5/2.6/2.7 + 第 3 节零风险项**：纯 Python，本机可 `py_compile`/`ruff` 验证，NPU 侧对齐输出即可；
+2. **再做 2.4 + 2.8(a)**：socket 建连移出锁、DONE 多端口并发，中风险，需 NPU 验证建连/DONE 时序；
+3. **最后单独评审 2.2 + 2.3**：并发 pull / 流式 reformat / NZ sync，需并发设计评审 + NPU 全场景验证，单独立项。
+
+> 收益最高的 2.2 恰是功能风险最高的一类；2.3 有已知 FIXME，不可贸然动。建议低风险类先行验证流程，高风险类单独评审。
+
+---
+
+## 7. 实施状态（2026-08-03）
+
+按第 6 节推进建议实施，本机 `py_compile` 通过，未 NPU 验证。
+
+### 7.1 已实施
+
+| 项 | 风险 | 改动 | 行号 |
 |---|---|---|---|
-| 2GB 大包 | 46 GB/s | 46~47（收敛） | 已近带宽上限，准备开销占比<2%，收益<2% |
-| 128MB 中包 32MB×4 | 41 GB/s | ~43 | 准备阶段占比~9%，边际 |
-| 128MB 小包 1MB×128 | 33 GB/s | **38~42** | per-op 开销占比 25%+，主收益区 |
+| 2.1 ACK 忙轮询 | 低 | `zmq.Poller` 等 POLLOUT 替代 `sleep(0.01)` 旋转 | [374-378](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L374)、[407-414](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L407) |
+| 2.4 建连移出锁 | 中 | `_get_remote_socket` 锁内只查池，建连在锁外 | [1212-1222](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1212) |
+| 2.5 纯 Python 合并 | 低 | `group_concurrent_contiguous` 去 numpy，单遍历 | [3178-3204](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L3178) |
+| 2.6 group_kv 缓存 | 低 | `_get_group_kv_caches` 加 `_group_kv_cache` memo | [947-972](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L947) |
+| 2.7 deepcopy → 浅拷贝 | 低 | `list()` 浅拷贝 + `final_block_idx` 分支按需复制子 list | [2437-2439](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L2437)、[2494-2498](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L2494) |
+| 2.8(a) DONE 多端口并发 | 中 | `num==0` 端口 `threading.Thread` 并发（避开 executor 死锁） | [1180-1192](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1180) |
+| §3 `ready_event.wait` | 零 | 替代 `sleep(3)`，保留 `is_alive`+超时 | [3058-3063](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L3058) |
+| §3 循环外读 cluster_id | 零 | `remote_metadata_lock` 循环外读一次 | [790-793](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L790) |
+| §3 `.copy()` → swap | 零 | `get_and_clear_finished_requests` swap 引用 | [277-283](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L277) |
+| §3 出队批量化 | 低 | `_handle_peer_requests` 一次取 ≤MAX 批，锁次数 MAX+1→2 | [610-635](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L610) |
 
-### 4.2 各优化点量级收益（推断）
+### 7.2 未实施
 
-| 优化 | 收益类型 | 量级 |
-|---|---|---|
-| 拆 HixlCSClient/FSM 全局锁 | 并发吞吐（非单次延迟） | 多 client/多 group 并发下 **+30~100%** |
-| export_desc 改二进制 framing | 建链延迟 | 单次省百µs~ms；对 54ms CreateChannel 占比 <2% |
-| CopyJob/SwapImpl/建链线程池常驻 | CPU 开销 | 每次省 4~16 线程建销毁；不影响带宽 |
-| 热路径去 INFO 日志 + chrono 计时 | CPU 开销 | 小包高频场景 CPU 占比降数%~十几% |
-| BatchPut 扩大 + 合并 desc/flag | 小包延迟 | list_num=128 时 fill_args 降 30~50% |
-| Host 异步改 batch 原语 | 小包延迟 | N 次单条 NBI→1 次 batch，省数百µs |
-| 设备 desc buffer 池化 | 小包延迟 | 每次省 malloc+H2D（~百µs），高频累积 |
-| 自旋改条件变量/退避 | CPU + 尾延迟 | 烧满核释放；正常路径延迟不变 |
-
-### 4.3 建链
-
-建链 ~95% 耗时在 `CreateChannel`（底层 HCCL/HCOMM 资源创建），上层软件优化（JSON、线程池、g_mutex）合计影响在 ms 以内。大幅下降需架构层：
-- **channel/连接复用**（避免每次 CreateChannel）：可能 54ms → ms 级（依赖底层支持）。
-- 多 cluster 并行建链（破 `g_mutex` 串行）：N 个 cluster 时 wall-clock 可降 N 倍（hccl init 不支持并行，收益打折）。
-
----
-
-## 5. 最高优先级建议（收益/成本比）
-
-1. **拆 HixlCSClient / FSM 全局锁**：让异步提交与完成查询不互斥，直接提并发吞吐。收益最高、改动集中。
-2. **export_desc 改二进制 framing**：砍建链序列化开销，配合锁拆分降 connect 耗时。
-3. **CopyJob/SwapImpl/建链线程池常驻复用**：消除每调用 4~16 线程建销毁，CPU 收益明确。
-4. **热路径去 INFO 日志 + chrono 计时**：低成本高收益，小包场景明显。
-5. **自旋改条件变量/退避**：降 CPU 占用与尾延迟。
-
----
-
-## 6. 总体判断
-
-- **带宽天花板明确**：大包已近 UBDMA 物理上限，无法大幅突破。
-- **主收益在小包/高并发场景**：per-op 开销压缩 + 锁拆分，小包吞吐 33→38~42 GB/s 量级；并发吞吐（多 P rank/多 group KV transfer）提升 30~100%。
-- **建链大幅下降需架构层**（连接复用），纯上层代码优化收益 ms 级。
-- **CPU 开销优化**（日志、线程池、chrono）不直接提带宽，但降低 CPU 占用与尾延迟，对负载叠加场景有价值。
-
----
-
-## 7. 优化风险评估
-
-> 评估每项优化对功能正确性的影响，分三档：安全 / 需谨慎 / 有功能风险。
-> 量级判断基于代码逻辑推断，非实测，需 NPU 验证。
-
-### 7.1 基本安全（纯实现优化，语义不变）
-
-| 优化 | 功能影响 | 说明 |
-|---|---|---|
-| `std::map` → `unordered_map` / `shared_mutex` 读写分离 | 无 | 数据结构替换，接口语义不变 |
-| 线性扫描 → free-list / 区间树 / 位图 | 无 | 分配算法等价，返回结果一致 |
-| 线程池常驻复用（CopyJob/SwapImpl/建链） | 无 | 复用而非重建，行为一致 |
-| 热路径去 INFO 日志 + chrono 计时 | 无 | 仅删观测，不改逻辑 |
-| `HcclBatchGet` 补统计（与 Put 对齐） | 无 | 不影响传输 |
-| 每次 vector 拷贝 → 零拷贝透传 | 无 | 内存布局不变 |
-| `writev` 合并 3 次 send | 无 | TCP 字节流等价 |
-| EAGAIN 重试加指数退避 | 需注意 | 退避增加单次重试延迟，总超时不变；极端情况下单位时间内重试次数减少，需测成功率 |
-
-### 7.2 需谨慎（行为应等价但有边界条件）
-
-| 优化 | 风险点 | 验证项 |
-|---|---|---|
-| BatchPut 上限 64 → 更大 | HCCL 单次 batch 可能有底层上限（与 `transfer_message_limits.h` payload 约束相关），超限可能失败或被内部再切分 | 确认 HCCL batch 上限；超限需内部再分片，不能假设越大越好 |
-| 合并 desc+flag 为单次 batch | flag 与数据语义不同（flag 是完成标志），合并后远端读取顺序/时序可能变化 | 验证远端 flag 读取时序，确保不出现"读到旧 flag" |
-| Host 异步改 batch 原语 | `HcommBatchTransferOnThread` 与 N 次单条 NBI 的语义是否逐位等价（保序、错误传播） | 对齐输出，确认 batch 与逐条结果一致 |
-| 设备 desc buffer 池化复用 | 复用 buffer 需保证上一轮传输完成才回收，否则覆盖在途数据 | 池化必须带 in-use 标记，回收前查完成态 |
-| `aclrtMemcpy` 同步 → async + event | 异步化后需正确同步 event，否则后续读到未完成数据 | event 等待点要对齐原同步点 |
-| 自旋改条件变量 | CV 需正确配对 notify，遗漏会死等；多等待者需 broadcast | 每处唤醒点都补 notify；实测唤醒不丢 |
-| export_desc 改二进制 framing | 协议变更，双端必须同版本，否则建链失败 | 版本握手 / 兼容老版本或灰度 |
-| `Unlink` 1ms 轮询 → CV | 拆链时序敏感，CV 唤醒延迟可能让 unlink 变慢，影响后续重建 | 测拆链 + 重建串联场景 |
-
-### 7.3 有功能风险（需重新设计，非简单改动）
-
-| 优化 | 风险 |
+| 项 | 原因 |
 |---|---|
-| 拆 HixlCSClient 全局 mutex | 当前单锁隐式保证提交/查状态/注册的**原子可见性**；拆锁后需保证：①异步提交后查状态能立即看到该提交；②Abort/Destroy 与在途传输的回收顺序不出现 use-after-free；③complete_handles 与 req 表的跨锁一致性。锁拆错会丢任务、重复完成、野指针 |
-| 拆 FSM 全局 mutex / 状态推进与传输解耦 | FSM 单线程 + 全局锁当前保证 entity 状态机串行推进，解耦后多线程并发驱动同一 entity 状态会出现竞态（状态跳跃、重复下发、unlink 与传输交错）。需重新设计状态机并发模型，非简单拆锁 |
-| channel / 连接复用 | 复用语义下，断链检测、远端内存失效、cluster 生命周期管理都要重设计；复用一个 stale channel 会导致传输到已释放内存。需配套心跳/失效协议 |
-| g_mutex 去串行（hccl init 并行） | 代码注释明说"hccl HcclCommInitClusterInfoMemConfig not support parallel call"，强行并行会触发底层未定义行为。**此项不可改**，除非 hccl 提供并行 init 接口 |
+| 2.2 并发 pull + 流式 reformat | 高风险，需并发设计评审 + NPU 验证（`pull_blocks` 线程安全、staging 复用时机） |
+| 2.3 NZ `torch.npu.synchronize()` | 高风险，FIXME 标注 GQA crash 根因未知，**不可贸然动** |
+| 2.8(b) 多 req DONE 合并多帧 | 中风险，需改 P 端协议解析（392-405） |
+| §3 `MAX_REQUESTS_PER_PEER_HANDLER` 短路 yield | 收益低，改动结构与并发模型耦合，暂缓 |
 
-### 7.4 协议层协同（功能风险为零但需双端协同）
+### 7.3 实施中发现并修复的 bug
+- **2.8a encoder 线程安全**：多 Thread 并发调 `_send_done_recv_signal`，原用共享 `self.encoder.encode`（msgspec `Encoder` 非线程安全，会竞争内部 buffer）。已改用模块级 `msgspec.msgpack.encode`（[1205](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L1205)，无共享状态）。
 
-- 给 `SendNotify`/`GetRemoteMem`/`ServerListen` 补 Python 绑定去 ZMQ：协议层变更，D/P 双端需同时升级，且需保留发现/通知的可靠性（ZMQ 当前有重试）。属架构演进，非纯优化。
+### 7.4 既有问题（非本次引入）
+- `_get_remote_metadata`（[723](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py#L723)）同样用共享 `self.encoder`，多 worker 并发时有相同线程安全隐患。原代码既有，建议后续统一改模块级 encode。
 
-### 7.5 风险分布与推进建议
-
-- **约 60% 是纯实现优化**（数据结构、线程池复用、去日志/计时、零拷贝透传），功能无影响。
-- **约 25% 需谨慎验证**（batch 上限、合并 desc/flag、buffer 池化、async memcpy、CV 替换自旋），语义应等价但有边界条件，需 NPU 对齐测试。
-- **约 15% 有功能风险**（拆 HixlCSClient/FSM 锁、连接复用），涉及并发正确性，需重新设计而非简单改动；`g_mutex` 串行 hccl init 不可改（底层限制）。
-
-**收益最高的"拆锁"恰是功能风险最高的一类**，建议推进顺序：
-1. 先做纯实现类（低风险高 CPU 收益）；
-2. 再逐项验证谨慎类（对齐输出）；
-3. 最后单独评审拆锁/复用的并发设计。
+### 7.5 验证状态
+- ✅ `python -m py_compile` 通过（语法正确，含 encoder 修复后）
+- ❌ 未 NPU 验证运行时：建议 `--kv-transfer-config kv_connector=HIXLConnectorV1` P/D 双进程冒烟（TP=1/单 group）+ CP 多端口场景（验证 2.8a）+ `ruff-check`/`ruff-format`
 
 ---
 
 ## 附：信息来源
 
-- [HIXLCS性能分析.md](../../../hixl.wiki/HIXLCS性能分析.md) — 128MB/2GB Device 单边通信实测样例
-- [HIXL传输profiling分析.md](../../../hixl.wiki/HIXL传输profiling分析.md) — msprof 采集与任务耗时分析
-- [vllm-ascend-hixl-connector-design.md](../vllm-ascend-hixl-connector-design.md) — vllm 集成设计与接口 gap
-- 代码探索：`hixl/src/llm_datadist`、`hixl/src/hixl`、`hixl/src/ops/hixl_kernel` 逐行核对（行号见正文）
+- 代码通读：[hixl_connector.py](../../vllm_ascend/distributed/kv_transfer/kv_p2p/hixl_connector.py)（3223 行，逐段核对行号见正文）
+- 设计依据：[vllm-ascend-hixl-connector-design.md](../vllm-ascend-hixl-connector-design.md)
+- 无 connector 层实测性能基线（底层 HIXL CS 打点见 hixl.wiki/HIXLCS性能分析.md，不在本报告范围）

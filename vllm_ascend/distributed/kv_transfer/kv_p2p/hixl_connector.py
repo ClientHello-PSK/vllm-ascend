@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Any, TypedDict
 
 import msgspec
 import numpy as np
-import numpy.typing as npt
 import torch
 import torch_npu
 import zmq
@@ -277,10 +276,10 @@ class KVCacheTaskTracker:
 
     def get_and_clear_finished_requests(self) -> set[str]:
         with self.done_task_lock:
-            finished_requests = self.finished_requests.copy()
+            finished_requests = self.finished_requests
+            self.finished_requests = set()
             expired_requests = self._retrieve_expired_requests()
-            finished_requests.update(expired_requests)
-            self.finished_requests.clear()
+        finished_requests.update(expired_requests)
         return finished_requests
 
     def add_delayed_request(self, request_id: str, delay_start_time: float):
@@ -375,6 +374,8 @@ class KVCacheSendingThread(threading.Thread):
         encoder = msgspec.msgpack.Encoder()
         encoded_data = encoder.encode(self.metadata)
         decoder = msgspec.msgpack.Decoder(type=tuple)
+        ack_poller = zmq.Poller()
+        ack_poller.register(sock, zmq.POLLOUT)
         while True:
             try:
                 frames = sock.recv_multipart()
@@ -404,11 +405,13 @@ class KVCacheSendingThread(threading.Thread):
                     else:
                         self.task_tracker.update_done_task_count(request_id)
                     while True:
+                        if not dict(ack_poller.poll(timeout=1000)):
+                            continue
                         try:
                             sock.send_multipart((identity, b"", b"ACK"), flags=zmq.NOBLOCK)  # type: ignore
                             break
                         except zmq.Again:  # type: ignore
-                            time.sleep(0.01)
+                            continue
                 else:
                     logger.error("Unexpected message type in KVCacheSendingThread: %s", msg[0])
             except Exception as e:
@@ -513,6 +516,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_sockets_lock = threading.Lock()
         self.remote_sockets: dict[str, deque[zmq.Socket]] = defaultdict(deque)  # type: ignore
         self.timeout = 1.0
+        self._group_kv_cache: dict[tuple, dict[str, Any]] = {}
 
         assert vllm_config is not None
         self.vllm_config: VllmConfig = vllm_config
@@ -608,21 +612,20 @@ class KVCacheRecvingThread(threading.Thread):
             self.executor.submit(self._handle_peer_requests, peer_key)
 
     def _handle_peer_requests(self, peer_key: tuple[str, int]) -> None:
-        requests_handled = 0
-        while requests_handled < MAX_REQUESTS_PER_PEER_HANDLER:
-            with self.peer_request_queues_lock:
-                peer_queue = self.peer_request_queues.get(peer_key)
-                if not peer_queue:
-                    self.peer_request_queues.pop(peer_key, None)
-                    self.active_peer_request_handlers.discard(peer_key)
-                    return
-                req_meta = peer_queue.popleft()
-            requests_handled += 1
+        with self.peer_request_queues_lock:
+            peer_queue = self.peer_request_queues.get(peer_key)
+            if not peer_queue:
+                self.peer_request_queues.pop(peer_key, None)
+                self.active_peer_request_handlers.discard(peer_key)
+                return
+            batch: list[dict[str, Any]] = []
+            while peer_queue and len(batch) < MAX_REQUESTS_PER_PEER_HANDLER:
+                batch.append(peer_queue.popleft())
+        for req_meta in batch:
             try:
                 self._handle_request(req_meta)
             except Exception:
                 logger.exception("Error handling HIXL KV transfer for peer %s:%d.", peer_key[0], peer_key[1])
-
         should_resubmit = False
         with self.peer_request_queues_lock:
             peer_queue = self.peer_request_queues.get(peer_key)
@@ -785,12 +788,12 @@ class KVCacheRecvingThread(threading.Thread):
 
         ready_attention_group_reformat_block_ids: list[tuple[tuple, bool]] = []
 
+        with self.remote_metadata_lock:
+            remote_cluster_id = self.remote_cluster_id[remote_engine_id][remote_handshake_port]
         for group_pull in group_pulls:
             group_idx = group_pull.group_id
             group_spec, layer_indices = self.kv_group2layeridx[group_idx]
             kv_cache_group_id = group_spec.get("kv_cache_group_id", group_idx)
-            with self.remote_metadata_lock:
-                remote_cluster_id = self.remote_cluster_id[remote_engine_id][remote_handshake_port]
             tp_n = group_pull.num_group_pulls
             tp_offset = group_pull.remote_tp_offset
             src_blocks = list(remote_block_ids[kv_cache_group_id])
@@ -947,6 +950,10 @@ class KVCacheRecvingThread(threading.Thread):
     def _get_group_kv_caches(self, group_idx: int, layer_indices: list[int] | None = None) -> dict[str, Any]:
         if layer_indices is None:
             _, layer_indices = self.kv_group2layeridx[group_idx]
+        cache_key = (group_idx, tuple(layer_indices))
+        cached = self._group_kv_cache.get(cache_key)
+        if cached is not None:
+            return cached
         layer_index_set = set(layer_indices)
         num_attn_module = 2 if self.vllm_config.model_config.hf_text_config.model_type == "longcat_flash" else 1
         from vllm.v1.worker.utils import extract_layer_index
@@ -958,9 +965,11 @@ class KVCacheRecvingThread(threading.Thread):
                 return any(layer_idx >= self.num_layers for layer_idx in layer_index_set)
             return extract_layer_index(layer_name, num_attn_module) in layer_index_set
 
-        return {
+        result = {
             layer_name: layer_cache for layer_name, layer_cache in self.kv_caches.items() if layer_in_group(layer_name)
         }
+        self._group_kv_cache[cache_key] = result
+        return result
 
     def _stash_pending_reformat(
         self,
@@ -1169,10 +1178,18 @@ class KVCacheRecvingThread(threading.Thread):
             if should_send:
                 self.proc_not_transfer_request[request_id] = False
         if should_send:
+            done_threads: list[threading.Thread] = []
             for remote_port in remote_port_send_num:
                 if remote_port_send_num[remote_port]["num"] == 0:
                     remote_host_ = remote_port_send_num[remote_port]["host"]
-                    self._send_done_recv_signal(request_id, remote_host_, remote_port, remote_port_send_num)
+                    t = threading.Thread(
+                        target=self._send_done_recv_signal,
+                        args=(request_id, remote_host_, remote_port, remote_port_send_num),
+                    )
+                    t.start()
+                    done_threads.append(t)
+            for t in done_threads:
+                t.join()
 
     def _send_done_recv_signal(
         self,
@@ -1185,7 +1202,7 @@ class KVCacheRecvingThread(threading.Thread):
         sock: zmq.Socket | None = None  # type: ignore
         try:
             sock = self._get_remote_socket(remote_host, remote_handshake_port)
-            data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
+            data_bytes = msgspec.msgpack.encode((DONE_RECVING_MSG, request_id, remote_port_send_num))
             ensure_zmq_send(sock, data_bytes, f"{remote_host}:{remote_handshake_port}")
             resp = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
             if resp != b"ACK":
@@ -1203,13 +1220,14 @@ class KVCacheRecvingThread(threading.Thread):
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
         remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
         with self.remote_sockets_lock:
-            if self.remote_sockets[remote_path]:
-                return self.remote_sockets[remote_path].popleft()
-            ctx = zmq.Context()  # type: ignore
-            sock = make_zmq_socket(ctx=ctx, path=remote_path, socket_type=zmq.REQ, bind=False)  # type: ignore
-            sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))  # type: ignore
-            sock.setsockopt(zmq.RCVTIMEO, int(self.timeout * 1000))  # type: ignore
-            return sock
+            pool = self.remote_sockets[remote_path]
+            if pool:
+                return pool.popleft()
+        ctx = zmq.Context()  # type: ignore
+        sock = make_zmq_socket(ctx=ctx, path=remote_path, socket_type=zmq.REQ, bind=False)  # type: ignore
+        sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))  # type: ignore
+        sock.setsockopt(zmq.RCVTIMEO, int(self.timeout * 1000))  # type: ignore
+        return sock
 
     def _return_remote_socket(self, sock: zmq.Socket, remote_host: str, remote_handshake_port: int) -> None:  # type: ignore
         remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
@@ -2434,7 +2452,7 @@ class HIXLConnectorWorker:
             self.remote_port_send_num[meta.remote_engine_id] = get_remote_port_send_num(
                 local_remote_block_port_mappings
             )
-        local_remote_block_port_mapping = copy.deepcopy(
+        local_remote_block_port_mapping = list(
             self.local_remote_block_port_mapping[meta.remote_engine_id]
         )
 
@@ -2487,9 +2505,11 @@ class HIXLConnectorWorker:
             final_block_num = remote_block_nums.pop(final_block_idx)
             shard_cp_ranks.append(shard_cp_ranks.pop(final_block_idx))
             remote_block_nums.append(final_block_num)
-            for mapping in local_remote_block_port_mapping:
+            for idx, mapping in enumerate(local_remote_block_port_mapping):
+                mapping = mapping.copy()
                 final_block_port = mapping.pop(final_block_idx)
                 mapping.append(final_block_port)
+                local_remote_block_port_mapping[idx] = mapping
 
         num_prefix_p_blocks = num_prefix_cached_blocks
         if r_blk > 1:
@@ -3060,7 +3080,7 @@ class HIXLConnectorWorker:
                 raise RuntimeError("HIXL KV Cache sending/receiving thread failed to start.")
             if time.time() - start_wait_time > 5 * 60:
                 raise RuntimeError("Timeout waiting for HIXL KV Cache thread to be ready.")
-            time.sleep(3)
+            ready_event.wait(timeout=3)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_sending = (
@@ -3175,16 +3195,24 @@ def group_concurrent_contiguous(
     src: list[int], dst: list[int]
 ) -> tuple[list[list[int]], list[list[int]]]:
     """Group block ids that are contiguous in both id space and memory."""
-    src_indices: npt.NDArray[np.int64] = np.array(src, dtype=np.int64)
-    dst_indices: npt.NDArray[np.int64] = np.array(dst, dtype=np.int64)
-    if src_indices.size == 0:
+    if not src:
         return [], []
-    src_byte_contiguous = np.diff(src_indices) == 1
-    dst_byte_contiguous = np.diff(dst_indices) == 1
-    brk = np.where(~(src_byte_contiguous & dst_byte_contiguous))[0] + 1
-    src_groups = np.split(src_indices, brk)
-    dst_groups = np.split(dst_indices, brk)
-    return [g.tolist() for g in src_groups], [g.tolist() for g in dst_groups]
+    src_groups: list[list[int]] = []
+    dst_groups: list[list[int]] = []
+    cur_src: list[int] = [src[0]]
+    cur_dst: list[int] = [dst[0]]
+    for i in range(1, len(src)):
+        if src[i] == src[i - 1] + 1 and dst[i] == dst[i - 1] + 1:
+            cur_src.append(src[i])
+            cur_dst.append(dst[i])
+        else:
+            src_groups.append(cur_src)
+            dst_groups.append(cur_dst)
+            cur_src = [src[i]]
+            cur_dst = [dst[i]]
+    src_groups.append(cur_src)
+    dst_groups.append(cur_dst)
+    return src_groups, dst_groups
 
 
 def string_to_int64_hash(input_str):
