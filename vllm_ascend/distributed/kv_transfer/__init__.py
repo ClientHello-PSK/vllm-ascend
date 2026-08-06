@@ -34,6 +34,14 @@ def register_connector():
         "HIXLConnectorV1", "vllm_ascend.distributed.kv_transfer.kv_p2p.hixl_connector", "HIXLConnector"
     )
 
+    # Address-level pull connector driving hixl::Hixl directly (no LLM-DataDist
+    # block API, no staging/post-transpose). Coexists with HIXLConnector above;
+    # selected via `kv_connector=HIXLEngineConnector`. See
+    # docs/hixl/hixl-engine-connector-design.md.
+    KVConnectorFactory.register_connector(
+        "HIXLEngineConnector", "vllm_ascend.distributed.kv_transfer.kv_p2p.hixl_engine_connector", "HIXLEngineConnector"
+    )
+
     KVConnectorFactory.register_connector(
         "MooncakeHybridConnector",
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector",
