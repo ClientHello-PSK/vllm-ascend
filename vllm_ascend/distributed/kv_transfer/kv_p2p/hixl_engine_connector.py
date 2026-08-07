@@ -815,19 +815,46 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 is_conv_state_dim_first,
             )
 
-            assert is_conv_state_dim_first(), (
-                "HIXLEngine Mamba transfer requires DS conv state layout. "
-                "Set VLLM_SSM_CONV_STATE_LAYOUT=DS"
-            )
             mamba_spec = next(
                 spec
                 for spec in self._layer_specs.values()
                 if isinstance(spec, MambaSpec)
             )
-            self._conv_decomp = derive_mamba_conv_split(
-                mamba_spec, self._tp_size
-            )
-            mamba_ssm_size = self._conv_decomp.ssm_sizes
+            if is_conv_state_dim_first():
+                # DS 布局:走 NIXL 3-read 子投影分解取 ssm_sizes。hixl 尚未
+                # 移植子投影传输路径(_build_op_descs 走整块线性寻址,见
+                # TODO C#26),保留 decomp 备后续移植。
+                self._conv_decomp = derive_mamba_conv_split(
+                    mamba_spec, self._tp_size
+                )
+                mamba_ssm_size = self._conv_decomp.ssm_sizes
+            else:
+                # SD 布局放宽:Ascend npu_causal_conv1d_custom 算子硬性要求
+                # convStates=(num_cache_lines, state_len, dim),与原 DS 断言
+                # 冲突。hixl 的整块传输路径(_build_op_descs SSM 分支)与
+                # ssm_sizes 均布局无关,故 SD 下不再强制 DS。不调用
+                # derive_mamba_conv_split(其内部断言要求 DS,且 hixl 未用其
+                # 子投影偏移),仅按布局无关的 numel*dtype_size 算 ssm_sizes,
+                # 不影响 nixl 共享路径。P_TP==D_TP 时整块 memcpy 安全;
+                # P_TP>D_TP reshard 下 slot*chunk 线性寻址假设 DS,SD 未验证。
+                conv_dt = torch.tensor(
+                    [], dtype=mamba_spec.dtypes[0]
+                ).element_size()
+                ssm_dt = torch.tensor(
+                    [], dtype=mamba_spec.dtypes[1]
+                ).element_size()
+                conv_state_bytes = (
+                    torch.Size(mamba_spec.shapes[0]).numel() * conv_dt
+                )
+                ssm_state_bytes = (
+                    torch.Size(mamba_spec.shapes[1]).numel() * ssm_dt
+                )
+                mamba_ssm_size = (conv_state_bytes, ssm_state_bytes)
+                logger.warning(
+                    "HIXLEngine running with SD conv state layout. Safe when "
+                    "P_TP == D_TP (whole-block memcpy); P_TP > D_TP reshard "
+                    "with SD is unverified."
+                )
         self._mamba_ssm_size: tuple[int, int] = mamba_ssm_size
         # Local transfer topology; built lazily in register_kv_caches (mirrors
         # NIXL base_worker.py:1041-1054). Used by compute_tp_mapping.
