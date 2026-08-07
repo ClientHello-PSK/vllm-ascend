@@ -109,6 +109,13 @@ logger = logging.getLogger(__name__)
 # DONE_RECVING_MSG side-channel constant here.
 # ---------------------------------------------------------------------------
 GET_META_MSG = b"get_meta_msg"
+# Bug-4: error-reply marker for a malformed GET_META handshake. The P-side
+# listener replies with ("", b"", b"__HIXL_ERR__" + msg, b"") instead of
+# silently dropping the frame, so the D side fails fast on the real cause
+# rather than waiting out the 5s RCVTIMEO and surfacing a confusing
+# zmq.error.Again. A normal reply's handshake_bytes is msgpack-encoded and can
+# never start with this ASCII prefix.
+HIXL_ERR_PREFIX = b"__HIXL_ERR__"
 
 
 @contextmanager
@@ -264,7 +271,6 @@ class HIXLEngineReqMeta:
     """Per-request metadata consumed by the D-side worker."""
 
     local_block_ids: list[list[int]]
-    local_physical_block_ids: list[list[int]]
     tp_size: int
     remote: HIXLEngineRemoteMeta | None = None
 
@@ -342,7 +348,6 @@ class HIXLEngineConnectorMetadata(KVConnectorMetadata):
     ) -> HIXLEngineReqMeta:
         return HIXLEngineReqMeta(
             local_block_ids=local_block_ids,
-            local_physical_block_ids=local_block_ids,
             tp_size=kv_transfer_params.get("tp_size", 1),
         )
 
@@ -707,6 +712,18 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._engine_id = str(kvtc.engine_id)
         self._tp_rank = get_tensor_model_parallel_rank()
         self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+        # B2 (#22): offset the hixl listen port by tp_rank so co-located TP
+        # ranks each bind a distinct port (avoids the 503900 bind failure when
+        # the second rank rebinds the same port). The peer reads the actual
+        # port from local_engine_endpoint in the handshake metadata, so P/D
+        # stay aligned without per-rank config. TP=1 offsets by 0 (no change).
+        # TODO: extend the offset for DP>1 (currently DP=1, matching
+        # side_channel_port which also offsets by data_parallel_index only).
+        if self._local_engine_base_port > 0:
+            self._local_engine_endpoint = (
+                f"{self._local_engine_host}:"
+                f"{self._local_engine_base_port + self._tp_rank}"
+            )
         self._world_size = get_tensor_model_parallel_world_size()
         self._pp_rank = get_pp_group().rank_in_group
         self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
@@ -722,14 +739,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._pcp_size = get_pcp_group().world_size
         self._pcp_rank = (
             get_pcp_group().rank_in_group if self._pcp_size > 1 else 0)
-        from vllm.distributed import (
-            get_decode_context_model_parallel_rank,
-            get_decode_context_model_parallel_world_size,
-        )
-        self._dcp_size = get_decode_context_model_parallel_world_size()
+        from vllm.distributed import get_dcp_group
+        _dcp_group = get_dcp_group()
+        self._dcp_size = _dcp_group.world_size
         self._dcp_rank = (
-            get_decode_context_model_parallel_rank()
-            if self._dcp_size > 1 else 0)
+            _dcp_group.rank_in_group if self._dcp_size > 1 else 0)
         assert not (self._pp_size > 1 and self._pcp_size > 1), (
             "HIXLEngineConnector: pp and pcp cannot be enabled at the "
             "same time."
@@ -850,6 +864,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # _notify_release skips them to avoid a double-notify that would
         # over-decrement the P-side consumer counter.
         self._notified_release_ranks: dict[str, set[int]] = {}
+        # MED-3: ranks this request actually issued an async READ to. Used by
+        # _notify_release to send DONE only to real readers instead of
+        # broadcasting to plan.all_source_ranks (which spans attn+ssm and can
+        # include ranks this D never read in P_TP>D_TP / GQA-dedup cases — a
+        # spurious DONE there over-decrements the P-side consumer counter and
+        # can free a block before its real consumers finish).
+        self._transferred_ranks: dict[str, set[int]] = {}
         # request_id -> failed flag (for get_block_ids_with_load_errors)
         self._failed_recv_reqs: set[str] = set()
         self._invalid_block_ids: set[int] = set()
@@ -872,15 +893,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._handshake_lock = threading.RLock()
         # req_id -> perf_counter lease expiry (P-side delayed free).
         self._reqs_to_send: dict[str, float] = {}
-        self._reqs_to_process: set[str] = set()
-        self._reqs_in_batch: set[str] = set()
         # Multi-consumer done-notification counting (mirrors NIXL).
         self._consumer_notification_counts_by_req: dict[str, int] = defaultdict(int)
         # P-side lease / heartbeat timing (mirrors NIXL base_worker). Used by
         # _get_new_notifs (lease expiry) and _handle_heartbeat (extension).
         self._kv_lease_duration: int = kvtc.get_from_extra_config(
             "kv_lease_duration", 30)
-        self._lease_extension: int = self._kv_lease_duration
+        # 2/3 factor (NIXL base_worker.py:268): heartbeats only extend the
+        # lease when its remaining < _lease_extension, so the lease converges
+        # to now+extension instead of growing unboundedly on each heartbeat.
+        self._lease_extension: int = self._kv_lease_duration * 2 // 3
         # P-side handshake ROUTER lifecycle.
         self._handshake_stop_event = threading.Event()
         self._handshake_listener_thread: threading.Thread | None = None
@@ -932,16 +954,29 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         """
         kvtc = vllm_config.kv_transfer_config
         cfg: dict[str, Any] = kvtc.get_from_extra_config("hixl_engine", {})
-        self._local_engine_endpoint: str = cfg.get("local_engine", "")
         self._engine_options: dict[str, str] = cfg.get("options", {})
         self._link_timeout_ms: int = int(cfg.get("link_timeout_ms", 5000))
         self._transfer_timeout_ms: int = int(cfg.get("transfer_timeout_ms", 60_000))
         self._side_channel_port_base: int = int(cfg.get("side_channel_port", 0))
-        if not self._local_engine_endpoint:
+        raw_local_engine: str = cfg.get("local_engine", "")
+        if not raw_local_engine:
             raise ValueError(
                 "HIXLEngineConnector requires kv_connector_extra_config."
                 "hixl_engine.local_engine (host:port for hixl Initialize)."
             )
+        # Split host:port now; the per-rank endpoint is resolved in __init__
+        # once tp_rank is known (B2 #22: co-located TP ranks must not share one
+        # listen port, or the second rank's Hixl Initialize bind fails with
+        # 503900). The peer learns the actual port from the local_engine_endpoint
+        # field in the handshake metadata, so P/D stay aligned without per-rank
+        # config.
+        if ":" in raw_local_engine:
+            self._local_engine_host, port_str = raw_local_engine.rsplit(":", 1)
+            self._local_engine_base_port: int = int(port_str)
+        else:
+            self._local_engine_host = raw_local_engine
+            self._local_engine_base_port = 0
+        self._local_engine_endpoint: str = raw_local_engine
 
     def _sync_block_size_with_kernel(self) -> None:
         """Align block_size to the kernel's physical block size.
@@ -1036,6 +1071,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                         f"HIXLEngine handshake short reply: {len(reply)} frames"
                     )
                 handshake_bytes = reply[0]
+                # Bug-4: surface a P-side malformed-request rejection (error
+                # reply frame) immediately instead of a misleading 5s RCVTIMEO
+                # timeout.
+                if handshake_bytes.startswith(HIXL_ERR_PREFIX):
+                    raise RuntimeError(
+                        "HIXLEngine handshake rejected by remote: "
+                        f"{handshake_bytes[len(HIXL_ERR_PREFIX):].decode(errors='replace')}"
+                    )
                 remote_perf = msgspec.msgpack.decode(reply[1])
                 # perf_counter midpoint clock-offset estimate; keep the
                 # lowest-RTT sample (NIXL base_worker.py:628-631).
@@ -1099,13 +1142,19 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 with self._handshake_lock:
                     self._handshake_futures.pop(remote_engine_id, None)
-                    # HIGH-1: fail parked reqs so the scheduler recomputes them
-                    # instead of leaving them queued forever.
+                    # NEW-MED-2: defer failure handling to the main thread.
+                    # _handle_failed_transfer writes _failed_recv_reqs /
+                    # _invalid_block_ids and reads _recving_metadata, all of
+                    # which get_finished (main thread) also touches — calling
+                    # it here on the executor thread races on those
+                    # sets/dicts. Park on _ready_requests; the drain in
+                    # start_load_kv finds plan is None (handshake failed, no
+                    # _tp_mappings entry) and routes to _handle_failed_transfer
+                    # on the main thread.
                     parked = self._pending_handshake_reqs.pop(
                         remote_engine_id, []
                     )
-                for rid, _ in parked:
-                    self._handle_failed_transfer(rid, None)
+                    self._ready_requests.extend(parked)
                 return
             meta_list, offset = fut.result()
             # Connect + plan BEFORE publishing metadata: if connect fails we
@@ -1125,11 +1174,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 self._cleanup_remote_engine(remote_engine_id)
                 with self._handshake_lock:
                     self._handshake_futures.pop(remote_engine_id, None)
+                    # NEW-MED-2: same as handshake-failure path above — defer
+                    # to the main thread via _ready_requests.
                     parked = self._pending_handshake_reqs.pop(
                         remote_engine_id, []
                     )
-                for rid, _ in parked:
-                    self._handle_failed_transfer(rid, None)
+                    self._ready_requests.extend(parked)
                 return
             with self._handshake_lock:
                 # All ranks of an engine share block_lens/block_size/etc;
@@ -1462,18 +1512,22 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         identity = frames[0]
         payload = [f for f in frames[1:] if f != b""]
         if len(payload) != 1:
+            self._reject_handshake(sock, identity, "expected exactly one payload frame")
             return
         try:
             msg = msgspec.msgpack.decode(payload[0])
         except Exception:
+            self._reject_handshake(sock, identity, "unparseable GET_META payload")
             return
         if not isinstance(msg, (list, tuple)) or not msg or msg[0] != GET_META_MSG:
+            self._reject_handshake(sock, identity, "not a GET_META message")
             return
         # NIXL single-listener routing (base_scheduler.py:316-322): the D side
         # addresses a specific (pp, tp) rank; serve that rank's pre-encoded
         # payload from the mapping set_xfer_handshake_metadata populated.
         if len(msg) < 3:
             logger.warning("HIXLEngine GET_META without (pp, tp): %s", msg)
+            self._reject_handshake(sock, identity, "GET_META missing (pp, tp)")
             return
         pp_rank, tp_rank = msg[1], msg[2]
         # Snapshot under the lock: the scheduler thread may re-enter
@@ -1488,9 +1542,28 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 "HIXLEngine GET_META for unknown (pp=%s, tp=%s); have %s",
                 pp_rank, tp_rank, have,
             )
+            self._reject_handshake(sock, identity, f"unknown (pp={pp_rank}, tp={tp_rank})")
             return
         perf_ts = msgspec.msgpack.encode(time.perf_counter())
         sock.send_multipart((identity, b"", handshake_bytes, perf_ts))
+
+    @staticmethod
+    def _reject_handshake(
+        sock: zmq.Socket, identity: bytes, reason: str,  # type: ignore[name-defined]
+    ) -> None:
+        """Bug-4: reply with an explicit error frame instead of silently
+        dropping a malformed GET_META. Lets the D side fail fast on the real
+        cause rather than waiting out the 5s RCVTIMEO and surfacing a
+        confusing zmq.error.Again. Frame shape mirrors the successful reply
+        (identity, b"", handshake_bytes, perf_ts) so the D-side short-reply
+        check still applies; reply[0] becomes HIXL_ERR_PREFIX + reason.
+        """
+        try:
+            sock.send_multipart(
+                (identity, b"", HIXL_ERR_PREFIX + reason.encode(), b"")
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("HIXLEngine handshake reject failed: %s", reason)
 
     # ==================================================================
     # Scheduler-side decisions delegated to HIXLEngineConnectorScheduler
@@ -1846,76 +1919,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 descs.append(TransferOpDesc(local_addr, remote_addr, chunk))
         return descs
 
-    def _local_kernel_ids_for_shard(
-        self,
-        shard_first_p_block: int,
-        num_blocks_to_pull: int,
-        shard_cp_rank: int,
-        num_prefix_p_blocks: int,
-        rank_first_d_block: int,
-        block_size_ratio: int,
-        local_cp_size: int,
-        remote_cp_size: int,
-        remote_block_size: int,
-        kernel_size: int,
-        local_block_ids: list[int],
-    ) -> list[int]:
-        """Map a CP shard's pulled P-blocks to D-side kernel block ids.
-
-        Forked from hixl_connector L2529-2591. The shard (CP rank
-        ``shard_cp_rank``) pulls ``num_blocks_to_pull`` P-blocks starting at
-        its local index ``shard_first_p_block``; the destination kernel
-        position is derived from the CP rank and block index. Under
-        r_blk==1 + scale==1 this degenerates to kernels_per_d_block==1 ->
-        kernel id == d_block.
-
-        Called from _read_blocks' CP branch (TODO: wire when CP>1 e2e is
-        validated — the single-listener handshake model routes (pp, tp)
-        with pcp folded, so CP shard params are not yet threaded here).
-        """
-        kernels_per_d_block = self._block_size // kernel_size
-        kernels_per_p_block = remote_block_size // kernel_size
-        local_token_limit = len(local_block_ids) * self._block_size
-        kernel_block_ids: list[int] = []
-        for block_idx in range(num_blocks_to_pull):
-            global_p_block = (
-                (shard_first_p_block + block_idx) * remote_cp_size
-                + shard_cp_rank
-            )
-            if remote_block_size > self._block_size:
-                p_block_token_start = (
-                    (global_p_block - num_prefix_p_blocks)
-                    * remote_block_size
-                )
-                for kernel_idx in range(kernels_per_p_block):
-                    token_offset = p_block_token_start + kernel_idx * kernel_size
-                    if token_offset >= local_token_limit:
-                        break
-                    d_block = local_block_ids[token_offset // self._block_size]
-                    kernel_in_d_block = (
-                        (token_offset % self._block_size) // kernel_size
-                    )
-                    kernel_block_ids.append(
-                        d_block * kernels_per_d_block + kernel_in_d_block
-                    )
-            else:
-                d_block_local_idx = (
-                    (global_p_block // block_size_ratio - rank_first_d_block)
-                    // local_cp_size
-                )
-                if d_block_local_idx >= len(local_block_ids):
-                    continue
-                d_block = local_block_ids[d_block_local_idx]
-                first_kernel_in_d_block = (
-                    (global_p_block % block_size_ratio) * remote_block_size
-                ) // kernel_size
-                for kernel_idx in range(kernels_per_p_block):
-                    kernel_block_ids.append(
-                        d_block * kernels_per_d_block
-                        + first_kernel_in_d_block + kernel_idx
-                    )
-        return kernel_block_ids
-
     def _read_blocks(
         self, request_id: str, req_meta: HIXLEngineReqMeta, plan: TPMapping
     ) -> None:
@@ -2045,6 +2048,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 self._recving_transfers.setdefault(
                     request_id, []
                 ).append(handle)
+                # MED-3: record this rank as a real reader so _notify_release
+                # sends DONE to it (and only it) instead of broadcasting to
+                # plan.all_source_ranks.
+                self._transferred_ranks.setdefault(
+                    request_id, set()
+                ).add(rank)
             except Exception as e:
                 logger.error(
                     "HIXLEngine transfer_async failed. req=%s rank=%s err=%s",
@@ -2089,15 +2098,20 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             # ready-queue drain / failure paths recover req state after a
             # deferred handshake.
             self._recving_metadata[req_id] = meta
-            if remote_engine_id not in self._remote_metadata:
-                # Park the req on the engine's pending list; the handshake
-                # done_callback releases it into _ready_requests on success
-                # (or _handle_failed_transfer on failure). Under
-                # _handshake_lock so it races cleanly with the done_callback.
-                with self._handshake_lock:
+            # NEW-HIGH-1: check + park under _handshake_lock so the
+            # done_callback (executor thread) cannot publish
+            # _remote_metadata and drain _pending_handshake_reqs between our
+            # check and our park — that window would strand the req in
+            # _pending_handshake_reqs forever (the callback won't fire again,
+            # _ensure_handshake no-ops on the now-published engine). RLock so
+            # _ensure_handshake's own lock acquisition re-enters cleanly.
+            with self._handshake_lock:
+                already = remote_engine_id in self._remote_metadata
+                if not already:
                     self._pending_handshake_reqs.setdefault(
                         remote_engine_id, []
                     ).append((req_id, meta))
+            if not already:
                 self._ensure_handshake(
                     remote_engine_id,
                     meta.remote.host,
@@ -2456,28 +2470,32 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     def _notify_release(self, req_id: str) -> None:
-        """Tell every P-side source rank that this req's reads are done.
+        """Tell every P-side source rank this req actually read from that its
+        reads are done.
 
         Replaces NIXL's make_prepped_xfer(notif_msg=...) auto-delivery
         (pull_worker.py:335). The P-side get_notifies() consumes
         ``("DONE", "<remote_request_id>:<world_size>")`` and decrements its
         per-req consumer counter.
+
+        MED-3: only notify ranks this request issued an async READ to
+        (``_transferred_ranks``), never broadcast to ``plan.all_source_ranks``.
+        The latter spans attn+ssm and can include ranks this D never read in
+        P_TP>D_TP / GQA-dedup cases; a spurious DONE there over-decrements the
+        P-side consumer counter and can free a block before its real consumers
+        finish. Ranks covered by a prefix-hit DONE (no transfer) were already
+        notified in _read_blocks and are skipped here to avoid a double-notify.
         """
         meta = self._recving_metadata.get(req_id)
         if meta is None:
             return
-        plan = self._tp_mappings.get(meta.remote.engine_id)
         remote_agents = self._remote_agents.get(meta.remote.engine_id, {})
-        if plan is None:
-            return
         notif_id = f"{meta.remote.request_id}:{self._world_size}"
-        # MED-3: ranks already sent a prefix-hit DONE in _read_blocks must be
-        # skipped here — the two notifies share the notif_id, so a repeat
-        # would over-decrement the P-side consumer counter.
+        # Prefix-hit ranks already got a DONE in _read_blocks.
         already_notified = self._notified_release_ranks.pop(req_id, set())
-        for rank in plan.all_source_ranks:
-            if rank in already_notified:
-                continue
+        # Real readers only (transfer_async issued in _read_blocks).
+        to_notify = self._transferred_ranks.pop(req_id, set()) - already_notified
+        for rank in to_notify:
             endpoint = remote_agents.get((0, rank))
             if endpoint is None:
                 continue
@@ -2711,6 +2729,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in done_recving:
             self._recving_metadata.pop(req_id, None)
             self._notified_release_ranks.pop(req_id, None)
+            self._transferred_ranks.pop(req_id, None)
         failed = set(self._failed_recv_reqs)
         self._failed_recv_reqs.clear()
         # Also drop metadata for reqs that failed without ever issuing a
@@ -2720,6 +2739,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in failed:
             self._recving_metadata.pop(req_id, None)
             self._notified_release_ranks.pop(req_id, None)
+            self._transferred_ranks.pop(req_id, None)
         # Lease expiry: force-release reqs whose lease lapsed before every
         # consumer reported DONE (NIXL base_worker.py:2027-2044). Full scan
         # (not NIXL's sorted-dict early-exit) — _reqs_to_send is
