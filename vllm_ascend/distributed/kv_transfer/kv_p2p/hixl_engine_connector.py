@@ -1727,6 +1727,15 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._block_len_per_layer.clear()
         self._region_is_mla.clear()
         self._region_group_idx.clear()
+        # C#26-fix: actual per-logical-block bytes from each tensor's own
+        # shape. vllm-ascend pads MambaSpec.page_size_bytes (via
+        # patch_mamba_config mamba_page_size_padded = attn_page +
+        # conv_block_page) to align mamba/attn blocks for HMA pooling, which
+        # inflates block_len_per_layer past the real ssm per-block and makes
+        # bid*stride overrun the region (503900). SSM addressing uses this
+        # real per-block instead. FA regions keep block_len_per_layer (FA
+        # page_size is not padded).
+        self._per_block_per_layer = []
         seen_base_addresses: list[int] = []
         self._kv_caches_base_addr[self._engine_id][self._tp_rank] = (
             seen_base_addresses
@@ -1797,6 +1806,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                         length, _pages, length - _pages * _stride,
                     )
                 self._block_len_per_layer.append(block_len)
+                # C#26-fix: real per-logical-block bytes from the tensor's
+                # own shape (block-0 element count * dtype size). Immune to
+                # the vllm-ascend mamba page padding; used by SSM addressing.
+                self._per_block_per_layer.append(
+                    t[0].numel() * t.element_size()
+                )
                 self._region_is_mla.append(is_mla_region)
                 self._region_group_idx.append(
                     self._layer_to_group.get(layer_name, 0)
@@ -1997,15 +2012,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             replicated = self._region_is_mla[i]
             if is_ssm_group:
                 # Mamba state: logical-id addressing (M1 skips expansion for
-                # state groups), so stride/page_size span a full logical
-                # block. conv decomp (TODO C#26) is the full path; phys==1
-                # makes this a no-op and keeps phys>1 symmetric both sides.
-                stride = (
-                    self._block_len_per_layer[i] * local_phys // block_size_ratio
-                )
-                page_size = (
-                    remote_meta.block_lens[i] * remote_physical_per_logical
-                )
+                # state groups). C#26-fix: stride/page_size use the real
+                # per-logical-block bytes from the tensor shape, NOT the
+                # padded MambaSpec.page_size_bytes (which vllm-ascend inflates
+                # to align with attn for HMA pooling — see register_kv_caches).
+                # P/D run the same model/spec, so local per_block is valid for
+                # the remote side too. conv decomp (TODO C#26) is the full
+                # 3-read path; this is the whole-block fallback.
+                per_block = self._per_block_per_layer[i]
+                stride = per_block // block_size_ratio
+                page_size = per_block
             else:
                 stride = self._block_len_per_layer[i] // block_size_ratio
                 page_size = remote_meta.block_lens[i]
