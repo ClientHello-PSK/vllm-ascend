@@ -767,6 +767,53 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             "HIXLEngineConnector: pp and pcp cannot be enabled at the "
             "same time."
         )
+        # SCHEDULER role 在 EngineCore 主进程创建,主进程既不初始化
+        # TP/PP/PCP/DCP group,也无 set_current_vllm_config() context(只有
+        # worker 进程经 init_model_parallel + set_current_vllm_config 后才有)。
+        # 而下面 worker 初始化(get_current_attn_backends / get_kv_cache_layout
+        # / _sync_block_size_with_kernel / mamba conv decomp 等)依赖这些
+        # context,在主进程必崩(见 L775 "Current vLLM config is not set")。
+        # SCHEDULER 端所有回调委托给独立的 HIXLEngineConnectorScheduler
+        # (L1620-1663),不消费 worker 初始化的字段。对齐 nixl __init__
+        # (connector.py:109-118):SCHEDULER 只建 scheduler 与握手路由表后返回,
+        # 跳过整个 worker 数据面初始化。
+        # (pp_rank, tp_rank) -> encoded HixlEngineHandshakePayload. Filled on
+        # the SCHEDULER side by set_xfer_handshake_metadata[_pp_aware] (L2843+)
+        # from the payloads each worker produced in register_kv_caches; the
+        # single listener routes GET_META requests by (pp, tp) (NIXL
+        # base_scheduler.py:316-322).
+        # P-side handshake ROUTER lifecycle + handshake serialization. Both
+        # roles build these: SCHEDULER runs the listener thread and stores
+        # handshake payloads; WORKER needs them present so shutdown() can join
+        # a (never-started, None) listener and stop the executor without
+        # AttributeError (the SCHEDULER early-return below skips the worker
+        # data-plane init that originally created these, so they must precede it).
+        self._handshake_initiation_executor = ThreadPoolExecutor(max_workers=1)
+        self._handshake_lock = threading.RLock()
+        self._handshake_stop_event = threading.Event()
+        self._handshake_listener_thread: threading.Thread | None = None
+        self._handshake_payloads: dict[tuple[int, int], bytes] = {}
+        if role == KVConnectorRole.SCHEDULER:
+            # NIXL-style single scheduler-side ROUTER listener. The base port
+            # comes from hixl_engine.side_channel_port; data_parallel_index
+            # separates DP groups (NIXL base_scheduler.py:64-68). The scheduler
+            # is constructed with this port directly (no override hack), and
+            # its request_finished writes it into kv_transfer_params.remote_port
+            # so the D-side REQ connect lands on the same port the listener
+            # binds.
+            self._side_channel_port: int = (
+                self._side_channel_port_base
+                + vllm_config.parallel_config.data_parallel_index
+            )
+            self._scheduler: HIXLEngineConnectorScheduler | None = (
+                HIXLEngineConnectorScheduler(
+                    vllm_config, self._engine_id, kv_cache_config,
+                    self._side_channel_port,
+                )
+            )
+            return
+        self._scheduler = None
+        self._side_channel_port = 0
         self._model_config = vllm_config.model_config
         self._use_mla = self._model_config.is_deepseek_mla
         self._num_kv_heads = self._model_config.get_total_num_kv_heads()
@@ -932,11 +979,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # by get_handshake_metadata. None until register_kv_caches runs.
         self._xfer_handshake_metadata: HixlEngineHandshakePayload | None = None
         self._compat_hash: str | None = None
-        # ZMQ handshake runs on a single-worker executor (hixl/hixl isn't
-        # thread-safe); mirrors NIXL base_worker.py:476-480.
-        self._handshake_initiation_executor = ThreadPoolExecutor(max_workers=1)
+        # ZMQ handshake futures. The executor and _handshake_lock are built
+        # above (before the SCHEDULER early-return) so both roles own them;
+        # only WORKER populates _handshake_futures (D-side REQ connect).
         self._handshake_futures: dict[str, Future] = {}
-        self._handshake_lock = threading.RLock()
         # req_id -> perf_counter lease expiry (P-side delayed free).
         self._reqs_to_send: dict[str, float] = {}
         # Multi-consumer done-notification counting (mirrors NIXL).
@@ -949,40 +995,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # lease when its remaining < _lease_extension, so the lease converges
         # to now+extension instead of growing unboundedly on each heartbeat.
         self._lease_extension: int = self._kv_lease_duration * 2 // 3
-        # P-side handshake ROUTER lifecycle.
-        self._handshake_stop_event = threading.Event()
-        self._handshake_listener_thread: threading.Thread | None = None
-        # Scheduler role delegates decisions to HIXLEngineConnectorScheduler
-        # (forked from NIXL pull_scheduler / base_scheduler); worker role
-        # owns the data plane (register_kv_caches / _read_blocks / polling).
-        if role == KVConnectorRole.SCHEDULER:
-            # NIXL-style single scheduler-side ROUTER listener. The base port
-            # comes from hixl_engine.side_channel_port; data_parallel_index
-            # separates DP groups (NIXL base_scheduler.py:64-68). The scheduler
-            # is constructed with this port directly (no override hack), and
-            # its request_finished writes it into kv_transfer_params.remote_port
-            # so the D-side REQ connect lands on the same port the listener
-            # binds.
-            self._side_channel_port: int = (
-                self._side_channel_port_base
-                + vllm_config.parallel_config.data_parallel_index
-            )
-            self._scheduler: HIXLEngineConnectorScheduler | None = (
-                HIXLEngineConnectorScheduler(
-                    vllm_config, self._engine_id, kv_cache_config,
-                    self._side_channel_port,
-                )
-            )
-        else:
-            self._scheduler = None
-            self._side_channel_port = 0
-
-        # (pp_rank, tp_rank) -> encoded HixlEngineHandshakePayload. Filled on
-        # the SCHEDULER side by set_xfer_handshake_metadata[_pp_aware] from
-        # the payloads each worker produced in register_kv_caches; the single
-        # listener routes GET_META requests by (pp, tp) (NIXL
-        # base_scheduler.py:316-322).
-        self._handshake_payloads: dict[tuple[int, int], bytes] = {}
+        # (P-side handshake ROUTER lifecycle — _handshake_stop_event and
+        # _handshake_listener_thread — built above, before the early-return.)
+        # (SCHEDULER early-return + _handshake_payloads + _scheduler/
+        #  _side_channel_port defaults are set above, right after the
+        #  pp/pcp assert; the worker role continues below.)
 
     # ------------------------------------------------------------------
     # Config & kernel-block-size derivation (mirrors NIXL base_worker.py
@@ -2874,14 +2891,23 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._ensure_handshake_listener()
 
     def shutdown(self):
-        # Stop the P-side handshake ROUTER listener (Step A).
+        # Stop the P-side handshake ROUTER listener (Step A). Both roles own
+        # _handshake_stop_event / _handshake_listener_thread (built before the
+        # SCHEDULER early-return), so this is safe for both.
         self._handshake_stop_event.set()
         if self._handshake_listener_thread is not None:
             self._handshake_listener_thread.join(timeout=2.0)
-        # Cancel queued handshakes; let in-flight connect() finish before we
-        # pull the engine out from under it (connect runs on this executor and
-        # takes _hixl_lock — finalizing underneath it would be a use-after-free).
+        # Cancel queued handshakes (executor shared by both roles).
         self._handshake_initiation_executor.shutdown(wait=True, cancel_futures=True)
+        # SCHEDULER role has no data plane — _wrapper / _hixl_lock /
+        # _kv_mem_handles were never built (the early-return skipped worker
+        # init). Only WORKER finalizes the hixl engine; without this guard
+        # the SCHEDULER shutdown would AttributeError on _hixl_lock.
+        if self._scheduler is not None:
+            return
+        # Let in-flight connect() finish before we pull the engine out from
+        # under it (connect runs on the executor above and takes _hixl_lock —
+        # finalizing underneath it would be a use-after-free).
         with self._hixl_lock:
             for handle, _, _ in self._kv_mem_handles.values():
                 try:
