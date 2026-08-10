@@ -1783,28 +1783,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     handle, base_addr, length,
                 )
                 seen_base_addresses.append(base_addr)
-                logger.error(
-                    "HIXLTRACE register region idx=%d layer=%s group=%d "
-                    "is_mla=%d base=0x%x length=%d end=0x%x",
-                    len(seen_base_addresses) - 1, layer_name,
-                    self._layer_to_group.get(layer_name, 0),
-                    is_mla_region, base_addr, length, base_addr + length,
-                )
-                if isinstance(layer_spec, MambaSpec):
-                    _phys = self._physical_blocks_per_logical_kv_block
-                    _stride = block_len * _phys
-                    _pages = length // _stride if _stride else -1
-                    logger.error(
-                        "HIXLTRACE mamba_struct layer=%s page_size_bytes=%d "
-                        "len_tensors=%d phys=%d physical_page_size=%d "
-                        "block_len=%d stride=%d t.shape=%s t.numel=%d "
-                        "elem_size=%d region_bytes=%d pages_in_region=%d "
-                        "remainder=%d",
-                        layer_name, layer_spec.page_size_bytes,
-                        len(tensors), _phys, physical_page_size, block_len,
-                        _stride, list(t.shape), t.numel(), t.element_size(),
-                        length, _pages, length - _pages * _stride,
-                    )
                 self._block_len_per_layer.append(block_len)
                 # C#26-fix: real per-logical-block bytes from the tensor's
                 # own shape (block-0 element count * dtype size). Immune to
@@ -1967,6 +1945,24 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         split_reads = len(plan.source_ranks_per_group[group_idx])
         local_bases = self._kv_caches_base_addr[self._engine_id][self._tp_rank]
         is_ssm_group = self._is_ssm_spec(self._group_spec_types[group_idx])
+        # P/D SSM group-count mismatch workaround (plan A): P may split SSM
+        # into N kv_cache_groups (per mamba spec) while D merges them into
+        # one. Strict group_idx matching then makes plan SSM groups 2..N find
+        # no D region (n_matched_regions=0) and their blocks never transfer,
+        # leaving D's mamba state partially empty (decode degrades to
+        # repetition). When D has exactly one SSM group, route all plan SSM
+        # groups to D's SSM regions by spec type instead of group_idx; FA
+        # always matches strictly.
+        _d_ssm_group_count = (
+            len({
+                self._region_group_idx[i]
+                for i in range(len(remote_bases))
+                if self._region_group_idx[i] < len(self._group_spec_types)
+                and self._is_ssm_spec(
+                    self._group_spec_types[self._region_group_idx[i]])
+            }) if self._has_mamba else 0
+        )
+        route_ssm_by_spec = is_ssm_group and _d_ssm_group_count == 1
         # Per-source-rank local head slot (gather scenario). split/MLA => 0.
         if is_ssm_group:
             # TODO(conv-decomp, C#26): replace with conv decomposition
@@ -2007,7 +2003,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             f"remote_block_lens={len(remote_meta.block_lens)}"
         )
         for i, remote_base in enumerate(remote_bases):
-            if self._region_group_idx[i] != group_idx:
+            if route_ssm_by_spec:
+                # D has one SSM group: route this plan SSM group to every D
+                # SSM region (P/D split mismatch workaround, plan A).
+                _ri = self._region_group_idx[i]
+                if not (
+                    _ri < len(self._group_spec_types)
+                    and self._is_ssm_spec(self._group_spec_types[_ri])
+                ):
+                    continue
+            elif self._region_group_idx[i] != group_idx:
                 continue
             replicated = self._region_is_mla[i]
             if is_ssm_group:
@@ -2035,7 +2040,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 remote_addr = remote_base + rank_offset + remote_bid * page_size
                 local_addr = local_base + local_bid * stride + slot * chunk
                 descs.append(TransferOpDesc(local_addr, remote_addr, chunk))
-            if pairs:
+            if pairs and is_ssm_group:
                 _max_lbid = max(p[0] for p in pairs)
                 _max_rbid = max(p[1] for p in pairs)
                 logger.error(
@@ -2053,12 +2058,18 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 )
         logger.error(
             "HIXLTRACE build_op_summary group_idx=%d source_rank=%d "
-            "is_ssm=%d n_matched_regions=%d n_pairs=%d "
-            "n_regions_total=%d region_groups=%s",
-            group_idx, source_rank, is_ssm_group,
-            sum(1 for j in range(len(remote_bases))
-                if self._region_group_idx[j] == group_idx),
-            len(pairs), len(remote_bases),
+            "is_ssm=%d route_by_spec=%d d_ssm_groups=%d n_matched_regions=%d "
+            "n_pairs=%d n_regions_total=%d region_groups=%s",
+            group_idx, source_rank, is_ssm_group, route_ssm_by_spec,
+            _d_ssm_group_count,
+            (sum(1 for j in range(n_regions)
+                 if self._region_group_idx[j] < len(self._group_spec_types)
+                 and self._is_ssm_spec(
+                     self._group_spec_types[self._region_group_idx[j]]))
+             if route_ssm_by_spec
+             else sum(1 for j in range(n_regions)
+                      if self._region_group_idx[j] == group_idx)),
+            len(pairs), n_regions,
             list(self._region_group_idx),
         )
         return descs
@@ -2266,10 +2277,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._connector_metadata
         if metadata is None:
             return
-        logger.error(
-            "HIXLTRACE D-start_load_kv reqs_in_batch=%d reqs_to_recv=%d",
-            len(metadata.reqs_in_batch), len(metadata.reqs_to_recv),
-        )
         for req_id in metadata.reqs_in_batch:
             self._task_tracker.add_req_to_process(req_id)
         for req_id, meta in metadata.reqs_to_recv.items():
