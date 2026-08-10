@@ -1947,6 +1947,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
 
         descs: list[TransferOpDesc] = []
         pairs = list(zip(local_block_ids, remote_block_ids))
+        if is_ssm_group and pairs:
+            logger.error(
+                "HIXLTRACE ssm_pairs group=%d source_rank=%d n_pairs=%d "
+                "slot=%d local_phys=%d remote_phys=%d block_size_ratio=%d "
+                "split_reads=%d local_bids=%s remote_bids=%s",
+                group_idx, source_rank, len(pairs),
+                slot, local_phys, remote_physical_per_logical,
+                block_size_ratio, split_reads,
+                local_block_ids, remote_block_ids,
+            )
         # Region parity (M5): P/D register_kv_caches dedup base addresses via
         # HMA pooling independently, so a layout mismatch would otherwise land
         # as a silent IndexError / wrong-region address rather than a clear
