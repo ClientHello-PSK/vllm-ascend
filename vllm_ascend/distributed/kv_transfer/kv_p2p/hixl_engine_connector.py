@@ -1781,6 +1781,21 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     self._layer_to_group.get(layer_name, 0),
                     is_mla_region, base_addr, length, base_addr + length,
                 )
+                if isinstance(layer_spec, MambaSpec):
+                    _phys = self._physical_blocks_per_logical_kv_block
+                    _stride = block_len * _phys
+                    _pages = length // _stride if _stride else -1
+                    logger.error(
+                        "HIXLTRACE mamba_struct layer=%s page_size_bytes=%d "
+                        "len_tensors=%d phys=%d physical_page_size=%d "
+                        "block_len=%d stride=%d t.shape=%s t.numel=%d "
+                        "elem_size=%d region_bytes=%d pages_in_region=%d "
+                        "remainder=%d",
+                        layer_name, layer_spec.page_size_bytes,
+                        len(tensors), _phys, physical_page_size, block_len,
+                        _stride, list(t.shape), t.numel(), t.element_size(),
+                        length, _pages, length - _pages * _stride,
+                    )
                 self._block_len_per_layer.append(block_len)
                 self._region_is_mla.append(is_mla_region)
                 self._region_group_idx.append(
