@@ -710,40 +710,59 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # Parallel / model identity (mirrors NIXL base_worker.py:470-510).
         kvtc = vllm_config.kv_transfer_config
         self._engine_id = str(kvtc.engine_id)
-        self._tp_rank = get_tensor_model_parallel_rank()
-        self._tp_size = vllm_config.parallel_config.tensor_parallel_size
-        # B2 (#22): offset the hixl listen port by tp_rank so co-located TP
-        # ranks each bind a distinct port (avoids the 503900 bind failure when
-        # the second rank rebinds the same port). The peer reads the actual
-        # port from local_engine_endpoint in the handshake metadata, so P/D
-        # stay aligned without per-rank config. TP=1 offsets by 0 (no change).
-        # TODO: extend the offset for DP>1 (currently DP=1, matching
-        # side_channel_port which also offsets by data_parallel_index only).
-        if self._local_engine_base_port > 0:
-            self._local_engine_endpoint = (
-                f"{self._local_engine_host}:"
-                f"{self._local_engine_base_port + self._tp_rank}"
-            )
-        self._world_size = get_tensor_model_parallel_world_size()
-        self._pp_rank = get_pp_group().rank_in_group
-        self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        # B2 (#19/#20/#21): CP parallel-state fields. Forked from
-        # hixl_connector L1564-1572. get_pcp_group is already imported
-        # (L43); DCP helpers are imported lazily to avoid a hard dependency
-        # when CP is unused. The single-listener handshake model (one
-        # ROUTER per (engine_id, dp_index), routing by (pp, tp)) means CP
-        # shards share the listener endpoint, so #17 _set_hma_shared_port
-        # and #22 device_index port offset — both premised on the old
-        # per-rank multi-port model — are eliminated by this architecture
-        # (TODO: per-pcp routing if non-HMA CP is ever required).
-        self._pcp_size = get_pcp_group().world_size
-        self._pcp_rank = (
-            get_pcp_group().rank_in_group if self._pcp_size > 1 else 0)
-        from vllm.distributed import get_dcp_group
-        _dcp_group = get_dcp_group()
-        self._dcp_size = _dcp_group.world_size
-        self._dcp_rank = (
-            _dcp_group.rank_in_group if self._dcp_size > 1 else 0)
+        if role == KVConnectorRole.SCHEDULER:
+            # SCHEDULER 端在 EngineCore 主进程创建,主进程不初始化
+            # TP/PP/PCP/DCP group(只有 worker 进程初始化,见
+            # parallel_state world_size=...backend=hccl)。直接调
+            # get_tensor_model_parallel_rank() 会触发 "_TP is not None"
+            # 断言。SCHEDULER 端所有 scheduler 回调委托
+            # HIXLEngineConnectorScheduler(L1601-1644),不消费 tp_rank
+            # 等并行组字段,故设默认值跳过全局组调用。_local_engine_endpoint
+            # 保持 base(SCHEDULER 不 bind,握手 payload 由 WORKER 填)。
+            self._tp_rank = 0
+            self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+            self._world_size = 1
+            self._pp_rank = 0
+            self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
+            self._pcp_size = 1
+            self._pcp_rank = 0
+            self._dcp_size = 1
+            self._dcp_rank = 0
+        else:
+            self._tp_rank = get_tensor_model_parallel_rank()
+            self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+            # B2 (#22): offset the hixl listen port by tp_rank so co-located TP
+            # ranks each bind a distinct port (avoids the 503900 bind failure when
+            # the second rank rebinds the same port). The peer reads the actual
+            # port from local_engine_endpoint in the handshake metadata, so P/D
+            # stay aligned without per-rank config. TP=1 offsets by 0 (no change).
+            # TODO: extend the offset for DP>1 (currently DP=1, matching
+            # side_channel_port which also offsets by data_parallel_index only).
+            if self._local_engine_base_port > 0:
+                self._local_engine_endpoint = (
+                    f"{self._local_engine_host}:"
+                    f"{self._local_engine_base_port + self._tp_rank}"
+                )
+            self._world_size = get_tensor_model_parallel_world_size()
+            self._pp_rank = get_pp_group().rank_in_group
+            self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
+            # B2 (#19/#20/#21): CP parallel-state fields. Forked from
+            # hixl_connector L1564-1572. get_pcp_group is already imported
+            # (L43); DCP helpers are imported lazily to avoid a hard dependency
+            # when CP is unused. The single-listener handshake model (one
+            # ROUTER per (engine_id, dp_index), routing by (pp, tp)) means CP
+            # shards share the listener endpoint, so #17 _set_hma_shared_port
+            # and #22 device_index port offset — both premised on the old
+            # per-rank multi-port model — are eliminated by this architecture
+            # (TODO: per-pcp routing if non-HMA CP is ever required).
+            self._pcp_size = get_pcp_group().world_size
+            self._pcp_rank = (
+                get_pcp_group().rank_in_group if self._pcp_size > 1 else 0)
+            from vllm.distributed import get_dcp_group
+            _dcp_group = get_dcp_group()
+            self._dcp_size = _dcp_group.world_size
+            self._dcp_rank = (
+                _dcp_group.rank_in_group if self._dcp_size > 1 else 0)
         assert not (self._pp_size > 1 and self._pcp_size > 1), (
             "HIXLEngineConnector: pp and pcp cannot be enabled at the "
             "same time."
