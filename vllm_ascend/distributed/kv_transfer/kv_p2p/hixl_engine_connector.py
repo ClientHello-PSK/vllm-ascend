@@ -639,6 +639,13 @@ class HIXLEngineConnectorScheduler:
                 blocks_expiry_time = self._reqs_need_send[request.request_id]
             block_ids = self.get_sw_clipped_blocks(block_ids)
             remote_num_tokens = request.num_computed_tokens
+        logger.info(
+            "HIXLTRACE P-request_finished req=%s is_p=%d delay_free=%d "
+            "remote_port=%d n_blocks=%s",
+            request.request_id, is_p_node, delay_free_blocks,
+            self.side_channel_port,
+            [len(g) for g in block_ids] if block_ids else [],
+        )
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,
             do_remote_decode=is_d_node,
@@ -2016,6 +2023,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         remote_agents = self._remote_agents[remote_engine_id]
         num_groups = len(req_meta.local_block_ids)
         notif_id = f"{req_meta.remote.request_id}:{self._world_size}"
+        logger.info(
+            "HIXLTRACE D-read_blocks req=%s remote_engine=%s n_groups=%d "
+            "source_ranks=%s local_blks=%s remote_blks=%s",
+            request_id, remote_engine_id, num_groups,
+            list(plan.all_source_ranks),
+            [len(g) for g in req_meta.local_block_ids],
+            [len(g) for g in (req_meta.remote.block_ids or [])],
+        )
 
         assert self._transfer_topo is not None
         remote_info = self._transfer_topo.get_engine_info(remote_engine_id)
@@ -2103,6 +2118,18 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     request_id, set()
                 ).add(rank)
                 continue
+            if group_descs:
+                _la = [d.local_addr for d in group_descs]
+                _ra = [d.remote_addr for d in group_descs]
+                _ln = [d.len for d in group_descs]
+                logger.info(
+                    "HIXLTRACE D-transfer_async req=%s rank=%d endpoint=%s "
+                    "n_descs=%d local=[0x%x..0x%x] remote=[0x%x..0x%x] "
+                    "len=[%d..%d]",
+                    request_id, rank, endpoint, len(group_descs),
+                    min(_la), max(_la), min(_ra), max(_ra),
+                    min(_ln), max(_ln),
+                )
             try:
                 with self._hixl_lock:
                     handle = self._wrapper.transfer_async(
@@ -2118,9 +2145,15 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     request_id, set()
                 ).add(rank)
             except Exception as e:
+                _la = [d.local_addr for d in group_descs] if group_descs else []
+                _ra = [d.remote_addr for d in group_descs] if group_descs else []
                 logger.error(
-                    "HIXLEngine transfer_async failed. req=%s rank=%s err=%s",
-                    request_id, rank, e,
+                    "HIXLEngine transfer_async failed. req=%s rank=%s err=%s "
+                    "endpoint=%s n_descs=%d local=[0x%x..0x%x] "
+                    "remote=[0x%x..0x%x]",
+                    request_id, rank, e, endpoint, len(group_descs),
+                    min(_la) if _la else 0, max(_la) if _la else 0,
+                    min(_ra) if _ra else 0, max(_ra) if _ra else 0,
                 )
                 # M-2: do NOT pop already-issued handles. hixl has no transfer
                 # cancel API, so popping leaks them — _pop_done_transfers never
@@ -2159,6 +2192,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._connector_metadata
         if metadata is None:
             return
+        logger.info(
+            "HIXLTRACE D-start_load_kv reqs_in_batch=%d reqs_to_recv=%d",
+            len(metadata.reqs_in_batch), len(metadata.reqs_to_recv),
+        )
         for req_id in metadata.reqs_in_batch:
             self._task_tracker.add_req_to_process(req_id)
         for req_id, meta in metadata.reqs_to_recv.items():
@@ -2350,6 +2387,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     self._handle_failed_transfer(req_id, handle)
             if not in_progress:
                 done_req_ids.add(req_id)
+                logger.info(
+                    "HIXLTRACE D-transfer_done req=%s handles=%d failed=%s",
+                    req_id, len(handles), had_failure,
+                )
                 del transfers[req_id]
                 # Only notify P to release if the req finished cleanly AND no
                 # earlier rank's transfer_async raised (M1: _read_blocks
@@ -2845,6 +2886,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         register_kv_caches). The framework ships it to the scheduler, which
         fans it out to peers via set_xfer_handshake_metadata_pp_aware.
         """
+        logger.info(
+            "HIXLTRACE P-get_handshake engine=%s has_payload=%d",
+            self._engine_id, self._xfer_handshake_metadata is not None,
+        )
         return self._xfer_handshake_metadata
 
     def set_xfer_handshake_metadata(
@@ -2890,6 +2935,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     payload
                 )
             nonempty = bool(self._handshake_payloads)
+        logger.info(
+            "HIXLTRACE P-store_handshake n_payloads=%d keys=%s side_port=%d",
+            len(self._handshake_payloads), list(self._handshake_payloads),
+            self._side_channel_port,
+        )
         # Only the P side receives worker payloads, so starting the listener
         # here binds it exactly where request_finished advertised
         # remote_port = _side_channel_port.
