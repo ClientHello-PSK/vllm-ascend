@@ -2039,15 +2039,28 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 _max_lbid = max(p[0] for p in pairs)
                 _max_rbid = max(p[1] for p in pairs)
                 logger.error(
-                    "HIXLTRACE build_op region=%d is_ssm=%d remote_base=0x%x "
-                    "local_base=0x%x stride=%d page=%d chunk=%d rank_offset=%d "
-                    "slot=%d max_rbid=%d max_remote_addr=0x%x "
-                    "max_lbid=%d max_local_addr=0x%x",
-                    i, is_ssm_group, remote_base, local_base, stride,
+                    "HIXLTRACE build_op region=%d group_idx=%d "
+                    "region_group=%d is_ssm=%d remote_base=0x%x "
+                    "local_base=0x%x stride=%d page=%d chunk=%d "
+                    "rank_offset=%d slot=%d max_rbid=%d "
+                    "max_remote_addr=0x%x max_lbid=%d "
+                    "max_local_addr=0x%x",
+                    i, group_idx, self._region_group_idx[i],
+                    is_ssm_group, remote_base, local_base, stride,
                     page_size, chunk, rank_offset, slot, _max_rbid,
                     remote_base + rank_offset + _max_rbid * page_size,
                     _max_lbid, local_base + _max_lbid * stride + slot * chunk,
                 )
+        logger.error(
+            "HIXLTRACE build_op_summary group_idx=%d source_rank=%d "
+            "is_ssm=%d n_matched_regions=%d n_pairs=%d "
+            "n_regions_total=%d region_groups=%s",
+            group_idx, source_rank, is_ssm_group,
+            sum(1 for j in range(len(remote_bases))
+                if self._region_group_idx[j] == group_idx),
+            len(pairs), len(remote_bases),
+            list(self._region_group_idx),
+        )
         return descs
 
     def _read_blocks(
