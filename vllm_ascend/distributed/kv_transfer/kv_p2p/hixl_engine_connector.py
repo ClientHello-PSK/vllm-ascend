@@ -2150,7 +2150,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         re-queue the req would be lost — the scheduler clears
         _reqs_need_recv / flips do_remote_prefill the same step.
         """
-        metadata = forward_context.connector_meta
+        # metadata comes from bind_connector_metadata (base.py:221), which the
+        # model runner calls with scheduler_output.kv_connector_metadata just
+        # before start_load_kv (kv_connector_model_runner_mixin.py:88-95). vllm
+        # never sets forward_context.connector_meta — reading it AttributeError'd
+        # ("'ForwardContext' object has no attribute 'connector_meta'"). This was
+        # masked until now because the SCHEDULER __init__ crashed earlier.
+        metadata = self._connector_metadata
         if metadata is None:
             return
         for req_id in metadata.reqs_in_batch:
