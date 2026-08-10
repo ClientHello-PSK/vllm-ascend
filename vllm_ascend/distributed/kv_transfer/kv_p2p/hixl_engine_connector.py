@@ -178,7 +178,7 @@ class KVCacheTaskTracker:
                 self._finished_requests.add(request_id)
                 self._reqs_to_process.discard(request_id)
             else:
-                logger.warning(
+                logger.error(
                     "HIXLEngine finish req not in process: %s", request_id)
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -451,7 +451,7 @@ class HIXLEngineConnectorScheduler:
         self.decoder_kv_blocks_ttl = kvtc.get_from_extra_config(
             "decoder_kv_blocks_ttl", 480
         )
-        logger.info("Initializing HIXLEngine scheduler %s", engine_id)
+        logger.error("Initializing HIXLEngine scheduler %s", engine_id)
 
     # -- heartbeat bookkeeping (fork base_scheduler.py:175-219) ----------
     def on_new_request(self, request: "Request") -> None:
@@ -597,7 +597,7 @@ class HIXLEngineConnectorScheduler:
                     self._reqs_need_recv[request.request_id] = (
                         request, local_block_ids)
                 else:
-                    logger.warning(
+                    logger.error(
                         "Got invalid KVTransferParams: %s. This request "
                         "will not utilize KVTransfer", params)
             else:
@@ -639,7 +639,7 @@ class HIXLEngineConnectorScheduler:
                 blocks_expiry_time = self._reqs_need_send[request.request_id]
             block_ids = self.get_sw_clipped_blocks(block_ids)
             remote_num_tokens = request.num_computed_tokens
-        logger.info(
+        logger.error(
             "HIXLTRACE P-request_finished req=%s is_p=%d delay_free=%d "
             "remote_port=%d n_blocks=%s",
             request.request_id, is_p_node, delay_free_blocks,
@@ -923,7 +923,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     torch.Size(mamba_spec.shapes[1]).numel() * ssm_dt
                 )
                 mamba_ssm_size = (conv_state_bytes, ssm_state_bytes)
-                logger.warning(
+                logger.error(
                     "HIXLEngine running with SD conv state layout. Safe when "
                     "P_TP == D_TP (whole-block memcpy); P_TP > D_TP reshard "
                     "with SD is unverified."
@@ -1267,7 +1267,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     remote_engine_id, []
                 )
                 self._ready_requests.extend(parked)
-            logger.info(
+            logger.error(
                 "HIXLEngine handshake ok. engine=%s ranks=%d endpoint=%s "
                 "num_blocks=%d",
                 remote_engine_id, len(meta_list),
@@ -1352,7 +1352,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             )
             # Validate layout / block-size compatibility.
             self._validate_remote_agent_handshake(peer_meta, remote_tp_size)
-        logger.info(
+        logger.error(
             "HIXLEngine connected to %s (rank pp=%d tp=%d, remote_tp_size=%d, "
             "rank_offset_factor=%d).",
             remote_engine_id, remote_pp_rank, remote_tp_rank,
@@ -1482,7 +1482,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                         endpoint, self._link_timeout_ms
                     )
             except Exception as e:  # noqa: BLE001
-                logger.warning(
+                logger.error(
                     "HIXLEngine disconnect failed for %s: %s",
                     remote_engine_id, e,
                 )
@@ -1494,7 +1494,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_caches_base_addr.pop(remote_engine_id, None)
         if self._transfer_topo is not None:
             self._transfer_topo.unregister_remote_engine(remote_engine_id)
-        logger.info("HIXLEngine evicted stale remote engine %s.", remote_engine_id)
+        logger.error("HIXLEngine evicted stale remote engine %s.", remote_engine_id)
 
     # ==================================================================
     # P-side ZMQ ROUTER handshake listener. Mirrors NIXL
@@ -1521,7 +1521,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._handshake_listener_thread = thread
         thread.start()
         if not ready_event.wait(_HIXL_ENGINE_LISTENER_READY_TIMEOUT_S):
-            logger.warning(
+            logger.error(
                 "HIXLEngine handshake listener not ready within %.1fs on %s:%d",
                 _HIXL_ENGINE_LISTENER_READY_TIMEOUT_S, host, port,
             )
@@ -1540,7 +1540,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             return
         if self._side_channel_port == 0:
-            logger.warning(
+            logger.error(
                 "HIXLEngine cannot start listener: side_channel_port is 0 "
                 "(set hixl_engine.side_channel_port)."
             )
@@ -1552,7 +1552,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         ready_event: threading.Event, stop_event: threading.Event,
     ) -> None:
         path = make_zmq_path("tcp", host, port)
-        logger.info("HIXLEngine handshake listener on %s.", path)
+        logger.error("HIXLEngine handshake listener on %s.", path)
         encoder = msgspec.msgpack.Encoder()
         try:
             with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore[arg-type]
@@ -1564,12 +1564,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     except zmq.Again:  # type: ignore[attr-defined]
                         continue
                     except zmq.ZMQError as e:  # type: ignore[attr-defined]
-                        logger.warning("HIXLEngine listener recv error: %s", e)
+                        logger.error("HIXLEngine listener recv error: %s", e)
                         continue
                     try:
                         self._handle_handshake_request(sock, frames, encoder)
                     except Exception as e:  # noqa: BLE001
-                        logger.warning("HIXLEngine listener handler error: %s", e)
+                        logger.error("HIXLEngine listener handler error: %s", e)
         except Exception as e:  # noqa: BLE001
             logger.exception("HIXLEngine handshake listener fatal: %s", e)
 
@@ -1596,7 +1596,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # addresses a specific (pp, tp) rank; serve that rank's pre-encoded
         # payload from the mapping set_xfer_handshake_metadata populated.
         if len(msg) < 3:
-            logger.warning("HIXLEngine GET_META without (pp, tp): %s", msg)
+            logger.error("HIXLEngine GET_META without (pp, tp): %s", msg)
             self._reject_handshake(sock, identity, "GET_META missing (pp, tp)")
             return
         pp_rank, tp_rank = msg[1], msg[2]
@@ -1608,7 +1608,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             handshake_bytes = self._handshake_payloads.get((pp_rank, tp_rank))
             have = list(self._handshake_payloads)
         if handshake_bytes is None:
-            logger.warning(
+            logger.error(
                 "HIXLEngine GET_META for unknown (pp=%s, tp=%s); have %s",
                 pp_rank, tp_rank, have,
             )
@@ -1633,7 +1633,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 (identity, b"", HIXL_ERR_PREFIX + reason.encode(), b"")
             )
         except Exception:  # noqa: BLE001
-            logger.warning("HIXLEngine handshake reject failed: %s", reason)
+            logger.error("HIXLEngine handshake reject failed: %s", reason)
 
     # ==================================================================
     # Scheduler-side decisions delegated to HIXLEngineConnectorScheduler
@@ -1774,6 +1774,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     handle, base_addr, length,
                 )
                 seen_base_addresses.append(base_addr)
+                logger.error(
+                    "HIXLTRACE register region idx=%d layer=%s group=%d "
+                    "is_mla=%d base=0x%x length=%d end=0x%x",
+                    len(seen_base_addresses) - 1, layer_name,
+                    self._layer_to_group.get(layer_name, 0),
+                    is_mla_region, base_addr, length, base_addr + length,
+                )
                 self._block_len_per_layer.append(block_len)
                 self._region_is_mla.append(is_mla_region)
                 self._region_group_idx.append(
@@ -1784,7 +1791,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
 
         self._build_transfer_topology(kv_caches)
         self._build_xfer_handshake_metadata()
-        logger.info(
+        logger.error(
             "HIXLEngineConnector registered %d KV regions on rank %s "
             "(num_blocks=%d, block_size=%d, layout=%s).",
             len(self._kv_mem_handles), self._tp_rank,
@@ -1987,6 +1994,19 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 remote_addr = remote_base + rank_offset + remote_bid * page_size
                 local_addr = local_base + local_bid * stride + slot * chunk
                 descs.append(TransferOpDesc(local_addr, remote_addr, chunk))
+            if pairs:
+                _max_lbid = max(p[0] for p in pairs)
+                _max_rbid = max(p[1] for p in pairs)
+                logger.error(
+                    "HIXLTRACE build_op region=%d is_ssm=%d remote_base=0x%x "
+                    "local_base=0x%x stride=%d page=%d chunk=%d rank_offset=%d "
+                    "slot=%d max_rbid=%d max_remote_addr=0x%x "
+                    "max_lbid=%d max_local_addr=0x%x",
+                    i, is_ssm_group, remote_base, local_base, stride,
+                    page_size, chunk, rank_offset, slot, _max_rbid,
+                    remote_base + rank_offset + _max_rbid * page_size,
+                    _max_lbid, local_base + _max_lbid * stride + slot * chunk,
+                )
         return descs
 
     def _read_blocks(
@@ -2023,7 +2043,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         remote_agents = self._remote_agents[remote_engine_id]
         num_groups = len(req_meta.local_block_ids)
         notif_id = f"{req_meta.remote.request_id}:{self._world_size}"
-        logger.info(
+        logger.error(
             "HIXLTRACE D-read_blocks req=%s remote_engine=%s n_groups=%d "
             "source_ranks=%s local_blks=%s remote_blks=%s",
             request_id, remote_engine_id, num_groups,
@@ -2122,7 +2142,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 _la = [d.local_addr for d in group_descs]
                 _ra = [d.remote_addr for d in group_descs]
                 _ln = [d.len for d in group_descs]
-                logger.info(
+                logger.error(
                     "HIXLTRACE D-transfer_async req=%s rank=%d endpoint=%s "
                     "n_descs=%d local=[0x%x..0x%x] remote=[0x%x..0x%x] "
                     "len=[%d..%d]",
@@ -2192,7 +2212,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._connector_metadata
         if metadata is None:
             return
-        logger.info(
+        logger.error(
             "HIXLTRACE D-start_load_kv reqs_in_batch=%d reqs_to_recv=%d",
             len(metadata.reqs_in_batch), len(metadata.reqs_to_recv),
         )
@@ -2387,7 +2407,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     self._handle_failed_transfer(req_id, handle)
             if not in_progress:
                 done_req_ids.add(req_id)
-                logger.info(
+                logger.error(
                     "HIXLTRACE D-transfer_done req=%s handles=%d failed=%s",
                     req_id, len(handles), had_failure,
                 )
@@ -2432,7 +2452,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # let the direct ND write stand (only correct when HCCL scatter-writes
         # NZ offsets, which is the non-NZ fast path anyway).
         if self._tp_size > 1:
-            logger.warning(
+            logger.error(
                 "HIXLEngine enable_kv_nz with TP=%d: NZ reformat is TP=1 only; "
                 "skipping NZ reformat and relying on direct ND write.",
                 self._tp_size,
@@ -2797,7 +2817,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             if not any_waiting:
                 return
             time.sleep(0.001)
-        logger.warning(
+        logger.error(
             "HIXLEngine wait_for_layer_load timed out after %sms for %s; "
             "leaving in-flight handles for get_finished to mark failed.",
             self._transfer_timeout_ms, layer_name,
@@ -2858,7 +2878,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in [rid for rid, exp in self._reqs_to_send.items()
                        if now >= exp]:
             count = self._consumer_notification_counts_by_req.pop(req_id, 0)
-            logger.warning(
+            logger.error(
                 "HIXLEngine releasing expired KV blocks for request %s "
                 "retrieved by %d consumer(s) before lease expired.",
                 req_id, count,
@@ -2886,7 +2906,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         register_kv_caches). The framework ships it to the scheduler, which
         fans it out to peers via set_xfer_handshake_metadata_pp_aware.
         """
-        logger.info(
+        logger.error(
             "HIXLTRACE P-get_handshake engine=%s has_payload=%d",
             self._engine_id, self._xfer_handshake_metadata is not None,
         )
@@ -2935,7 +2955,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     payload
                 )
             nonempty = bool(self._handshake_payloads)
-        logger.info(
+        logger.error(
             "HIXLTRACE P-store_handshake n_payloads=%d keys=%s side_port=%d",
             len(self._handshake_payloads), list(self._handshake_payloads),
             self._side_channel_port,
