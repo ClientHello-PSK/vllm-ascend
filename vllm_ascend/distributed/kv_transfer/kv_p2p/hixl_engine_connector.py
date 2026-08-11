@@ -2327,16 +2327,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._read_blocks(req_id, meta, plan)
 
         # Drain reqs whose handshakes finished (this step or a prior one) —
-        # NIXL pull_worker.py:78-79.
-        while self._ready_requests:
-            rid, rmeta = self._ready_requests.popleft()
-            plan = self._tp_mappings.get(rmeta.remote.engine_id)
-            if plan is None:
-                # Engine evicted while parked; surface as failure so the
-                # scheduler recomputes the blocks.
-                self._handle_failed_transfer(rid, None)
-                continue
-            self._read_blocks(rid, rmeta, plan)
+        # NIXL pull_worker.py:78-79. Also drained from get_finished so a
+        # handshake that lands during this step's forward issues its READ at
+        # step end instead of waiting for the next step's start_load_kv
+        # (saves one step of KV-read latency on the cold-start path).
+        self._drain_ready_requests()
 
         # Drop aborted reqs from the in-process set (NIXL pull_worker:90-94).
         for req_id in metadata.reqs_not_processed:
@@ -2351,6 +2346,30 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # D-side: extend P-side leases for reqs still WAITING in scheduler
         # (NIXL pull_worker:101-103).
         self._send_heartbeats(metadata)
+
+    def _drain_ready_requests(self) -> None:
+        """Issue READ for reqs released by handshake done_callbacks.
+
+        Pulled out of start_load_kv so get_finished can also drain mid-step:
+        if a handshake completes during this step's forward, its parked req
+        is already in _ready_requests by step end. Draining here issues the
+        READ one step earlier than waiting for the next start_load_kv,
+        shaving KV-read latency off the cold-start path (TTFT). Same worker
+        thread as start_load_kv, so _read_blocks / _hixl_lock semantics are
+        unchanged. _ready_requests is extend()ed under _handshake_lock by the
+        done_callback on the executor thread and popleft()ed here without
+        the lock — same pattern as the original start_load_kv drain (deque
+        append/popleft is atomic under CPython's GIL).
+        """
+        while self._ready_requests:
+            rid, rmeta = self._ready_requests.popleft()
+            plan = self._tp_mappings.get(rmeta.remote.engine_id)
+            if plan is None:
+                # Engine evicted while parked; surface as failure so the
+                # scheduler recomputes the blocks.
+                self._handle_failed_transfer(rid, None)
+                continue
+            self._read_blocks(rid, rmeta, plan)
 
     def _apply_prefix_caching(
         self,
@@ -2885,48 +2904,61 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         avoid an infinite loop on a stuck handle.
         """
         deadline = time.perf_counter() + self._transfer_timeout_ms / 1000.0
+        backoff = 0.001
         while time.perf_counter() < deadline:
             any_waiting = False
-            # Snapshot the req ids: replacing a handle list below can't
-            # trigger "dictionary changed size" while iterating.
-            for req_id in list(self._recving_transfers.keys()):
-                handles = self._recving_transfers[req_id]
-                still_in_flight: list[int] = []
-                for h in list(handles):
-                    try:
-                        with self._hixl_lock:
+            # Coarse-grained lock: hold _hixl_lock across the whole sweep
+            # instead of per-handle (N acquisitions -> 1). Safe because this
+            # method, _read_blocks (start_load_kv) and _pop_done_transfers
+            # (get_finished) all run in the same worker thread, never
+            # concurrently; the only contender is the handshake thread's
+            # connect(), which is not hot (once per engine) and tolerates a
+            # brief block. sleep is kept outside the lock so we don't hold
+            # it while idle-polling.
+            with self._hixl_lock:
+                # Snapshot the req ids: replacing a handle list below can't
+                # trigger "dictionary changed size" while iterating.
+                for req_id in list(self._recving_transfers.keys()):
+                    handles = self._recving_transfers[req_id]
+                    still_in_flight: list[int] = []
+                    for h in list(handles):
+                        try:
                             status = self._wrapper.get_transfer_status(h)
-                    except Exception as e:
-                        # 103900 == HIXL_PARAM_INVALID: handle already
-                        # consumed (returned COMPLETED earlier) — treat as
-                        # done and drop. The C++ binding raises this via
-                        # py::register_exception<HixlError> as the message
-                        # "<ctx> failed, code=103900"; the code member is not
-                        # exposed as a Python attribute, so match the text too.
-                        # Other errors are real; keep the handle for
-                        # _pop_done_transfers to mark failed.
-                        if (getattr(e, "code", None) == 103900
-                                or "code=103900" in str(e)):
+                        except Exception as e:
+                            # 103900 == HIXL_PARAM_INVALID: handle already
+                            # consumed (returned COMPLETED earlier) — treat as
+                            # done and drop. The C++ binding raises this via
+                            # py::register_exception<HixlError> as the message
+                            # "<ctx> failed, code=103900"; the code member is not
+                            # exposed as a Python attribute, so match the text
+                            # too. Other errors are real; keep the handle for
+                            # _pop_done_transfers to mark failed.
+                            if (getattr(e, "code", None) == 103900
+                                    or "code=103900" in str(e)):
+                                continue
+                            any_waiting = True
+                            still_in_flight.append(h)
                             continue
-                        any_waiting = True
+                        sname = self._transfer_status_name(status)
+                        if sname == "COMPLETED":
+                            # Consumed by hixl — drop so the drafter forward and
+                            # _pop_done_transfers don't re-query a freed handle.
+                            continue
+                        if sname == "WAITING":
+                            any_waiting = True
+                            still_in_flight.append(h)
+                            continue
+                        # FAILED / TIMEOUT / unknown: leave for get_finished
+                        # to mark failed via _pop_done_transfers.
                         still_in_flight.append(h)
-                        continue
-                    sname = self._transfer_status_name(status)
-                    if sname == "COMPLETED":
-                        # Consumed by hixl — drop so the drafter forward and
-                        # _pop_done_transfers don't re-query a freed handle.
-                        continue
-                    if sname == "WAITING":
-                        any_waiting = True
-                        still_in_flight.append(h)
-                        continue
-                    # FAILED / TIMEOUT / unknown: leave for get_finished to
-                    # mark failed via _pop_done_transfers.
-                    still_in_flight.append(h)
-                self._recving_transfers[req_id] = still_in_flight
+                    self._recving_transfers[req_id] = still_in_flight
             if not any_waiting:
                 return
-            time.sleep(0.001)
+            # Exponential backoff (1ms -> 8ms cap) instead of a fixed 1ms
+            # busy poll. All-COMPLETED returns above without sleeping.
+            # deadline (_transfer_timeout_ms, default 60s) is unaffected.
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 0.008)
         logger.error(
             "HIXLEngine wait_for_layer_load timed out after %sms for %s; "
             "leaving in-flight handles for get_finished to mark failed.",
@@ -2980,6 +3012,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._recving_metadata.pop(req_id, None)
             self._notified_release_ranks.pop(req_id, None)
             self._transferred_ranks.pop(req_id, None)
+        # Drain reqs whose handshakes finished during this step's forward:
+        # issue their READ at step end so next step's wait_for_layer_load
+        # sees COMPLETED handles sooner (one less step of cold-start KV-read
+        # latency). See _drain_ready_requests.
+        self._drain_ready_requests()
         # Lease expiry: force-release reqs whose lease lapsed before every
         # consumer reported DONE (NIXL base_worker.py:2027-2044). Full scan
         # (not NIXL's sorted-dict early-exit) — _reqs_to_send is
