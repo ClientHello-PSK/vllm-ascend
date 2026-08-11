@@ -25,8 +25,8 @@ HIXLEngineConnectorMetadata / HIXLEngineConnectorScheduler / handshake payload
 / zmq_ctx / KVCacheTaskTracker) is forked from NIXL and self-contained in this
 module. No RecvingThread — transfers are async and handles are polled in
 get_finished / wait_for_layer_load on the worker main thread. Outstanding
-TODOs: C#26 Mamba conv decomposition, H-2 heterogeneous block_size reshard
-(desc decoupling), CP>1 (#19/#20), and the items logged inline.
+TODOs: Mamba conv decomposition, heterogeneous block_size reshard
+(desc decoupling), CP>1, and the items logged inline.
 """
 
 from __future__ import annotations
@@ -109,12 +109,8 @@ logger = logging.getLogger(__name__)
 # DONE_RECVING_MSG side-channel constant here.
 # ---------------------------------------------------------------------------
 GET_META_MSG = b"get_meta_msg"
-# Bug-4: error-reply marker for a malformed GET_META handshake. The P-side
-# listener replies with ("", b"", b"__HIXL_ERR__" + msg, b"") instead of
-# silently dropping the frame, so the D side fails fast on the real cause
-# rather than waiting out the 5s RCVTIMEO and surfacing a confusing
-# zmq.error.Again. A normal reply's handshake_bytes is msgpack-encoded and can
-# never start with this ASCII prefix.
+# Error-reply marker for a malformed GET_META handshake. A normal reply's
+# handshake_bytes is msgpack-encoded and never starts with this ASCII prefix.
 HIXL_ERR_PREFIX = b"__HIXL_ERR__"
 
 
@@ -165,10 +161,10 @@ class KVCacheTaskTracker:
             self._reqs_to_process.discard(request_id)
 
     def __contains__(self, request_id: str) -> bool:
-        # M-4: _get_new_notifs uses this to distinguish a premature DONE
-        # (D finished reading before this P worker's request_finished moved
-        # the req into _reqs_to_send) from a truly unknown/expired req, so
-        # the former is a debug log, not an error.
+        # _get_new_notifs uses this to distinguish a premature DONE (D finished
+        # reading before this P worker's request_finished moved the req into
+        # _reqs_to_send) from a truly unknown/expired req; the former is a
+        # debug log, not an error.
         with self._lock:
             return request_id in self._reqs_to_process
 
@@ -178,7 +174,7 @@ class KVCacheTaskTracker:
                 self._finished_requests.add(request_id)
                 self._reqs_to_process.discard(request_id)
             else:
-                logger.error(
+                logger.warning(
                     "HIXLEngine finish req not in process: %s", request_id)
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -237,7 +233,7 @@ class HixlEngineHandshakePayload(msgspec.Struct, omit_defaults=True):
     agent_metadata_bytes: bytes
 
 
-# M-6: msgspec.Struct and ABC have incompatible metaclasses, so the payload
+# msgspec.Struct and ABC have incompatible metaclasses, so the payload
 # cannot directly inherit KVConnectorHandshakeMetadata (the way NIXL's
 # @dataclass NixlHandshakePayload does). Register it as a virtual subclass
 # so isinstance(payload, KVConnectorHandshakeMetadata) holds for any framework
@@ -421,8 +417,8 @@ class HIXLEngineConnectorScheduler:
             isinstance(g.kv_cache_spec, MambaSpec)
             for g in kv_cache_config.kv_cache_groups
         )
-        # B1 (#24/#25): compress-aware truncation. Mamba state groups already
-        # force N-1 truncation; models with compress_ratios (e.g. hybrid
+        # Compress-aware truncation. Mamba state groups already force N-1
+        # truncation; models with compress_ratios (e.g. hybrid
         # attention/compress) need it too. Forked from hixl_connector L1316-1319.
         self._use_compress = self._model_uses_compress()
         self._need_truncate = self._use_compress or self._has_mamba
@@ -451,7 +447,7 @@ class HIXLEngineConnectorScheduler:
         self.decoder_kv_blocks_ttl = kvtc.get_from_extra_config(
             "decoder_kv_blocks_ttl", 480
         )
-        logger.error("Initializing HIXLEngine scheduler %s", engine_id)
+        logger.info("Initializing HIXLEngine scheduler %s", engine_id)
 
     # -- heartbeat bookkeeping (fork base_scheduler.py:175-219) ----------
     def on_new_request(self, request: "Request") -> None:
@@ -497,7 +493,7 @@ class HIXLEngineConnectorScheduler:
         )
 
     # -- truncate helpers (fork hixl_connector L1337-1369) ---------------
-    # B1 (#24/#25): covers both Mamba state groups and compress-ratio models.
+    # Covers both Mamba state groups and compress-ratio models.
     def _model_uses_compress(self) -> bool:
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
         compress_ratios = getattr(hf_config, "compress_ratios", None)
@@ -639,7 +635,7 @@ class HIXLEngineConnectorScheduler:
                 blocks_expiry_time = self._reqs_need_send[request.request_id]
             block_ids = self.get_sw_clipped_blocks(block_ids)
             remote_num_tokens = request.num_computed_tokens
-        logger.error(
+        logger.debug(
             "HIXLTRACE P-request_finished req=%s is_p=%d delay_free=%d "
             "remote_port=%d n_blocks=%s",
             request.request_id, is_p_node, delay_free_blocks,
@@ -718,14 +714,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         kvtc = vllm_config.kv_transfer_config
         self._engine_id = str(kvtc.engine_id)
         if role == KVConnectorRole.SCHEDULER:
-            # SCHEDULER 端在 EngineCore 主进程创建,主进程不初始化
-            # TP/PP/PCP/DCP group(只有 worker 进程初始化,见
-            # parallel_state world_size=...backend=hccl)。直接调
-            # get_tensor_model_parallel_rank() 会触发 "_TP is not None"
-            # 断言。SCHEDULER 端所有 scheduler 回调委托
-            # HIXLEngineConnectorScheduler(L1601-1644),不消费 tp_rank
-            # 等并行组字段,故设默认值跳过全局组调用。_local_engine_endpoint
-            # 保持 base(SCHEDULER 不 bind,握手 payload 由 WORKER 填)。
+            # SCHEDULER 在 EngineCore 主进程创建,主进程未初始化并行组,
+            # 调 get_tensor_model_parallel_rank() 会触发 "_TP is not None"
+            # 断言。SCHEDULER 回调委托 HIXLEngineConnectorScheduler,不消费
+            # tp_rank 等字段,故设默认值跳过。_local_engine_endpoint 保持
+            # base(SCHEDULER 不 bind,握手 payload 由 WORKER 填)。
             self._tp_rank = 0
             self._tp_size = vllm_config.parallel_config.tensor_parallel_size
             self._world_size = 1
@@ -738,11 +731,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             self._tp_rank = get_tensor_model_parallel_rank()
             self._tp_size = vllm_config.parallel_config.tensor_parallel_size
-            # B2 (#22): offset the hixl listen port by tp_rank so co-located TP
-            # ranks each bind a distinct port (avoids the 503900 bind failure when
-            # the second rank rebinds the same port). The peer reads the actual
-            # port from local_engine_endpoint in the handshake metadata, so P/D
-            # stay aligned without per-rank config. TP=1 offsets by 0 (no change).
+            # Offset the hixl listen port by tp_rank so co-located TP ranks
+            # each bind a distinct port (avoids the 503900 bind failure when
+            # the second rank rebinds the same port). The peer reads the
+            # actual port from local_engine_endpoint in the handshake
+            # metadata, so P/D stay aligned without per-rank config. TP=1
+            # offsets by 0 (no change).
             # TODO: extend the offset for DP>1 (currently DP=1, matching
             # side_channel_port which also offsets by data_parallel_index only).
             if self._local_engine_base_port > 0:
@@ -753,15 +747,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._world_size = get_tensor_model_parallel_world_size()
             self._pp_rank = get_pp_group().rank_in_group
             self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
-            # B2 (#19/#20/#21): CP parallel-state fields. Forked from
-            # hixl_connector L1564-1572. get_pcp_group is already imported
-            # (L43); DCP helpers are imported lazily to avoid a hard dependency
-            # when CP is unused. The single-listener handshake model (one
-            # ROUTER per (engine_id, dp_index), routing by (pp, tp)) means CP
-            # shards share the listener endpoint, so #17 _set_hma_shared_port
-            # and #22 device_index port offset — both premised on the old
-            # per-rank multi-port model — are eliminated by this architecture
-            # (TODO: per-pcp routing if non-HMA CP is ever required).
+            # CP parallel-state fields. Forked from hixl_connector L1564-1572.
+            # get_pcp_group is already imported (L43); DCP helpers are imported
+            # lazily to avoid a hard dependency when CP is unused. The
+            # single-listener handshake model (one ROUTER per (engine_id,
+            # dp_index), routing by (pp, tp)) means CP shards share the
+            # listener endpoint, so the old per-rank multi-port offset is
+            # eliminated by this architecture (TODO: per-pcp routing if
+            # non-HMA CP is ever required).
             self._pcp_size = get_pcp_group().world_size
             self._pcp_rank = (
                 get_pcp_group().rank_in_group if self._pcp_size > 1 else 0)
@@ -774,15 +767,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             "HIXLEngineConnector: pp and pcp cannot be enabled at the "
             "same time."
         )
-        # SCHEDULER role 在 EngineCore 主进程创建,主进程既不初始化
-        # TP/PP/PCP/DCP group,也无 set_current_vllm_config() context(只有
-        # worker 进程经 init_model_parallel + set_current_vllm_config 后才有)。
-        # 而下面 worker 初始化(get_current_attn_backends / get_kv_cache_layout
-        # / _sync_block_size_with_kernel / mamba conv decomp 等)依赖这些
-        # context,在主进程必崩(见 L775 "Current vLLM config is not set")。
-        # SCHEDULER 端所有回调委托给独立的 HIXLEngineConnectorScheduler
-        # (L1620-1663),不消费 worker 初始化的字段。对齐 nixl __init__
-        # (connector.py:109-118):SCHEDULER 只建 scheduler 与握手路由表后返回,
+        # SCHEDULER role 在 EngineCore 主进程创建,无并行组与
+        # set_current_vllm_config() context(worker 进程经
+        # init_model_parallel 后才有)。下面 worker 初始化
+        # (get_current_attn_backends / get_kv_cache_layout /
+        # _sync_block_size_with_kernel / mamba conv decomp)依赖这些
+        # context,主进程必崩。SCHEDULER 回调委托独立
+        # HIXLEngineConnectorScheduler,不消费 worker 字段,故对齐
+        # nixl __init__:SCHEDULER 只建 scheduler 与握手路由表后返回,
         # 跳过整个 worker 数据面初始化。
         # (pp_rank, tp_rank) -> encoded HixlEngineHandshakePayload. Filled on
         # the SCHEDULER side by set_xfer_handshake_metadata[_pp_aware] (L2843+)
@@ -865,11 +857,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._engine_id: {self._tp_rank: []}
         }
         self._device_id: int = 0
-        # B4 (#9): NZ layout reformat fallback. Filled from AscendConfig in
+        # NZ layout reformat fallback. Filled from AscendConfig in
         # register_kv_caches. When HCCL cannot scatter-write NZ offsets the
         # D cache is ND after transfer and must be reformatted to NZ.
         self._enable_kv_nz: bool = False
-        # B4: layer_name -> KV tensor(s). Saved in register_kv_caches so
+        # layer_name -> KV tensor(s). Saved in register_kv_caches so
         # _apply_nz_reformat can operate on the D real cache post-transfer.
         self._kv_caches: dict[str, Any] = {}
         self._has_mamba: bool = any(
@@ -878,7 +870,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # Conv state sub-projection decomposition (None when no Mamba). Mirrors
         # NIXL base_worker.py:292-321. ssm_sizes is shipped in the handshake so
         # the peer can address conv/ssm regions; the per-region conv offsets are
-        # consumed by _build_op_descs' SSM branch (TODO(conv-decomp, C#26): port the
+        # consumed by _build_op_descs' SSM branch (TODO(conv-decomp): port the
         # remote_conv_offsets addressing once a Mamba model is available to
         # validate the DS-layout assumption on NPU).
         self._conv_decomp: MambaConvSplitInfo | None = None
@@ -896,20 +888,19 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             if is_conv_state_dim_first():
                 # DS 布局:走 NIXL 3-read 子投影分解取 ssm_sizes。hixl 尚未
                 # 移植子投影传输路径(_build_op_descs 走整块线性寻址,见
-                # TODO C#26),保留 decomp 备后续移植。
+                # TODO),保留 decomp 备后续移植。
                 self._conv_decomp = derive_mamba_conv_split(
                     mamba_spec, self._tp_size
                 )
                 mamba_ssm_size = self._conv_decomp.ssm_sizes
             else:
-                # SD 布局放宽:Ascend npu_causal_conv1d_custom 算子硬性要求
-                # convStates=(num_cache_lines, state_len, dim),与原 DS 断言
-                # 冲突。hixl 的整块传输路径(_build_op_descs SSM 分支)与
-                # ssm_sizes 均布局无关,故 SD 下不再强制 DS。不调用
-                # derive_mamba_conv_split(其内部断言要求 DS,且 hixl 未用其
-                # 子投影偏移),仅按布局无关的 numel*dtype_size 算 ssm_sizes,
-                # 不影响 nixl 共享路径。P_TP==D_TP 时整块 memcpy 安全;
-                # P_TP>D_TP reshard 下 slot*chunk 线性寻址假设 DS,SD 未验证。
+                # SD 布局:Ascend npu_causal_conv1d_custom 要求
+                # convStates=(num_cache_lines, state_len, dim),与 DS 断言
+                # 冲突。hixl 整块传输与 ssm_sizes 均布局无关,故 SD 下不
+                # 强制 DS,不调 derive_mamba_conv_split(其内部断言要求 DS),
+                # 仅按 numel*dtype_size 算 ssm_sizes。P_TP==D_TP 整块 memcpy
+                # 安全;P_TP>D_TP reshard 下 slot*chunk 线性寻址假设 DS,SD
+                # 未验证。
                 conv_dt = torch.tensor(
                     [], dtype=mamba_spec.dtypes[0]
                 ).element_size()
@@ -923,7 +914,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     torch.Size(mamba_spec.shapes[1]).numel() * ssm_dt
                 )
                 mamba_ssm_size = (conv_state_bytes, ssm_state_bytes)
-                logger.error(
+                logger.warning(
                     "HIXLEngine running with SD conv state layout. Safe when "
                     "P_TP == D_TP (whole-block memcpy); P_TP > D_TP reshard "
                     "with SD is unverified."
@@ -949,27 +940,19 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._recving_transfers: dict[str, list[int]] = {}
         # request_id -> HIXLEngineReqMeta (for failure recovery / post-process)
         self._recving_metadata: dict[str, HIXLEngineReqMeta] = {}
-        # HIGH-1: reqs whose handshake hadn't landed when start_load_kv first
-        # saw them. The scheduler clears _reqs_need_recv / flips
-        # do_remote_prefill the same step, so without this ready-queue the
-        # req's KV read is lost. _pending_handshake_reqs parks them per
-        # engine; the handshake done_callback releases them into
-        # _ready_requests, which start_load_kv drains next step (NIXL
+        # Reqs whose handshake hadn't landed yet are parked on
+        # _pending_handshake_reqs per engine; the handshake done_callback
+        # releases them into _ready_requests, drained next step (NIXL
         # pull_worker.py:66-79).
         self._ready_requests: deque[tuple[str, "HIXLEngineReqMeta"]] = deque()
         self._pending_handshake_reqs: dict[
             str, list[tuple[str, "HIXLEngineReqMeta"]]
         ] = {}
-        # MED-3: ranks already sent a prefix-hit DONE in _read_blocks, so
-        # _notify_release skips them to avoid a double-notify that would
-        # over-decrement the P-side consumer counter.
+        # Ranks already sent a prefix-hit DONE in _read_blocks; _notify_release
+        # skips them to avoid a double-notify.
         self._notified_release_ranks: dict[str, set[int]] = {}
-        # MED-3: ranks this request actually issued an async READ to. Used by
-        # _notify_release to send DONE only to real readers instead of
-        # broadcasting to plan.all_source_ranks (which spans attn+ssm and can
-        # include ranks this D never read in P_TP>D_TP / GQA-dedup cases — a
-        # spurious DONE there over-decrements the P-side consumer counter and
-        # can free a block before its real consumers finish).
+        # Ranks this request actually issued an async READ to; _notify_release
+        # sends DONE to these real readers only.
         self._transferred_ranks: dict[str, set[int]] = {}
         # request_id -> failed flag (for get_block_ids_with_load_errors)
         self._failed_recv_reqs: set[str] = set()
@@ -1035,7 +1018,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 "hixl_engine.local_engine (host:port for hixl Initialize)."
             )
         # Split host:port now; the per-rank endpoint is resolved in __init__
-        # once tp_rank is known (B2 #22: co-located TP ranks must not share one
+        # once tp_rank is known (co-located TP ranks must not share one
         # listen port, or the second rank's Hixl Initialize bind fails with
         # 503900). The peer learns the actual port from the local_engine_endpoint
         # field in the handshake metadata, so P/D stay aligned without per-rank
@@ -1141,9 +1124,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                         f"HIXLEngine handshake short reply: {len(reply)} frames"
                     )
                 handshake_bytes = reply[0]
-                # Bug-4: surface a P-side malformed-request rejection (error
-                # reply frame) immediately instead of a misleading 5s RCVTIMEO
-                # timeout.
                 if handshake_bytes.startswith(HIXL_ERR_PREFIX):
                     raise RuntimeError(
                         "HIXLEngine handshake rejected by remote: "
@@ -1187,7 +1167,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         On success, also Connect to every peer rank and compute the TP
         mapping (Step C). Mirrors NIXL base_worker.py:840-896.
         """
-        # Evict engines past their TTL before adding a new one (M3: mirrors
+        # Evict engines past their TTL before adding a new one (mirrors
         # NIXL base_worker.py:858 — otherwise stale peers accumulate).
         self._evict_stale_engines()
         with self._handshake_lock:
@@ -1212,15 +1192,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 with self._handshake_lock:
                     self._handshake_futures.pop(remote_engine_id, None)
-                    # NEW-MED-2: defer failure handling to the main thread.
-                    # _handle_failed_transfer writes _failed_recv_reqs /
-                    # _invalid_block_ids and reads _recving_metadata, all of
-                    # which get_finished (main thread) also touches — calling
-                    # it here on the executor thread races on those
-                    # sets/dicts. Park on _ready_requests; the drain in
-                    # start_load_kv finds plan is None (handshake failed, no
-                    # _tp_mappings entry) and routes to _handle_failed_transfer
-                    # on the main thread.
+                    # Defer failure handling to the main thread: park on
+                    # _ready_requests; start_load_kv finds plan is None and
+                    # routes to _handle_failed_transfer there.
                     parked = self._pending_handshake_reqs.pop(
                         remote_engine_id, []
                     )
@@ -1244,8 +1218,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 self._cleanup_remote_engine(remote_engine_id)
                 with self._handshake_lock:
                     self._handshake_futures.pop(remote_engine_id, None)
-                    # NEW-MED-2: same as handshake-failure path above — defer
-                    # to the main thread via _ready_requests.
+                    # Defer to the main thread via _ready_requests (same as
+                    # the handshake-failure path above).
                     parked = self._pending_handshake_reqs.pop(
                         remote_engine_id, []
                     )
@@ -1259,15 +1233,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 self._engine_clock_offset[remote_engine_id] = offset
                 self._remote_engine_last_seen[remote_engine_id] = time.perf_counter()
                 self._handshake_futures.pop(remote_engine_id, None)
-                # HIGH-1: release reqs parked on this engine's handshake into
-                # the ready queue; start_load_kv drains them next step (NIXL
-                # pull_worker.py:78-79). Under _handshake_lock so the park in
-                # start_load_kv and this release are mutually exclusive.
+                # Release parked reqs into the ready queue under
+                # _handshake_lock so the park in start_load_kv and this
+                # release are mutually exclusive (NIXL pull_worker.py:78-79).
                 parked = self._pending_handshake_reqs.pop(
                     remote_engine_id, []
                 )
                 self._ready_requests.extend(parked)
-            logger.error(
+            logger.info(
                 "HIXLEngine handshake ok. engine=%s ranks=%d endpoint=%s "
                 "num_blocks=%d",
                 remote_engine_id, len(meta_list),
@@ -1300,8 +1273,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         assert self._transfer_topo is not None, (
             "register_kv_caches must run before handshake completion"
         )
-        # M6: pull mode addresses by region index assuming P/D region arrays
-        # line up 1:1, which only holds for pipeline_parallel_size==1 (single
+        # Pull mode addresses by region index assuming P/D region arrays line
+        # up 1:1, which only holds for pipeline_parallel_size==1 (single
         # stage). NIXL slices remote base/block_lens by PP stage
         # (base_worker.py:1537-1550); that is not ported here, so fail closed
         # rather than land a confusing region-parity IndexError downstream.
@@ -1352,7 +1325,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             )
             # Validate layout / block-size compatibility.
             self._validate_remote_agent_handshake(peer_meta, remote_tp_size)
-        logger.error(
+        logger.info(
             "HIXLEngine connected to %s (rank pp=%d tp=%d, remote_tp_size=%d, "
             "rank_offset_factor=%d).",
             remote_engine_id, remote_pp_rank, remote_tp_rank,
@@ -1395,13 +1368,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 f"Mamba hybrids. local={self._physical_blocks_per_logical_kv_block}"
                 f" remote={remote_phys}. Disable --enable-prefix-caching."
             )
-        # L4: per-region block_len compatibility (mirrors NIXL
-        # base_worker.py:1790-1818). A silent mismatch would otherwise land
-        # as a wrong address in _build_op_descs; surface it here instead.
-        # M-1: the previous ``lb*block_size_ratio == rb or is_mla`` form
-        # dropped the head-ratio factor and mis-fired on GQA SPLIT regions
-        # (local holds a head slice, remote the full block) — branch like
-        # NIXL: replicated / tp_ratio>0 (D_TP>=P_TP) / tp_ratio<0 (P_TP>D_TP).
+        # Per-region block_len compatibility (mirrors NIXL
+        # base_worker.py:1790-1818). Branch like NIXL: replicated /
+        # tp_ratio>0 (D_TP>=P_TP) / tp_ratio<0 (P_TP>D_TP).
         remote_bl = peer_meta.block_lens
         local_bl = self._block_len_per_layer
         if remote_bl and local_bl:
@@ -1494,7 +1463,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_caches_base_addr.pop(remote_engine_id, None)
         if self._transfer_topo is not None:
             self._transfer_topo.unregister_remote_engine(remote_engine_id)
-        logger.error("HIXLEngine evicted stale remote engine %s.", remote_engine_id)
+        logger.warning("HIXLEngine evicted stale remote engine %s.", remote_engine_id)
 
     # ==================================================================
     # P-side ZMQ ROUTER handshake listener. Mirrors NIXL
@@ -1521,7 +1490,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._handshake_listener_thread = thread
         thread.start()
         if not ready_event.wait(_HIXL_ENGINE_LISTENER_READY_TIMEOUT_S):
-            logger.error(
+            logger.warning(
                 "HIXLEngine handshake listener not ready within %.1fs on %s:%d",
                 _HIXL_ENGINE_LISTENER_READY_TIMEOUT_S, host, port,
             )
@@ -1552,7 +1521,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         ready_event: threading.Event, stop_event: threading.Event,
     ) -> None:
         path = make_zmq_path("tcp", host, port)
-        logger.error("HIXLEngine handshake listener on %s.", path)
+        logger.info("HIXLEngine handshake listener on %s.", path)
         encoder = msgspec.msgpack.Encoder()
         try:
             with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore[arg-type]
@@ -1564,12 +1533,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     except zmq.Again:  # type: ignore[attr-defined]
                         continue
                     except zmq.ZMQError as e:  # type: ignore[attr-defined]
-                        logger.error("HIXLEngine listener recv error: %s", e)
+                        logger.warning("HIXLEngine listener recv error: %s", e)
                         continue
                     try:
                         self._handle_handshake_request(sock, frames, encoder)
                     except Exception as e:  # noqa: BLE001
-                        logger.error("HIXLEngine listener handler error: %s", e)
+                        logger.warning("HIXLEngine listener handler error: %s", e)
         except Exception as e:  # noqa: BLE001
             logger.exception("HIXLEngine handshake listener fatal: %s", e)
 
@@ -1596,7 +1565,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # addresses a specific (pp, tp) rank; serve that rank's pre-encoded
         # payload from the mapping set_xfer_handshake_metadata populated.
         if len(msg) < 3:
-            logger.error("HIXLEngine GET_META without (pp, tp): %s", msg)
+            logger.warning("HIXLEngine GET_META without (pp, tp): %s", msg)
             self._reject_handshake(sock, identity, "GET_META missing (pp, tp)")
             return
         pp_rank, tp_rank = msg[1], msg[2]
@@ -1608,7 +1577,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             handshake_bytes = self._handshake_payloads.get((pp_rank, tp_rank))
             have = list(self._handshake_payloads)
         if handshake_bytes is None:
-            logger.error(
+            logger.warning(
                 "HIXLEngine GET_META for unknown (pp=%s, tp=%s); have %s",
                 pp_rank, tp_rank, have,
             )
@@ -1621,12 +1590,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
     def _reject_handshake(
         sock: zmq.Socket, identity: bytes, reason: str,  # type: ignore[name-defined]
     ) -> None:
-        """Bug-4: reply with an explicit error frame instead of silently
-        dropping a malformed GET_META. Lets the D side fail fast on the real
-        cause rather than waiting out the 5s RCVTIMEO and surfacing a
-        confusing zmq.error.Again. Frame shape mirrors the successful reply
-        (identity, b"", handshake_bytes, perf_ts) so the D-side short-reply
-        check still applies; reply[0] becomes HIXL_ERR_PREFIX + reason.
+        """Reply with an explicit error frame instead of silently dropping a
+        malformed GET_META, so the D side fails fast on the real cause.
+        Frame shape mirrors the successful reply (identity, b"",
+        handshake_bytes, perf_ts); reply[0] becomes HIXL_ERR_PREFIX + reason.
         """
         try:
             sock.send_multipart(
@@ -1699,9 +1666,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         address-level RegisterMem API and skips NIXL's prep_xfer_dlist /
         get_agent_metadata (hixl Connect uses the endpoint string directly).
         """
-        # B4 (#9): read NZ switch + save layer tensors for post-transfer
-        # ND->NZ reformat. Imported lazily so the module stays importable
-        # without an NPU (ascend_config pulls in the NPU stack).
+        # Read NZ switch + save layer tensors for post-transfer ND->NZ
+        # reformat. Imported lazily so the module stays importable without
+        # an NPU (ascend_config pulls in the NPU stack).
         from vllm_ascend.ascend_config import get_ascend_config  # noqa: PLC0415
         self._enable_kv_nz = bool(
             getattr(get_ascend_config(), "enable_kv_nz", False))
@@ -1727,14 +1694,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._block_len_per_layer.clear()
         self._region_is_mla.clear()
         self._region_group_idx.clear()
-        # C#26-fix: actual per-logical-block bytes from each tensor's own
-        # shape. vllm-ascend pads MambaSpec.page_size_bytes (via
-        # patch_mamba_config mamba_page_size_padded = attn_page +
-        # conv_block_page) to align mamba/attn blocks for HMA pooling, which
-        # inflates block_len_per_layer past the real ssm per-block and makes
-        # bid*stride overrun the region (503900). SSM addressing uses this
-        # real per-block instead. FA regions keep block_len_per_layer (FA
-        # page_size is not padded).
+        # Real per-logical-block bytes from each tensor's own shape, used by
+        # SSM addressing. vllm-ascend pads MambaSpec.page_size_bytes to align
+        # mamba/attn blocks for HMA pooling, which would inflate
+        # block_len_per_layer past the real ssm per-block; FA regions keep
+        # block_len_per_layer (FA page_size is not padded).
         self._per_block_per_layer = []
         seen_base_addresses: list[int] = []
         self._kv_caches_base_addr[self._engine_id][self._tp_rank] = (
@@ -1775,20 +1739,19 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 if base_addr in seen_base_addresses:
                     dup_idx = seen_base_addresses.index(base_addr)
                     dup_per_block = self._per_block_per_layer[dup_idx]
-                    # Direction E: SSM state shares the same base/length as an
+                    # SSM state shares the same base/length as an
                     # already-registered attn region (HMA pools attn K and
                     # mamba ssm_state onto one raw_tensor — same base, same
-                    # length, different block view: attn 6000x131072, ssm
-                    # 500x1572864). The physical segment is already covered
-                    # by attn's register_mem, and TransferAsync addresses
-                    # purely by (addr, len) without referencing mem handles
-                    # — so ssm needs neither register_mem nor a mem handle.
-                    # But its logical region record MUST be appended: the
-                    # is_ssm branch of _build_op_descs takes per_block from
+                    # length, different block view). The physical segment is
+                    # already covered by attn's register_mem, and
+                    # TransferAsync addresses purely by (addr, len) without
+                    # referencing mem handles — so ssm needs neither
+                    # register_mem nor a mem handle. But its logical region
+                    # record MUST be appended: the is_ssm branch of
+                    # _build_op_descs takes per_block from
                     # _per_block_per_layer[i], so without this entry ssm is
-                    # never iterated and its state is never transferred,
-                    # which is the decode-repetition root cause. A conv
-                    # duplicate (same per_block) is a true HMA shared_by
+                    # never iterated and its state is never transferred. A
+                    # conv duplicate (same per_block) is a true HMA shared_by
                     # re-reference and stays skipped.
                     if is_mamba_region and per_block != dup_per_block:
                         seen_base_addresses.append(base_addr)
@@ -1799,7 +1762,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                             self._layer_to_group.get(layer_name, 0)
                         )
                         self._device_id = max(t.get_device(), 0)
-                        logger.error(
+                        logger.debug(
                             "HIXLTRACE reg_ssm_alias layer=%s sub=%d "
                             "base=0x%x length=%d per_block=%d group=%d "
                             "shape=%s dup_seen_idx=%d dup_per_block=%d "
@@ -1811,7 +1774,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                             tuple(t.shape), dup_idx, dup_per_block,
                         )
                         continue
-                    logger.error(
+                    logger.debug(
                         "HIXLTRACE reg_dedup_skip layer=%s sub=%d base=0x%x "
                         "length=%d per_block=%d is_mamba=%d group=%d shape=%s "
                         "dup_seen_idx=%d",
@@ -1836,9 +1799,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 seen_base_addresses.append(base_addr)
                 self._block_len_per_layer.append(block_len)
-                # C#26-fix: real per-logical-block bytes from the tensor's
-                # own shape (block-0 element count * dtype size). Immune to
-                # the vllm-ascend mamba page padding; used by SSM addressing.
+                # Real per-logical-block bytes from the tensor's own shape
+                # (block-0 element count * dtype size), immune to the
+                # vllm-ascend mamba page padding; used by SSM addressing.
                 self._per_block_per_layer.append(per_block)
                 self._region_is_mla.append(is_mla_region)
                 self._region_group_idx.append(
@@ -1846,7 +1809,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 # Torch uses -1 for CPU; hixl needs a non-negative device id.
                 self._device_id = max(t.get_device(), 0)
-                logger.error(
+                logger.debug(
                     "HIXLTRACE reg_region layer=%s sub=%d base=0x%x "
                     "length=%d per_block=%d is_mamba=%d group=%d shape=%s",
                     layer_name, i, base_addr, length,
@@ -1864,13 +1827,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         _grp_counts: dict[int, int] = {}
         for _g in self._region_group_idx:
             _grp_counts[_g] = _grp_counts.get(_g, 0) + 1
-        logger.error(
+        logger.debug(
             "HIXLTRACE reg_summary n_regions=%d n_handles=%d "
             "per_block_dist=%s group_dist=%s",
             len(self._per_block_per_layer), len(self._kv_mem_handles),
             _pb_counts, _grp_counts,
         )
-        logger.error(
+        logger.info(
             "HIXLEngineConnector registered %d KV regions on rank %s "
             "(num_blocks=%d, block_size=%d, layout=%s).",
             len(self._kv_mem_handles), self._tp_rank,
@@ -1916,7 +1879,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             cluster_id=0,  # hixl Connect routes by endpoint string, not cluster
             listen_ip=get_ip(),
             listen_port=0,  # filled by scheduler wiring (Step R); per-device
-                            # port offset TODO(B2 #22)
+                            # port offset TODO
             kv_caches_base_addr=(
                 self._kv_caches_base_addr[self._engine_id][self._tp_rank]
             ),
@@ -2003,11 +1966,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             remote_meta.block_size
         )
         # physical_blocks_per_logical on each side. Non-Mamba regions address
-        # by physical block id (M1 expands them in _read_blocks), so their
+        # by physical block id (_read_blocks expands them), so their
         # stride/page_size are per-physical-block spans. Mamba state regions
         # keep logical-id addressing, so their stride/page_size must span a
         # full logical block (per-physical span * physical_blocks_per_logical)
-        # — NIXL _build_mamba_remote (base_worker.py:1345). M3.
+        # — NIXL _build_mamba_remote (base_worker.py:1345).
         remote_info = self._transfer_topo.get_engine_info(remote_engine_id)
         remote_physical_per_logical = remote_info.remote_physical_blocks_per_logical
         local_phys = self._physical_blocks_per_logical_kv_block
@@ -2016,14 +1979,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         split_reads = len(plan.source_ranks_per_group[group_idx])
         local_bases = self._kv_caches_base_addr[self._engine_id][self._tp_rank]
         is_ssm_group = self._is_ssm_spec(self._group_spec_types[group_idx])
-        # P/D SSM group-count mismatch workaround (plan A): P may split SSM
-        # into N kv_cache_groups (per mamba spec) while D merges them into
-        # one. Strict group_idx matching then makes plan SSM groups 2..N find
-        # no D region (n_matched_regions=0) and their blocks never transfer,
-        # leaving D's mamba state partially empty (decode degrades to
-        # repetition). When D has exactly one SSM group, route all plan SSM
-        # groups to D's SSM regions by spec type instead of group_idx; FA
-        # always matches strictly.
+        # P may split SSM into N kv_cache_groups (per mamba spec) while D
+        # merges them into one; when D has exactly one SSM group, route all
+        # plan SSM groups to D's SSM regions by spec type instead of
+        # group_idx. FA always matches strictly.
         _d_ssm_group_count = (
             len({
                 self._region_group_idx[i]
@@ -2036,7 +1995,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         route_ssm_by_spec = is_ssm_group and _d_ssm_group_count == 1
         # Per-source-rank local head slot (gather scenario). split/MLA => 0.
         if is_ssm_group:
-            # TODO(conv-decomp, C#26): replace with conv decomposition
+            # TODO(conv-decomp): replace with conv decomposition
             # (NIXL _build_mamba_remote, base_worker.py:1311-1352).
             slot = plan.all_source_ranks.index(source_rank)
         else:
@@ -2045,7 +2004,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         descs: list[TransferOpDesc] = []
         pairs = list(zip(local_block_ids, remote_block_ids))
         if is_ssm_group and pairs:
-            logger.error(
+            logger.debug(
                 "HIXLTRACE ssm_pairs group=%d source_rank=%d n_pairs=%d "
                 "slot=%d local_phys=%d remote_phys=%d block_size_ratio=%d "
                 "split_reads=%d local_bids=%s remote_bids=%s",
@@ -2054,12 +2013,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 block_size_ratio, split_reads,
                 local_block_ids, remote_block_ids,
             )
-        # Region parity (M5): P/D register_kv_caches dedup base addresses via
-        # HMA pooling independently, so a layout mismatch would otherwise land
-        # as a silent IndexError / wrong-region address rather than a clear
-        # error. PP>1 remote-window slicing (NIXL base_worker.py:1537-1550) is
-        # not yet ported (pull mode assumes single pipeline stage); a mismatch
-        # here is the symptom to surface.
+        # Region parity: a layout mismatch would otherwise land as a silent
+        # IndexError / wrong-region address. PP>1 remote-window slicing (NIXL
+        # base_worker.py:1537-1550) is not yet ported (pull mode assumes
+        # single pipeline stage).
         n_regions = len(remote_bases)
         assert (
             len(local_bases) == len(self._block_len_per_layer)
@@ -2076,7 +2033,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         for i, remote_base in enumerate(remote_bases):
             if route_ssm_by_spec:
                 # D has one SSM group: route this plan SSM group to every D
-                # SSM region (P/D split mismatch workaround, plan A).
+                # SSM region.
                 _ri = self._region_group_idx[i]
                 if not (
                     _ri < len(self._group_spec_types)
@@ -2087,14 +2044,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             replicated = self._region_is_mla[i]
             if is_ssm_group:
-                # Mamba state: logical-id addressing (M1 skips expansion for
-                # state groups). C#26-fix: stride/page_size use the real
-                # per-logical-block bytes from the tensor shape, NOT the
-                # padded MambaSpec.page_size_bytes (which vllm-ascend inflates
-                # to align with attn for HMA pooling — see register_kv_caches).
-                # P/D run the same model/spec, so local per_block is valid for
-                # the remote side too. conv decomp (TODO C#26) is the full
-                # 3-read path; this is the whole-block fallback.
+                # Mamba state: logical-id addressing (expansion is skipped
+                # for state groups). stride/page_size use the real
+                # per-logical-block bytes from the tensor shape, not the
+                # padded MambaSpec.page_size_bytes (see register_kv_caches).
+                # P/D run the same model/spec, so local per_block is valid
+                # for the remote side too.
                 per_block = self._per_block_per_layer[i]
                 stride = per_block // block_size_ratio
                 page_size = per_block
@@ -2114,7 +2069,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             if pairs and is_ssm_group:
                 _max_lbid = max(p[0] for p in pairs)
                 _max_rbid = max(p[1] for p in pairs)
-                logger.error(
+                logger.debug(
                     "HIXLTRACE build_op region=%d group_idx=%d "
                     "region_group=%d is_ssm=%d remote_base=0x%x "
                     "local_base=0x%x stride=%d page=%d chunk=%d "
@@ -2127,7 +2082,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     remote_base + rank_offset + _max_rbid * page_size,
                     _max_lbid, local_base + _max_lbid * stride + slot * chunk,
                 )
-        logger.error(
+        logger.debug(
             "HIXLTRACE build_op_summary group_idx=%d source_rank=%d "
             "is_ssm=%d route_by_spec=%d d_ssm_groups=%d n_matched_regions=%d "
             "n_pairs=%d n_regions_total=%d region_groups=%s",
@@ -2161,9 +2116,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         req's handles resolve (replaces NIXL's transfer notif_msg
         auto-delivery, plan §2.4).
 
-        G-bug fix: transfer_async takes the peer endpoint string (the value
-        passed to Connect), not the engine_id name. All wrapper calls that
-        touch the hixl instance are serialized with _hixl_lock (hixl is not
+        transfer_async takes the peer endpoint string (the value passed to
+        Connect), not the engine_id name. All wrapper calls that touch the
+        hixl instance are serialized with _hixl_lock (hixl is not
         thread-safe; connect runs on the handshake thread, transfers here).
         """
         remote_engine_id = req_meta.remote.engine_id
@@ -2179,7 +2134,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         remote_agents = self._remote_agents[remote_engine_id]
         num_groups = len(req_meta.local_block_ids)
         notif_id = f"{req_meta.remote.request_id}:{self._world_size}"
-        logger.error(
+        logger.debug(
             "HIXLTRACE D-read_blocks req=%s remote_engine=%s n_groups=%d "
             "source_ranks=%s local_blks=%s remote_blks=%s",
             request_id, remote_engine_id, num_groups,
@@ -2192,7 +2147,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         remote_info = self._transfer_topo.get_engine_info(remote_engine_id)
         remote_physical_per_logical = remote_info.remote_physical_blocks_per_logical
 
-        # Pre-trim per group (H-1: SSM tail-trim to last block, FA tail-trim
+        # Pre-trim per group (SSM tail-trim to last block, FA tail-trim
         # when same phys / front-trim to min when heterogeneous phys).
         trimmed_local: list[list[int]] = []
         trimmed_remote: list[list[int]] = []
@@ -2224,7 +2179,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 rb = trimmed_remote[g]
                 if not lb:
                     continue
-                # M1: expand logical -> physical block ids for non-Mamba groups
+                # Expand logical -> physical block ids for non-Mamba groups
                 # so _build_op_descs (which addresses by physical id with
                 # per-physical-block spans) lands on the right offset when
                 # physical_blocks_per_logical>1. Mamba state regions keep the
@@ -2234,14 +2189,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 ):
                     lb = self._expand_physical(lb, local_phys)
                     rb = self._expand_physical(rb, remote_physical_per_logical)
-                    # H-2: zip() in _build_op_descs pairs local/remote physical
+                    # zip() in _build_op_descs pairs local/remote physical
                     # ids positionally; heterogeneous phys (different kernel
-                    # block_size) makes the expanded lengths diverge, which
-                    # would silently truncate. Fail closed — the address-offset
-                    # path cannot express a per-side desc count without NIXL-
-                    # style desc decoupling (not ported). _apply_prefix_caching
-                    # front-trimmed to min already, so this only fires when phys
-                    # mismatch makes even the trimmed counts differ.
+                    # block_size) makes the expanded lengths diverge. Fail
+                    # closed — the address-offset path cannot express a
+                    # per-side desc count without NIXL-style desc decoupling
+                    # (not ported).
                     assert len(lb) == len(rb), (
                         f"group {g}: physical id count mismatch after expand: "
                         f"local={len(lb)} remote={len(rb)} (local_phys="
@@ -2266,10 +2219,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                         "req=%s rank=%s err=%s",
                         request_id, rank, e,
                     )
-                # MED-3: mark this rank notified so the completion path's
-                # _notify_release skips it — otherwise the P-side consumer
-                # counter is over-decremented (the prefix-hit notify and the
-                # release notify carry the same notif_id).
+                # Mark this rank notified so _notify_release skips it (the
+                # prefix-hit notify and the release notify share the same
+                # notif_id).
                 self._notified_release_ranks.setdefault(
                     request_id, set()
                 ).add(rank)
@@ -2278,7 +2230,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 _la = [d.local_addr for d in group_descs]
                 _ra = [d.remote_addr for d in group_descs]
                 _ln = [d.len for d in group_descs]
-                logger.error(
+                logger.debug(
                     "HIXLTRACE D-transfer_async req=%s rank=%d endpoint=%s "
                     "n_descs=%d local=[0x%x..0x%x] remote=[0x%x..0x%x] "
                     "len=[%d..%d]",
@@ -2294,9 +2246,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 self._recving_transfers.setdefault(
                     request_id, []
                 ).append(handle)
-                # MED-3: record this rank as a real reader so _notify_release
-                # sends DONE to it (and only it) instead of broadcasting to
-                # plan.all_source_ranks.
+                # Record this rank as a real reader so _notify_release sends
+                # DONE to it only.
                 self._transferred_ranks.setdefault(
                     request_id, set()
                 ).add(rank)
@@ -2311,15 +2262,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     min(_la) if _la else 0, max(_la) if _la else 0,
                     min(_ra) if _ra else 0, max(_ra) if _ra else 0,
                 )
-                # M-2: do NOT pop already-issued handles. hixl has no transfer
-                # cancel API, so popping leaks them — _pop_done_transfers never
-                # sees them again and the RDMA handle is never freed. Leave
-                # them in _recving_transfers so _pop_done_transfers polls them
-                # to COMPLETED and drops them normally; the req is already in
-                # _failed_recv_reqs (via _handle_failed_transfer below), which
-                # gates _notify_release so no P-side release fires for these
-                # blocks. The in-flight RDMA write may still land on a block
-                # the scheduler will recompute; the recompute retry overwrites.
+                # Do NOT pop already-issued handles. hixl has no transfer
+                # cancel API, so popping leaks them — _pop_done_transfers
+                # never sees them again and the RDMA handle is never freed.
+                # Leave them in _recving_transfers so _pop_done_transfers
+                # polls them to COMPLETED and drops them normally; the req is
+                # already in _failed_recv_reqs (via _handle_failed_transfer
+                # below), which gates _notify_release so no P-side release
+                # fires for these blocks. The in-flight RDMA write may still
+                # land on a block the scheduler will recompute; the recompute
+                # retry overwrites.
                 self._handle_failed_transfer(request_id, None)
                 return
 
@@ -2335,16 +2287,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         (NIXL pull_worker.start_load_kv:44-103). A request whose remote engine
         has not been handshaken yet is parked on _pending_handshake_reqs and
         read on a later step once the handshake done_callback releases it into
-        _ready_requests (HIGH-1, NIXL pull_worker.py:66-79). Without that
-        re-queue the req would be lost — the scheduler clears
-        _reqs_need_recv / flips do_remote_prefill the same step.
+        _ready_requests (NIXL pull_worker.py:66-79). Without that re-queue
+        the req would be lost — the scheduler clears _reqs_need_recv /
+        flips do_remote_prefill the same step.
         """
         # metadata comes from bind_connector_metadata (base.py:221), which the
         # model runner calls with scheduler_output.kv_connector_metadata just
-        # before start_load_kv (kv_connector_model_runner_mixin.py:88-95). vllm
-        # never sets forward_context.connector_meta — reading it AttributeError'd
-        # ("'ForwardContext' object has no attribute 'connector_meta'"). This was
-        # masked until now because the SCHEDULER __init__ crashed earlier.
+        # before start_load_kv (kv_connector_model_runner_mixin.py:88-95).
         metadata = self._connector_metadata
         if metadata is None:
             return
@@ -2352,17 +2301,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._task_tracker.add_req_to_process(req_id)
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_engine_id = meta.remote.engine_id
-            # HIGH-1: always store metadata (NIXL pull_worker.py:66) so the
+            # Always store metadata (NIXL pull_worker.py:66) so the
             # ready-queue drain / failure paths recover req state after a
             # deferred handshake.
             self._recving_metadata[req_id] = meta
-            # NEW-HIGH-1: check + park under _handshake_lock so the
-            # done_callback (executor thread) cannot publish
-            # _remote_metadata and drain _pending_handshake_reqs between our
-            # check and our park — that window would strand the req in
-            # _pending_handshake_reqs forever (the callback won't fire again,
-            # _ensure_handshake no-ops on the now-published engine). RLock so
-            # _ensure_handshake's own lock acquisition re-enters cleanly.
+            # Check + park under _handshake_lock so the done_callback
+            # (executor thread) cannot publish _remote_metadata and drain
+            # _pending_handshake_reqs between our check and our park. RLock
+            # so _ensure_handshake's own lock acquisition re-enters cleanly.
             with self._handshake_lock:
                 already = remote_engine_id in self._remote_metadata
                 if not already:
@@ -2380,9 +2326,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             plan = self._tp_mappings[remote_engine_id]
             self._read_blocks(req_id, meta, plan)
 
-        # HIGH-1: drain reqs whose handshakes finished (this step or a prior
-        # one) — NIXL pull_worker.py:78-79. Without this the parked reqs
-        # would never be read.
+        # Drain reqs whose handshakes finished (this step or a prior one) —
+        # NIXL pull_worker.py:78-79.
         while self._ready_requests:
             rid, rmeta = self._ready_requests.popleft()
             plan = self._tp_mappings.get(rmeta.remote.engine_id)
@@ -2417,10 +2362,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         """Trim to the locally-uncached tail, per group (NIXL base_worker.py:
         2255-2315).
 
-        H-1: a single ``if self._has_mamba: return`` skipped FA groups too,
-        so a partial prefix hit left remote untrimmed and the downstream
-        zip() in _build_op_descs paired prefix blocks into tail slots,
-        silently corrupting the D cache. Branch per group instead:
+        Branch per group:
 
         - SSM state: only the last block holds the full in-place state;
           assert num_local==1 and tail-trim remote to it.
@@ -2429,10 +2371,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
           pairing that keeps the physical-id arrays zip-aligned after
           _expand_physical; a true heterogeneous reshard needs NIXL-style
           desc decoupling (not done here) — _read_blocks asserts len(lb)
-          ==len(rb) (H-2) and fails closed on divergence.
+          ==len(rb) and fails closed on divergence.
 
         Trims logical block ids; physical-id expansion (when phys>1) is
-        done by _read_blocks via _expand_physical (M1).
+        done by _read_blocks via _expand_physical.
         """
         num_local = len(local_block_ids)
         num_remote = len(remote_block_ids)
@@ -2478,7 +2420,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         phys>1 maps logical id b to [b*phys, ..., b*phys+phys-1]. _build_op_descs
         addresses by physical id (page_size/stride are per-physical-block spans),
         so this expansion must happen before building op descs whenever
-        physical_blocks_per_logical>1 (M1).
+        physical_blocks_per_logical>1.
         """
         if phys <= 1:
             return list(block_ids)
@@ -2505,7 +2447,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         TIMEOUT marks the req invalid via _handle_failed_transfer. A req is
         done only when every handle resolved. On clean (failure-free)
         completion, _notify_release tells the P side to release blocks
-        (H4: replaces NIXL's transfer notif_msg auto-delivery).
+        (replaces NIXL's transfer notif_msg auto-delivery).
         """
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
@@ -2539,18 +2481,18 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     self._handle_failed_transfer(req_id, handle)
             if not in_progress:
                 done_req_ids.add(req_id)
-                logger.error(
+                logger.debug(
                     "HIXLTRACE D-transfer_done req=%s handles=%d failed=%s",
                     req_id, len(handles), had_failure,
                 )
                 del transfers[req_id]
                 # Only notify P to release if the req finished cleanly AND no
-                # earlier rank's transfer_async raised (M1: _read_blocks
+                # earlier rank's transfer_async raised (_read_blocks
                 # stashes req-level failure in _failed_recv_reqs on a partial
                 # submit; notify there would release P blocks for ranks whose
                 # transfers never issued).
                 if not had_failure and req_id not in self._failed_recv_reqs:
-                    # B4: ND->NZ reformat on the D real cache before telling
+                    # ND->NZ reformat on the D real cache before telling
                     # the P side to release (transfer is COMPLETED, so the ND
                     # bytes are fully written). No-op when enable_kv_nz is off
                     # or the group is a state (Mamba) group.
@@ -2560,12 +2502,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 transfers[req_id] = in_progress
         return done_req_ids
 
-    # -- B4 NZ reformat fallback (fork hixl_connector L1000-1090) ---------
-    # #2 npu_paged_cache_load / #4 npu_scatter_pa_kv_cache / #5 sync / #8
-    # _nz_kv_cache. Pure torch_npu ops on the post-transfer tensor; only
-    # needed when HCCL cannot scatter-write NZ offsets so the D cache lands
-    # ND. num_group_pulls>1 staging transpose (#11) is NOT forked — the
-    # address-offset path in _build_op_descs replaces it.
+    # -- NZ reformat fallback (fork hixl_connector L1000-1090) ---------
+    # npu_paged_cache_load / npu_scatter_pa_kv_cache / sync / _nz_kv_cache.
+    # Pure torch_npu ops on the post-transfer tensor; only needed when HCCL
+    # cannot scatter-write NZ offsets so the D cache lands ND. The
+    # num_group_pulls>1 staging transpose is NOT forked — the address-offset
+    # path in _build_op_descs replaces it.
     def _apply_nz_reformat(self, request_id: str) -> None:
         """ND->NZ reformat of D real cache for each attention group of a req.
 
@@ -2577,14 +2519,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if not self._enable_kv_nz:
             return
-        # M4: NZ reformat assumes a single-rank full-cache view (the reshape
-        # in _nz_kv_cache spans num_kv_heads//16 blocks). TP>1 each rank holds
-        # a head slice, so the reshape/scatter would land on wrong positions.
-        # A staging NZ-scatter branch for TP>1 is not implemented; skip NZ and
+        # NZ reformat assumes a single-rank full-cache view (the reshape in
+        # _nz_kv_cache spans num_kv_heads//16 blocks). TP>1 each rank holds a
+        # head slice, so the reshape/scatter would land on wrong positions. A
+        # staging NZ-scatter branch for TP>1 is not implemented; skip NZ and
         # let the direct ND write stand (only correct when HCCL scatter-writes
         # NZ offsets, which is the non-NZ fast path anyway).
         if self._tp_size > 1:
-            logger.error(
+            logger.warning(
                 "HIXLEngine enable_kv_nz with TP=%d: NZ reformat is TP=1 only; "
                 "skipping NZ reformat and relying on direct ND write.",
                 self._tp_size,
@@ -2601,7 +2543,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 continue  # state group: no NZ reformat
             if not block_ids:
                 continue
-            # H-3: _reformat_kv_cache_nz indexes the D paged cache by physical
+            # _reformat_kv_cache_nz indexes the D paged cache by physical
             # block id (block_table -> npu_paged_cache_load). With phys>1 the
             # logical ids from the scheduler must be expanded to physical ids
             # or the ND->NZ scatter lands on wrong slots. SSM groups keep
@@ -2636,7 +2578,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # NPU-free unit tests never reach this branch). Importing torch_npu
         # injects torch.npu + torch_npu.atb ops.
         import torch_npu  # noqa: F401, PLC0415
-        # M5: the head/dim indexing below assumes NHD (shape[-2]=num_kv_heads,
+        # The head/dim indexing below assumes NHD (shape[-2]=num_kv_heads,
         # shape[-1]=head_dim). HND would put block_size at shape[-2] and
         # silently mis-size the NZ reshape/scatter — fail closed instead.
         if self._kv_cache_layout != "NHD":
@@ -2677,15 +2619,15 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             (num_tokens, num_kv_heads, k_head_dim), dtype=dtype, device=device)
         v_buffer = torch.empty(
             (num_tokens, num_kv_heads, v_head_dim), dtype=dtype, device=device)
-        # #5: pull writes ND; synchronize before reformatting so the NPU
-        # sees the fully written range.
+        # Pull writes ND; synchronize before reformatting so the NPU sees
+        # the fully written range.
         torch.npu.synchronize()
         for d_cache in group_kv.values():
             if isinstance(d_cache, (list, tuple)):
                 k_cache_layer, v_cache_layer = d_cache[0], d_cache[1]
             else:
                 k_cache_layer = v_cache_layer = d_cache
-            torch_npu.atb.npu_paged_cache_load(  # #2: ND cache -> buffer
+            torch_npu.atb.npu_paged_cache_load(  # ND cache -> buffer
                 k_cache_layer,
                 v_cache_layer,
                 block_table,
@@ -2716,7 +2658,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         k_head_dim: int,
         v_head_dim: int,
     ):
-        # nz_fmt_last_dim=16 (MLA NZ layout). #8/#4: scatter buffer -> NZ view.
+        # nz_fmt_last_dim=16 (MLA NZ layout). Scatter buffer -> NZ view.
         import torch_npu  # noqa: F401, PLC0415
         nz_fmt_last_dim = 16
         k_cache_layer = k_cache_layer.view(
@@ -2740,13 +2682,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         ``("DONE", "<remote_request_id>:<world_size>")`` and decrements its
         per-req consumer counter.
 
-        MED-3: only notify ranks this request issued an async READ to
+        Only notify ranks this request issued an async READ to
         (``_transferred_ranks``), never broadcast to ``plan.all_source_ranks``.
-        The latter spans attn+ssm and can include ranks this D never read in
-        P_TP>D_TP / GQA-dedup cases; a spurious DONE there over-decrements the
-        P-side consumer counter and can free a block before its real consumers
-        finish. Ranks covered by a prefix-hit DONE (no transfer) were already
-        notified in _read_blocks and are skipped here to avoid a double-notify.
+        Ranks covered by a prefix-hit DONE (no transfer) were already notified
+        in _read_blocks and are skipped here to avoid a double-notify.
         """
         meta = self._recving_metadata.get(req_id)
         if meta is None:
@@ -2781,13 +2720,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         """
         for engine_id, hb_info in metadata.heartbeat_by_engine.items():
             if engine_id not in self._remote_agents:
-                # M-3: proactive handshake (NIXL base_worker.py:2162-2175).
-                # The req behind this heartbeat may still be waiting for peer
+                # Proactive handshake (NIXL base_worker.py:2162-2175). The
+                # req behind this heartbeat may still be waiting for peer
                 # metadata + Connect to land, so THIS heartbeat round has no
-                # agent to send to. Kick off _ensure_handshake now so the NEXT
-                # round (one step later) actually delivers the HB and extends
-                # the P-side lease — otherwise a first-sight engine's lease
-                # is never extended and the P blocks expire before the read.
+                # agent to send to. Kick off _ensure_handshake now so the
+                # NEXT round (one step later) actually delivers the HB and
+                # extends the P-side lease — otherwise a first-sight
+                # engine's lease is never extended and the P blocks expire
+                # before the read.
                 self._ensure_handshake(
                     engine_id,
                     hb_info.host,
@@ -2852,7 +2792,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     continue
                 req_id, tp_size = msg.rsplit(":", 1)
                 if req_id not in self._reqs_to_send:
-                    # M-4: distinguish a premature DONE (D finished reading
+                    # Distinguish a premature DONE (D finished reading
                     # before this P worker's request_finished moved the req
                     # into _reqs_to_send — NIXL guards on _reqs_to_process
                     # membership the same way) from a truly unknown/expired
@@ -2866,18 +2806,15 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                             "dropping (lease expiry is the backstop).", req_id,
                         )
                     else:
-                        logger.error(
+                        logger.warning(
                             "HIXLEngine DONE notify for unknown/expired request "
                             "%s; ignoring.", req_id,
                         )
                     continue
                 n_consumers = int(tp_size)  # D-side world_size (= D_TP)
-                # M7: mirror NIXL pull_worker.py:388-396 exactly. tp_ratio
-                # asserts TP divisibility and yields the correct per-producer
-                # consumer count for split (D_TP>P_TP => -tp_ratio) and 1
-                # otherwise. The previous n_consumers//world_size form was
-                # equivalent for plain split but diverged on the assert and
-                # on future GQA/MLA multi-consumer cases.
+                # Mirror NIXL pull_worker.py:388-396: tp_ratio asserts TP
+                # divisibility and yields the correct per-producer consumer
+                # count for split (D_TP>P_TP => -tp_ratio) and 1 otherwise.
                 assert self._transfer_topo is not None
                 tp_ratio = self._transfer_topo.tp_ratio(n_consumers)
                 consumers_per_producer = (
@@ -2905,7 +2842,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         ids via _invalid_block_ids so the scheduler recomputes them. Only
         attention group blocks are invalidated — Mamba/SSM state groups
         (conv state) are not per-token recomputable and must not be fed into
-        the recompute path (H2: NIXL gates on group 0 + _is_hma_required;
+        the recompute path (NIXL gates on group 0 + _is_hma_required;
         here we skip every state group via _is_ssm_spec).
         """
         self._failed_recv_reqs.add(req_id)
@@ -2995,7 +2932,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         failed = set(self._failed_recv_reqs)
         self._failed_recv_reqs.clear()
         # Also drop metadata for reqs that failed without ever issuing a
-        # transfer (e.g. handshake failure on a HIGH-1 parked req) — they
+        # transfer (e.g. handshake failure on a parked req) — they
         # never enter _recving_transfers so _pop_done_transfers won't surface
         # them, and would otherwise leak in _recving_metadata.
         for req_id in failed:
@@ -3010,7 +2947,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in [rid for rid, exp in self._reqs_to_send.items()
                        if now >= exp]:
             count = self._consumer_notification_counts_by_req.pop(req_id, 0)
-            logger.error(
+            logger.info(
                 "HIXLEngine releasing expired KV blocks for request %s "
                 "retrieved by %d consumer(s) before lease expired.",
                 req_id, count,
@@ -3038,7 +2975,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         register_kv_caches). The framework ships it to the scheduler, which
         fans it out to peers via set_xfer_handshake_metadata_pp_aware.
         """
-        logger.error(
+        logger.debug(
             "HIXLTRACE P-get_handshake engine=%s has_payload=%d",
             self._engine_id, self._xfer_handshake_metadata is not None,
         )
@@ -3087,7 +3024,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     payload
                 )
             nonempty = bool(self._handshake_payloads)
-        logger.error(
+        logger.debug(
             "HIXLTRACE P-store_handshake n_payloads=%d keys=%s side_port=%d",
             len(self._handshake_payloads), list(self._handshake_payloads),
             self._side_channel_port,
