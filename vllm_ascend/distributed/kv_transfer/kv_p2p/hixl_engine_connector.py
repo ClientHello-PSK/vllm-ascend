@@ -1771,6 +1771,18 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             for i, t in enumerate(tensors):
                 base_addr = int(t.data_ptr())
                 if base_addr in seen_base_addresses:
+                    logger.error(
+                        "HIXLTRACE reg_dedup_skip layer=%s sub=%d base=0x%x "
+                        "length=%d per_block=%d is_mamba=%d group=%d shape=%s "
+                        "dup_seen_idx=%d",
+                        layer_name, i, base_addr,
+                        t.numel() * t.element_size(),
+                        t[0].numel() * t.element_size(),
+                        isinstance(layer_spec, MambaSpec),
+                        self._layer_to_group.get(layer_name, 0),
+                        tuple(t.shape),
+                        seen_base_addresses.index(base_addr),
+                    )
                     # HMA memory pooling: same backing tensor shared across
                     # groups; register the region once.
                     continue
@@ -1796,9 +1808,30 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 )
                 # Torch uses -1 for CPU; hixl needs a non-negative device id.
                 self._device_id = max(t.get_device(), 0)
+                logger.error(
+                    "HIXLTRACE reg_region layer=%s sub=%d base=0x%x "
+                    "length=%d per_block=%d is_mamba=%d group=%d shape=%s",
+                    layer_name, i, base_addr, length,
+                    self._per_block_per_layer[-1],
+                    isinstance(layer_spec, MambaSpec),
+                    self._layer_to_group.get(layer_name, 0),
+                    tuple(t.shape),
+                )
 
         self._build_transfer_topology(kv_caches)
         self._build_xfer_handshake_metadata()
+        _pb_counts: dict[int, int] = {}
+        for _pb in self._per_block_per_layer:
+            _pb_counts[_pb] = _pb_counts.get(_pb, 0) + 1
+        _grp_counts: dict[int, int] = {}
+        for _g in self._region_group_idx:
+            _grp_counts[_g] = _grp_counts.get(_g, 0) + 1
+        logger.error(
+            "HIXLTRACE reg_summary n_regions=%d n_handles=%d "
+            "per_block_dist=%s group_dist=%s",
+            len(self._per_block_per_layer), len(self._kv_mem_handles),
+            _pb_counts, _grp_counts,
+        )
         logger.error(
             "HIXLEngineConnector registered %d KV regions on rank %s "
             "(num_blocks=%d, block_size=%d, layout=%s).",
