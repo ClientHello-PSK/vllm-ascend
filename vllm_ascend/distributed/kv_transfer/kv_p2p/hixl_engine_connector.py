@@ -1770,18 +1770,58 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             )
             for i, t in enumerate(tensors):
                 base_addr = int(t.data_ptr())
+                per_block = t[0].numel() * t.element_size()
+                is_mamba_region = isinstance(layer_spec, MambaSpec)
                 if base_addr in seen_base_addresses:
+                    dup_idx = seen_base_addresses.index(base_addr)
+                    dup_per_block = self._per_block_per_layer[dup_idx]
+                    # Direction E: SSM state shares the same base/length as an
+                    # already-registered attn region (HMA pools attn K and
+                    # mamba ssm_state onto one raw_tensor — same base, same
+                    # length, different block view: attn 6000x131072, ssm
+                    # 500x1572864). The physical segment is already covered
+                    # by attn's register_mem, and TransferAsync addresses
+                    # purely by (addr, len) without referencing mem handles
+                    # — so ssm needs neither register_mem nor a mem handle.
+                    # But its logical region record MUST be appended: the
+                    # is_ssm branch of _build_op_descs takes per_block from
+                    # _per_block_per_layer[i], so without this entry ssm is
+                    # never iterated and its state is never transferred,
+                    # which is the decode-repetition root cause. A conv
+                    # duplicate (same per_block) is a true HMA shared_by
+                    # re-reference and stays skipped.
+                    if is_mamba_region and per_block != dup_per_block:
+                        seen_base_addresses.append(base_addr)
+                        self._block_len_per_layer.append(block_len)
+                        self._per_block_per_layer.append(per_block)
+                        self._region_is_mla.append(is_mla_region)
+                        self._region_group_idx.append(
+                            self._layer_to_group.get(layer_name, 0)
+                        )
+                        self._device_id = max(t.get_device(), 0)
+                        logger.error(
+                            "HIXLTRACE reg_ssm_alias layer=%s sub=%d "
+                            "base=0x%x length=%d per_block=%d group=%d "
+                            "shape=%s dup_seen_idx=%d dup_per_block=%d "
+                            "(ssm reuses attn registered segment; "
+                            "no register_mem, no mem handle)",
+                            layer_name, i, base_addr,
+                            t.numel() * t.element_size(), per_block,
+                            self._layer_to_group.get(layer_name, 0),
+                            tuple(t.shape), dup_idx, dup_per_block,
+                        )
+                        continue
                     logger.error(
                         "HIXLTRACE reg_dedup_skip layer=%s sub=%d base=0x%x "
                         "length=%d per_block=%d is_mamba=%d group=%d shape=%s "
                         "dup_seen_idx=%d",
                         layer_name, i, base_addr,
                         t.numel() * t.element_size(),
-                        t[0].numel() * t.element_size(),
-                        isinstance(layer_spec, MambaSpec),
+                        per_block,
+                        is_mamba_region,
                         self._layer_to_group.get(layer_name, 0),
                         tuple(t.shape),
-                        seen_base_addresses.index(base_addr),
+                        dup_idx,
                     )
                     # HMA memory pooling: same backing tensor shared across
                     # groups; register the region once.
@@ -1799,9 +1839,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 # C#26-fix: real per-logical-block bytes from the tensor's
                 # own shape (block-0 element count * dtype size). Immune to
                 # the vllm-ascend mamba page padding; used by SSM addressing.
-                self._per_block_per_layer.append(
-                    t[0].numel() * t.element_size()
-                )
+                self._per_block_per_layer.append(per_block)
                 self._region_is_mla.append(is_mla_region)
                 self._region_group_idx.append(
                     self._layer_to_group.get(layer_name, 0)
@@ -1813,7 +1851,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     "length=%d per_block=%d is_mamba=%d group=%d shape=%s",
                     layer_name, i, base_addr, length,
                     self._per_block_per_layer[-1],
-                    isinstance(layer_spec, MambaSpec),
+                    is_mamba_region,
                     self._layer_to_group.get(layer_name, 0),
                     tuple(t.shape),
                 )
