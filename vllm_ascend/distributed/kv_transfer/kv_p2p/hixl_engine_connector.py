@@ -2862,27 +2862,68 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         Here there is nothing to reformat — once GetTransferStatus returns
         COMPLETED the KV is already in the D real cache at the right layout.
 
-        Polls without mutating _recving_transfers: completion accounting and
-        P-side release happen in get_finished -> _pop_done_transfers, so this
-        method only waits (no double-del/notify). Bounded by transfer_timeout
-        to avoid an infinite loop on a stuck handle.
+        hixl's GetTransferStatus is consumptive: returning COMPLETED releases
+        the handle's internal resources and removes it from
+        pending_device_handles_, so querying the same handle again returns
+        HIXL_PARAM_INVALID (103900) — see HIXL_CS介绍.md:655,701,769. This
+        method is invoked from every attention layer's forward, including
+        the MTP drafter forward that runs after the main model forward, so a
+        given handle would otherwise be queried multiple times and the second
+        query would hit 103900 (the incident root cause). To avoid that,
+        COMPLETED handles are dropped here by replacing each per-req handle
+        list with its still-in-flight subset; a stale/invalid handle (103900)
+        is likewise treated as already-completed and dropped instead of
+        crashing the worker. Other HixlError codes are left in place for
+        get_finished -> _pop_done_transfers to mark the req failed.
+
+        Replacing the handle list (not just polling) is safe because this
+        method, _read_blocks (start_load_kv) and _pop_done_transfers
+        (get_finished) all run in the same worker thread, never concurrently.
+        An emptied per-req list is left in place (not del'd) so
+        _pop_done_transfers still sees the req_id and can run
+        _apply_nz_reformat / _notify_release. Bounded by transfer_timeout to
+        avoid an infinite loop on a stuck handle.
         """
         deadline = time.perf_counter() + self._transfer_timeout_ms / 1000.0
         while time.perf_counter() < deadline:
             any_waiting = False
-            # Snapshot: _read_blocks (start_load) and _pop_done_transfers
-            # (get_finished) mutate _recving_transfers; though they run in
-            # the same worker thread as this call, iterate over a copy so a
-            # future async path can't trigger "dictionary changed size".
-            for handles in list(self._recving_transfers.values()):
-                for h in handles:
-                    with self._hixl_lock:
-                        status = self._wrapper.get_transfer_status(h)
-                    if self._transfer_status_name(status) == "WAITING":
+            # Snapshot the req ids: replacing a handle list below can't
+            # trigger "dictionary changed size" while iterating.
+            for req_id in list(self._recving_transfers.keys()):
+                handles = self._recving_transfers[req_id]
+                still_in_flight: list[int] = []
+                for h in list(handles):
+                    try:
+                        with self._hixl_lock:
+                            status = self._wrapper.get_transfer_status(h)
+                    except Exception as e:
+                        # 103900 == HIXL_PARAM_INVALID: handle already
+                        # consumed (returned COMPLETED earlier) — treat as
+                        # done and drop. The C++ binding raises this via
+                        # py::register_exception<HixlError> as the message
+                        # "<ctx> failed, code=103900"; the code member is not
+                        # exposed as a Python attribute, so match the text too.
+                        # Other errors are real; keep the handle for
+                        # _pop_done_transfers to mark failed.
+                        if (getattr(e, "code", None) == 103900
+                                or "code=103900" in str(e)):
+                            continue
                         any_waiting = True
-                        break
-                if any_waiting:
-                    break
+                        still_in_flight.append(h)
+                        continue
+                    sname = self._transfer_status_name(status)
+                    if sname == "COMPLETED":
+                        # Consumed by hixl — drop so the drafter forward and
+                        # _pop_done_transfers don't re-query a freed handle.
+                        continue
+                    if sname == "WAITING":
+                        any_waiting = True
+                        still_in_flight.append(h)
+                        continue
+                    # FAILED / TIMEOUT / unknown: leave for get_finished to
+                    # mark failed via _pop_done_transfers.
+                    still_in_flight.append(h)
+                self._recving_transfers[req_id] = still_in_flight
             if not any_waiting:
                 return
             time.sleep(0.001)
