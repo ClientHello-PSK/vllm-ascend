@@ -84,16 +84,13 @@ from vllm.v1.kv_cache_interface import (
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.utils import select_common_block_size
 
-from vllm_ascend.distributed.kv_transfer.kv_p2p.hixl_engine_wrapper import (
-    HixlEngineWrapper,
-    TransferOpDesc,
-)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.tp_mapping import (
     TPMapping,
     compute_tp_mapping,
 )
 # isort: off
 if TYPE_CHECKING:
+    from hixl import TransferOpDesc
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import KVConnectorOutput
@@ -102,10 +99,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# hixl_py (import hixl) is the address-level pybind11 binding built from
+# src/python/hixl_py/hixl_py.cc. Loaded lazily so vllm-ascend stays importable
+# without the hixl build artefact unless HIXLEngineConnector is selected.
+_HIXL_MOD = None
+
+
+def _load_hixl():
+    global _HIXL_MOD
+    if _HIXL_MOD is None:
+        import hixl  # type: ignore[import-not-found]
+        _HIXL_MOD = hixl
+    return _HIXL_MOD
+
 # ---------------------------------------------------------------------------
 # Control-plane constants & helpers (forked so this module does not import
 # hixl_connector — see Step R). done-notification runs over the hixl
-# data-plane (wrapper.send_notify / get_notifies), so there is no
+# data-plane (hixl.send_notify / get_notifies), so there is no
 # DONE_RECVING_MSG side-channel constant here.
 # ---------------------------------------------------------------------------
 GET_META_MSG = b"get_meta_msg"
@@ -694,7 +704,7 @@ class HIXLEngineConnectorScheduler:
 class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
     """Pull-mode KV connector backed by hixl::Hixl address-level transfer.
 
-    One instance per rank. Holds a HixlEngineWrapper (hixl::Hixl), the
+    One instance per rank. Holds a hixl::Hixl instance, the
     registered mem handles for local KV layers, and a set of in-flight
     TransferAsync request handles to poll.
     """
@@ -929,10 +939,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             vllm_config.kv_transfer_config.get_from_extra_config("engine_ttl", 3600.0)
         )
 
-        self._wrapper = HixlEngineWrapper()
-        # hixl::Hixl is not thread-safe; connect (handshake thread) and
-        # transfer_async / get_transfer_status (main worker thread) must not
-        # overlap. Every wrapper call goes through this lock.
+        self._hixl_mod = _load_hixl()
+        self._hixl = self._hixl_mod.Hixl()
+        self._hixl_initialized = False
+        # hixl_py serializes calls internally (C++ mutex + GIL release), but
+        # connect (handshake thread) and transfer_async / get_transfer_status
+        # (main worker thread) share this Python-side lock so the call sequence
+        # per engine stays ordered.
         self._hixl_lock = threading.Lock()
         # layer_name -> (mem_handle, base_addr, length)
         self._kv_mem_handles: dict[str, tuple[int, int, int]] = {}
@@ -994,6 +1007,81 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
     # ------------------------------------------------------------------
     # Config & kernel-block-size derivation (mirrors NIXL base_worker.py
     # _sync_block_size_with_kernel and HIXLConnector._extra_options).
+    # ------------------------------------------------------------------
+    # ==================================================================
+    # hixl_py adapter: thin inlined shim over the address-level ``hixl``
+    # module (import hixl, built from src/python/hixl_py/hixl_py.cc). hixl_py
+    # returns (Status, T) tuples instead of raising; _hixl_check turns non-
+    # SUCCESS into RuntimeError so the connector's try/except control flow
+    # (failure recovery / _handle_failed_transfer) is unchanged. Struct
+    # construction (MemDesc / NotifyDesc) and op-enum lookup live here too.
+    # ==================================================================
+    def _hixl_check(self, status: int, ctx: str) -> None:
+        if status != self._hixl_mod.SUCCESS:
+            raise RuntimeError(f"HIXLEngine {ctx} failed, code={status}")
+
+    def _hixl_op(self, op: str):
+        if op not in ("READ", "WRITE"):
+            raise ValueError(f"Unsupported TransferOp: {op!r}")
+        return getattr(self._hixl_mod.TransferOp, op)
+
+    def _hixl_initialize(self, local_engine: str, options: dict[str, str]) -> None:
+        status = self._hixl.initialize(local_engine, options)
+        self._hixl_check(status, "Initialize")
+        self._hixl_initialized = True
+
+    def _hixl_finalize(self) -> None:
+        self._hixl.finalize()
+        self._hixl_initialized = False
+
+    def _hixl_register_mem(self, addr: int, length: int, is_device: bool = True) -> int:
+        mod = self._hixl_mod
+        mt = mod.MemType.MEM_DEVICE if is_device else mod.MemType.MEM_HOST
+        status, handle = self._hixl.register_mem(mod.MemDesc(addr, length), mt)
+        self._hixl_check(status, "RegisterMem")
+        return handle
+
+    def _hixl_deregister_mem(self, handle: int) -> None:
+        status = self._hixl.deregister_mem(handle)
+        self._hixl_check(status, "DeregisterMem")
+
+    def _hixl_connect(self, remote_engine: str, timeout_ms: int = 1000) -> None:
+        status = self._hixl.connect(remote_engine, timeout_ms)
+        self._hixl_check(status, "Connect")
+
+    def _hixl_disconnect(self, remote_engine: str, timeout_ms: int = 1000) -> None:
+        status = self._hixl.disconnect(remote_engine, timeout_ms)
+        self._hixl_check(status, "Disconnect")
+
+    def _hixl_transfer_async(self, remote_engine: str, op: str, op_descs: list) -> int:
+        status, req = self._hixl.transfer_async(
+            remote_engine, self._hixl_op(op), op_descs)
+        self._hixl_check(status, "TransferAsync")
+        return req
+
+    def _hixl_get_transfer_status(self, req: int):
+        status, st = self._hixl.get_transfer_status(req)
+        if status == self._hixl_mod.PARAM_INVALID:
+            # hixl GetTransferStatus is consumable: a prior COMPLETED query
+            # released the handle's internal state, so re-querying it returns
+            # PARAM_INVALID (103900). Return a None sentinel so callers can
+            # drop the handle instead of mistaking it for a hard failure
+            # (HIXL_CS介绍.md:655,701,769).
+            return None
+        self._hixl_check(status, "GetTransferStatus")
+        return st
+
+    def _hixl_send_notify(self, remote_engine: str, name: str, msg: str,
+                         timeout_ms: int = 1000) -> None:
+        nd = self._hixl_mod.NotifyDesc(name=name, notify_msg=msg)
+        status = self._hixl.send_notify(remote_engine, nd, timeout_ms)
+        self._hixl_check(status, "SendNotify")
+
+    def _hixl_get_notifies(self) -> list[tuple[str, str]]:
+        status, ns = self._hixl.get_notifies()
+        self._hixl_check(status, "GetNotifies")
+        return [(n.name, n.notify_msg) for n in ns]
+
     # ------------------------------------------------------------------
     def _parse_hixl_engine_config(self, vllm_config: VllmConfig) -> None:
         """Read kv_connector_extra_config.hixl_engine (plan §2.5).
@@ -1285,7 +1373,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         )
         # 1. Establish the hixl connection (replaces nixl add_remote_agent).
         with self._hixl_lock:
-            self._wrapper.connect(
+            self._hixl_connect(
                 peer_meta.local_engine_endpoint, self._link_timeout_ms
             )
         self._remote_agents.setdefault(remote_engine_id, {})[
@@ -1447,7 +1535,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         for endpoint in endpoints:
             try:
                 with self._hixl_lock:
-                    self._wrapper.disconnect(
+                    self._hixl_disconnect(
                         endpoint, self._link_timeout_ms
                     )
             except Exception as e:  # noqa: BLE001
@@ -1678,8 +1766,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # and a handshake callback on _handshake_initiation_executor may be
         # racing connect() while we re-register here.
         with self._hixl_lock:
-            if not self._wrapper.is_initialized:
-                self._wrapper.initialize(
+            if not self._hixl_initialized:
+                self._hixl_initialize(
                     self._local_engine_endpoint, self._engine_options
                 )
 
@@ -1687,7 +1775,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         with self._hixl_lock:
             for handle, _, _ in self._kv_mem_handles.values():
                 try:
-                    self._wrapper.deregister_mem(handle)
+                    self._hixl_deregister_mem(handle)
                 except Exception:  # noqa: BLE001
                     pass
         self._kv_mem_handles.clear()
@@ -1791,7 +1879,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     continue
                 length = t.numel() * t.element_size()
                 with self._hixl_lock:
-                    handle = self._wrapper.register_mem(
+                    handle = self._hixl_register_mem(
                         base_addr, length, is_device=True
                     )
                 self._kv_mem_handles[f"{layer_name}/{i}"] = (
@@ -2065,7 +2153,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             for local_bid, remote_bid in pairs:
                 remote_addr = remote_base + rank_offset + remote_bid * page_size
                 local_addr = local_base + local_bid * stride + slot * chunk
-                descs.append(TransferOpDesc(local_addr, remote_addr, chunk))
+                descs.append(self._hixl_mod.TransferOpDesc(local_addr, remote_addr, chunk))
             if pairs and is_ssm_group:
                 _max_lbid = max(p[0] for p in pairs)
                 _max_rbid = max(p[1] for p in pairs)
@@ -2210,7 +2298,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             if not group_descs:
                 try:
                     with self._hixl_lock:
-                        self._wrapper.send_notify(
+                        self._hixl_send_notify(
                             endpoint, "DONE", notif_id
                         )
                 except Exception as e:
@@ -2240,7 +2328,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             try:
                 with self._hixl_lock:
-                    handle = self._wrapper.transfer_async(
+                    handle = self._hixl_transfer_async(
                         endpoint, "READ", group_descs
                     )
                 self._recving_transfers.setdefault(
@@ -2475,8 +2563,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             for handle in handles:
                 try:
                     with self._hixl_lock:
-                        status = self._wrapper.get_transfer_status(handle)
-                    sname = self._transfer_status_name(status)
+                        st = self._hixl_get_transfer_status(handle)
+                    if st is None:
+                        # Handle already consumed (PARAM_INVALID/103900: a
+                        # prior COMPLETED query released it) — treat as done.
+                        continue
+                    sname = self._transfer_status_name(st)
                     if sname == "COMPLETED":
                         # TODO: confirm whether hixl needs an explicit
                         # release for the req handle (no wrapper API yet).
@@ -2721,7 +2813,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             try:
                 with self._hixl_lock:
-                    self._wrapper.send_notify(endpoint, "DONE", notif_id)
+                    self._hixl_send_notify(endpoint, "DONE", notif_id)
             except Exception as e:
                 logger.error(
                     "HIXLEngine release notify failed. req=%s rank=%s err=%s",
@@ -2761,7 +2853,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             for agent_endpoint in self._remote_agents[engine_id].values():
                 try:
                     with self._hixl_lock:
-                        self._wrapper.send_notify(agent_endpoint, "HB", hb_msg)
+                        self._hixl_send_notify(agent_endpoint, "HB", hb_msg)
                 except Exception:
                     logger.debug(
                         "HIXLEngine heartbeat send failed to engine %s",
@@ -2798,7 +2890,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         notified_req_ids: set[str] = set()
         try:
             with self._hixl_lock:
-                notifs = self._wrapper.get_notifies()
+                notifs = self._hixl_get_notifies()
         except Exception:
             logger.error("HIXLEngine get_notifies failed", exc_info=True)
             return notified_req_ids
@@ -2892,8 +2984,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         COMPLETED handles are dropped here by replacing each per-req handle
         list with its still-in-flight subset; a stale/invalid handle (103900)
         is likewise treated as already-completed and dropped instead of
-        crashing the worker. Other HixlError codes are left in place for
-        get_finished -> _pop_done_transfers to mark the req failed.
+        crashing the worker. Other failure statuses (FAILED/TIMEOUT) are left
+        in place for get_finished -> _pop_done_transfers to mark the req failed.
 
         Replacing the handle list (not just polling) is safe because this
         method, _read_blocks (start_load_kv) and _pop_done_transfers
@@ -2923,23 +3015,22 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     still_in_flight: list[int] = []
                     for h in list(handles):
                         try:
-                            status = self._wrapper.get_transfer_status(h)
+                            st = self._hixl_get_transfer_status(h)
                         except Exception as e:
-                            # 103900 == HIXL_PARAM_INVALID: handle already
-                            # consumed (returned COMPLETED earlier) — treat as
-                            # done and drop. The C++ binding raises this via
-                            # py::register_exception<HixlError> as the message
-                            # "<ctx> failed, code=103900"; the code member is not
-                            # exposed as a Python attribute, so match the text
-                            # too. Other errors are real; keep the handle for
+                            # Real hixl error (PARAM_INVALID/103900 is mapped to
+                            # None inside _hixl_get_transfer_status and never
+                            # reaches here). Keep the handle for
                             # _pop_done_transfers to mark failed.
-                            if (getattr(e, "code", None) == 103900
-                                    or "code=103900" in str(e)):
-                                continue
+                            logger.debug(
+                                "HIXLEngine wait_for_layer_load poll err=%s", e)
                             any_waiting = True
                             still_in_flight.append(h)
                             continue
-                        sname = self._transfer_status_name(status)
+                        if st is None:
+                            # Handle already consumed (PARAM_INVALID/103900: a
+                            # prior COMPLETED query released it) — drop.
+                            continue
+                        sname = self._transfer_status_name(st)
                         if sname == "COMPLETED":
                             # Consumed by hixl — drop so the drafter forward and
                             # _pop_done_transfers don't re-query a freed handle.
@@ -3122,7 +3213,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._handshake_listener_thread.join(timeout=2.0)
         # Cancel queued handshakes (executor shared by both roles).
         self._handshake_initiation_executor.shutdown(wait=True, cancel_futures=True)
-        # SCHEDULER role has no data plane — _wrapper / _hixl_lock /
+        # SCHEDULER role has no data plane — _hixl / _hixl_lock /
         # _kv_mem_handles were never built (the early-return skipped worker
         # init). Only WORKER finalizes the hixl engine; without this guard
         # the SCHEDULER shutdown would AttributeError on _hixl_lock.
@@ -3134,7 +3225,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         with self._hixl_lock:
             for handle, _, _ in self._kv_mem_handles.values():
                 try:
-                    self._wrapper.deregister_mem(handle)
+                    self._hixl_deregister_mem(handle)
                 except Exception:  # noqa: BLE001
                     pass
-            self._wrapper.finalize()
+            self._hixl_finalize()
