@@ -951,6 +951,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._kv_mem_handles: dict[str, tuple[int, int, int]] = {}
         # request_id -> list[TransferAsync handle]
         self._recving_transfers: dict[str, list[int]] = {}
+        # request_id -> submitted bytes / first-submit perf_counter.
+        self._xfer_bytes: dict[str, int] = {}
+        self._xfer_start: dict[str, float] = {}
+        # Started lazily on first enqueue so the SCHEDULER role never spawns it.
+        self._notify_queue: "queue.Queue[tuple[str, str, str] | None]" = (
+            queue.Queue(maxsize=self._notify_queue_size))
+        self._notify_thread: threading.Thread | None = None
+        self._notify_thread_lock = threading.Lock()
         # request_id -> HIXLEngineReqMeta (for failure recovery / post-process)
         self._recving_metadata: dict[str, HIXLEngineReqMeta] = {}
         # Reqs whose handshake hadn't landed yet are parked on
@@ -1064,17 +1072,15 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         return req
 
     def _hixl_get_transfer_status(self, req: int):
-        # hixl's GetTransferStatus follows a "not-found" contract: the engine
-        # drops its record on ANY terminal status (COMPLETED / FAILED /
-        # TIMEOUT) *and* on any channel error, after which a re-query returns
-        # PARAM_INVALID (103900). None therefore means "the record is gone",
-        # NOT "it completed" — the cause is unrecoverable from here, so a
-        # caller that already observed a failure must record it before the
-        # handle is re-queried.
+        # "not-found" contract: hixl drops its record on ANY terminal status
+        # (COMPLETED / FAILED / TIMEOUT) and on any channel error, after which
+        # a re-query returns PARAM_INVALID (103900). None therefore means
+        # "record gone", NOT "completed" — a caller that observed a failure
+        # must record it before the handle is re-queried.
         #
-        # Order matters: on the PARAM_INVALID path hixl also writes FAILED
-        # into the status out-param, so testing `st` before `status` would
-        # misread an already-consumed handle as a hard failure.
+        # Order matters: on the PARAM_INVALID path hixl also writes FAILED into
+        # the status out-param, so testing `st` before `status` would misread
+        # an already-consumed handle as a hard failure.
         status, st = self._hixl.get_transfer_status(req)
         if status == self._hixl_mod.PARAM_INVALID:
             return None
@@ -1108,6 +1114,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._engine_options: dict[str, str] = cfg.get("options", {})
         self._link_timeout_ms: int = int(cfg.get("link_timeout_ms", 5000))
         self._transfer_timeout_ms: int = int(cfg.get("transfer_timeout_ms", 60_000))
+        # Bounds how long one notify can freeze the data plane: SendNotify
+        # holds hixl_py's process-wide C++ mutex until the peer ACKs. hixl's
+        # own default (1000ms) is far too long for a call on the KV path;
+        # DONE loss is covered by the P-side lease, a lost HB is re-sent.
+        self._notify_timeout_ms: int = int(cfg.get("notify_timeout_ms", 100))
+        self._notify_queue_size: int = int(cfg.get("notify_queue_size", 1024))
+        # Opt-in only, to A/B the two behaviours without a rebuild; see
+        # wait_for_layer_load for why blocking is not needed.
+        self._blocking_layer_wait: bool = bool(
+            cfg.get("blocking_layer_wait", False))
         self._side_channel_port_base: int = int(cfg.get("side_channel_port", 0))
         raw_local_engine: str = cfg.get("local_engine", "")
         if not raw_local_engine:
@@ -2025,8 +2041,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         remote_engine_id: str,
         group_idx: int,
         source_rank: int,
-    ) -> list[TransferOpDesc]:
+    ) -> tuple[list[TransferOpDesc], int]:
         """Build TransferOpDesc batch for one source rank, one group.
+
+        Returns ``(descs, total_bytes)``; the byte count feeds the
+        effective-bandwidth log in _pop_done_transfers and is accumulated
+        during the build so it costs nothing extra.
 
         Ports NIXL _build_fa_remote (base_worker.py:1386-1429) for the remote
         side and _build_local_splits_from_plan (base_worker.py:160-209) for
@@ -2104,8 +2124,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             slot = plan.rank_to_attention_slot.get(source_rank, 0)
 
         descs: list[TransferOpDesc] = []
-        # Hoisted out of the per-desc loop: with thousands of (region, block)
-        # pairs per request the attribute lookups dominate.
         _TransferOpDesc = self._hixl_mod.TransferOpDesc
         _emit = descs.append
         # Open coalescing run; cur_len == 0 means there is none.
@@ -2113,6 +2131,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         cur_remote = 0
         cur_len = 0
         n_matched_regions = 0
+        # Accumulated here rather than summed off the finished descs, which
+        # would cost a pybind attribute sweep.
+        total_bytes = 0
         pairs = list(zip(local_block_ids, remote_block_ids))
         if is_ssm_group and pairs:
             logger.debug(
@@ -2177,14 +2198,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             for local_bid, remote_bid in pairs:
                 remote_addr = remote_base + rank_offset + remote_bid * page_size
                 local_addr = local_base + local_bid * stride + slot * chunk
-                # Coalesce into the open run when this desc abuts it on BOTH
-                # sides. Consecutive block ids do that whenever
-                # chunk == stride == page_size (replicated regions, and the
-                # homogeneous-TP case where a group has one source rank); a
-                # strided layout (chunk < stride) never satisfies the test and
-                # falls through to one desc per pair, as before. Fewer, longer
-                # descs mean fewer pybind objects and fewer 256-desc HCCL
-                # batches downstream.
+                # Extend the open run only when this desc abuts it on BOTH
+                # sides; a strided layout (chunk < stride) never satisfies the
+                # test and falls through to one desc per pair.
+                total_bytes += chunk
                 if (cur_len
                         and local_addr == cur_local + cur_len
                         and remote_addr == cur_remote + cur_len):
@@ -2215,8 +2232,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         if cur_len:
             _emit(_TransferOpDesc(cur_local, cur_remote, cur_len))
         if logger.isEnabledFor(logging.DEBUG):
-            # n_descs vs n_descs_unmerged is the coalescing hit rate, which
-            # depends on how contiguous the scheduler's block ids happen to be.
+            # n_descs vs n_descs_unmerged is the coalescing hit rate.
             logger.debug(
                 "HIXLTRACE build_op_summary group_idx=%d source_rank=%d "
                 "is_ssm=%d route_by_spec=%d d_ssm_groups=%d "
@@ -2227,7 +2243,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 len(descs), n_matched_regions * len(pairs),
                 list(self._region_group_idx),
             )
-        return descs
+        return descs, total_bytes
 
     def _read_blocks(
         self, request_id: str, req_meta: HIXLEngineReqMeta, plan: TPMapping
@@ -2301,6 +2317,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             )
             # Gather this rank's descs across all groups it sources.
             group_descs: list[TransferOpDesc] = []
+            rank_bytes = 0
             for g, source_ranks in enumerate(plan.source_ranks_per_group):
                 if g >= num_groups or rank not in source_ranks:
                     continue
@@ -2331,23 +2348,15 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                         f"{remote_physical_per_logical}); heterogeneous "
                         "block_size not supported by the zip-pair path."
                     )
-                group_descs.extend(self._build_op_descs(
+                _g_descs, _g_bytes = self._build_op_descs(
                     list(lb), list(rb), plan, remote_engine_id, g, rank,
-                ))
+                )
+                group_descs.extend(_g_descs)
+                rank_bytes += _g_bytes
             # Full prefix hit across all groups for this rank: no transfer,
             # just notify P to release (NIXL pull_worker.py:277-294).
             if not group_descs:
-                try:
-                    with self._hixl_lock:
-                        self._hixl_send_notify(
-                            endpoint, "DONE", notif_id
-                        )
-                except Exception as e:
-                    logger.error(
-                        "HIXLEngine send_notify (prefix hit) failed. "
-                        "req=%s rank=%s err=%s",
-                        request_id, rank, e,
-                    )
+                self._enqueue_notify(endpoint, "DONE", notif_id)
                 # Mark this rank notified so _notify_release skips it (the
                 # prefix-hit notify and the release notify share the same
                 # notif_id).
@@ -2356,9 +2365,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 ).add(rank)
                 continue
             if group_descs and logger.isEnabledFor(logging.DEBUG):
-                # Nine full sweeps over group_descs (three comprehensions plus
-                # six min/max). Python evaluates call arguments before the
-                # level check, so without this guard they run at INFO too.
+                # Guarded: the args below sweep group_descs nine times and
+                # Python evaluates them before the level check.
                 _la = [d.local_addr for d in group_descs]
                 _ra = [d.remote_addr for d in group_descs]
                 _ln = [d.len for d in group_descs]
@@ -2378,6 +2386,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 self._recving_transfers.setdefault(
                     request_id, []
                 ).append(handle)
+                # Bytes accumulate across a request's per-rank transfers; the
+                # clock starts at the first submit.
+                self._xfer_bytes[request_id] = (
+                    self._xfer_bytes.get(request_id, 0) + rank_bytes)
+                self._xfer_start.setdefault(request_id, time.perf_counter())
                 # Record this rank as a real reader so _notify_release sends
                 # DONE to it only.
                 self._transferred_ranks.setdefault(
@@ -2594,6 +2607,28 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             out.extend(range(base, base + phys))
         return out
 
+    def _log_transfer_bandwidth(self, req_id: str, had_failure: bool) -> None:
+        """Report effective bandwidth for one request's KV pull.
+
+        Answers two questions: whether a single transfer_async saturates the
+        link (hixl slices op_descs into 256-desc batches onto one stream, so it
+        may not), and whether the submitted bytes match the model's theoretical
+        KV size — a larger figure would mean ranges are transferred twice.
+        """
+        nbytes = self._xfer_bytes.pop(req_id, 0)
+        started = self._xfer_start.pop(req_id, None)
+        if started is None or nbytes <= 0:
+            return
+        elapsed = time.perf_counter() - started
+        if elapsed <= 0.0:
+            return
+        logger.info(
+            "HIXLEngine KV pull done. req=%s bytes=%d (%.1f MiB) "
+            "elapsed=%.1fms effective=%.2f GB/s failed=%s",
+            req_id, nbytes, nbytes / 1048576.0, elapsed * 1000.0,
+            nbytes / elapsed / 1e9, had_failure,
+        )
+
     def _transfer_status_name(self, status: Any) -> str:
         """Normalize a hixl TransferStatus enum value to a comparable name."""
         name = getattr(status, "name", None)
@@ -2619,18 +2654,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             had_failure = False
             for handle in handles:
                 try:
-                    # Read-only; see wait_for_layer_load for why the Python
-                    # lock buys nothing here.
+                    # Read-only; see wait_for_layer_load on the missing lock.
                     st = self._hixl_get_transfer_status(handle)
                     if st is None:
-                        # Record gone (PARAM_INVALID/103900). Under hixl's
-                        # not-found contract this means "some earlier query
-                        # consumed a terminal status or hit an error" — the
-                        # two causes are indistinguishable here. Treat the
-                        # handle as resolved; if it was a failure, the
-                        # observer (wait_for_layer_load) already recorded it
-                        # in _failed_recv_reqs, which gates _notify_release
-                        # below.
+                        # Record gone: an earlier query consumed a terminal
+                        # status or hit an error, indistinguishable here. If it
+                        # was a failure the observer already put the req in
+                        # _failed_recv_reqs, which gates _notify_release below.
                         continue
                     sname = self._transfer_status_name(st)
                     if sname == "COMPLETED":
@@ -2660,6 +2690,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     "HIXLTRACE D-transfer_done req=%s handles=%d failed=%s",
                     req_id, len(handles), had_failure,
                 )
+                self._log_transfer_bandwidth(req_id, had_failure)
                 del transfers[req_id]
                 # Only notify P to release if the req finished cleanly AND no
                 # earlier rank's transfer_async raised (_read_blocks
@@ -2848,6 +2879,68 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             k_buffer, v_buffer, k_cache_layer, v_cache_layer, slot_mapping,
         )
 
+    # ------------------------------------------------------------------
+    # Async notify sender.
+    #
+    # SendNotify blocks until the peer ACKs (adxl_inner_engine.cc:611-621), and
+    # hixl_py holds its one process-wide C++ mutex for the whole call
+    # (hixl_py.cc:195-202) — so a slow ACK freezes transfer_async /
+    # get_transfer_status / get_notifies too. Neither half of the fix is
+    # sufficient alone: this thread keeps the forward thread off the ACK wait,
+    # while a short _notify_timeout_ms bounds the freeze, which happens no
+    # matter which thread issues the call.
+    # ------------------------------------------------------------------
+    def _ensure_notify_sender(self) -> None:
+        if self._notify_thread is not None:
+            return
+        with self._notify_thread_lock:
+            if self._notify_thread is not None:
+                return
+            t = threading.Thread(
+                target=self._notify_sender_loop,
+                name="hixl-notify-sender",
+                daemon=True,
+            )
+            self._notify_thread = t
+            t.start()
+
+    def _notify_sender_loop(self) -> None:
+        while True:
+            item = self._notify_queue.get()
+            if item is None:  # shutdown sentinel
+                return
+            endpoint, name, msg = item
+            try:
+                # No _hixl_lock: taking it would hand the ACK wait back to the
+                # forward thread, which is what this thread exists to avoid.
+                self._hixl_send_notify(
+                    endpoint, name, msg, self._notify_timeout_ms)
+            except Exception as e:  # noqa: BLE001
+                # DONE loss falls back to the P-side lease; HB is re-sent next
+                # round. Neither warrants a retry that could pile up behind a
+                # dead peer.
+                logger.warning(
+                    "HIXLEngine notify send failed. name=%s endpoint=%s err=%s",
+                    name, endpoint, e,
+                )
+
+    def _enqueue_notify(self, endpoint: str, name: str, msg: str) -> None:
+        """Hand a notify to the sender thread; never blocks the caller."""
+        self._ensure_notify_sender()
+        try:
+            self._notify_queue.put_nowait((endpoint, name, msg))
+        except queue.Full:
+            if name == "HB":
+                logger.debug(
+                    "HIXLEngine notify queue full, dropping HB to %s", endpoint)
+            else:
+                # Loud on purpose: a full queue means the peer is not ACKing.
+                logger.warning(
+                    "HIXLEngine notify queue full (%d), dropping %s to %s; "
+                    "P-side lease expiry is the backstop.",
+                    self._notify_queue_size, name, endpoint,
+                )
+
     def _notify_release(self, req_id: str) -> None:
         """Tell every P-side source rank this req actually read from that its
         reads are done.
@@ -2875,14 +2968,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             endpoint = remote_agents.get((0, rank))
             if endpoint is None:
                 continue
-            try:
-                with self._hixl_lock:
-                    self._hixl_send_notify(endpoint, "DONE", notif_id)
-            except Exception as e:
-                logger.error(
-                    "HIXLEngine release notify failed. req=%s rank=%s err=%s",
-                    req_id, rank, e,
-                )
+            self._enqueue_notify(endpoint, "DONE", notif_id)
 
     def _send_heartbeats(self, metadata: "HIXLEngineConnectorMetadata") -> None:
         """D-side: extend P-side leases for reqs still WAITING in scheduler.
@@ -2915,14 +3001,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             hb_msg = ",".join(req_ids)
             for agent_endpoint in self._remote_agents[engine_id].values():
-                try:
-                    with self._hixl_lock:
-                        self._hixl_send_notify(agent_endpoint, "HB", hb_msg)
-                except Exception:
-                    logger.debug(
-                        "HIXLEngine heartbeat send failed to engine %s",
-                        engine_id, exc_info=True,
-                    )
+                self._enqueue_notify(agent_endpoint, "HB", hb_msg)
 
     def _handle_heartbeat(self, payload: str) -> None:
         """P-side: extend leases for reqs referenced in a heartbeat.
@@ -3031,7 +3110,26 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 self._invalid_block_ids.update(group_blocks)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Block until in-flight transfers covering this layer resolve.
+        """No-op by default; see ``blocking_layer_wait`` to restore the wait.
+
+        There are no per-layer handles here — TransferAsync is issued once per
+        source rank covering every region — so the only thing this method could
+        wait for is "all in-flight transfers", i.e. other requests' pulls. That
+        is a whole-batch stall for the length of a KV pull.
+
+        It is also unnecessary: get_num_new_matched_tokens returns
+        ``(count, True)`` for remote-prefill requests, so the scheduler parks
+        them in WAITING_FOR_REMOTE_KVS and keeps them out of the forward batch
+        until finished_recving is reported
+        (vllm/v1/core/sched/scheduler.py:2192-2203) — nothing in the current
+        batch needs the KV that is in flight. Every other P/D pull connector
+        (NIXL, Mooncake, MoRIIO, HIXLConnector) is a no-op for the same reason.
+
+        Handles are polled once per step in _pop_done_transfers (get_finished),
+        which also owns failure reporting.
+
+        The blocking path below, when enabled: block until in-flight transfers
+        covering this layer resolve.
 
         Replaces hixl_connector's pull_blocks sync + _reformat_staging_to_local.
         Here there is nothing to reformat — once GetTransferStatus returns
@@ -3063,27 +3161,23 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         there, so a req failed here does not notify the P side. Bounded by
         transfer_timeout to avoid an infinite loop on a stuck handle.
         """
+        if not self._blocking_layer_wait:
+            # Default path: no-op, matching every other P/D pull connector
+            # (NIXL, Mooncake, MoRIIO, HIXLConnector). See the docstring for
+            # why blocking here is neither required nor desirable.
+            return
         if not self._recving_transfers:
-            # Steady-state fast path: no request is loading KV at all, which is
-            # the common case once the batch is warm. Skips the deadline
-            # arithmetic and the two perf_counter calls the loop below would
-            # otherwise pay once per full-attention layer per forward (twice
-            # that with the MTP drafter). Requests whose handle lists have all
-            # drained still keep the dict non-empty until get_finished pops
-            # them, so those steps take the (cheap) full pass.
             return
         deadline = time.perf_counter() + self._transfer_timeout_ms / 1000.0
         backoff = 0.001
         while time.perf_counter() < deadline:
             any_waiting = False
-            # No _hixl_lock here: get_transfer_status is read-only and hixl_py
-            # already serializes every call on its own C++ mutex, so the Python
-            # lock adds no safety and no concurrency (hixl_py.h:50-53 — one
-            # mutex for all methods). _recving_transfers is likewise
-            # worker-thread-only: _read_blocks (start_load_kv),
-            # _pop_done_transfers (get_finished) and this method never run
-            # concurrently, and the handshake thread only extends
-            # _ready_requests.
+            # No _hixl_lock: get_transfer_status is read-only and hixl_py
+            # serializes every call on one C++ mutex (hixl_py.h:50-53), so the
+            # Python lock adds neither safety nor concurrency.
+            # _recving_transfers is worker-thread-only — _read_blocks,
+            # _pop_done_transfers and this method never run concurrently, and
+            # the handshake thread only extends _ready_requests.
             #
             # Snapshot the req ids: replacing a handle list below can't
             # trigger "dictionary changed size" while iterating.
@@ -3094,12 +3188,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     try:
                         st = self._hixl_get_transfer_status(h)
                     except Exception as e:
-                        # A real hixl error (PARAM_INVALID/103900 maps to
-                        # None below and never raises). hixl dropped its
-                        # record as part of this very query, so deferring
-                        # to _pop_done_transfers would surface only
-                        # "not found" — the failure must be recorded here
-                        # or it turns into a silent success.
+                        # hixl dropped its record as part of this very query,
+                        # so _pop_done_transfers would later see only
+                        # "not found" — record the failure here or it becomes
+                        # a silent success.
                         logger.error(
                             "HIXLEngine wait_for_layer_load poll failed. "
                             "req=%s err=%s", req_id, e,
@@ -3107,26 +3199,18 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                         self._handle_failed_transfer(req_id, h)
                         continue
                     if st is None:
-                        # Record gone (PARAM_INVALID). Either a prior query
-                        # consumed a terminal status or an error released
-                        # it; the two are indistinguishable from here, so
-                        # treat the handle as resolved and drop it. A
-                        # failure, if any, was already recorded by whoever
-                        # observed it.
+                        # Record gone; cause is unrecoverable from here, and
+                        # whoever observed a failure already recorded it.
                         continue
                     sname = self._transfer_status_name(st)
                     if sname == "COMPLETED":
-                        # Consumed by hixl — drop so the drafter forward and
-                        # _pop_done_transfers don't re-query a freed handle.
                         continue
                     if sname == "WAITING":
                         any_waiting = True
                         still_in_flight.append(h)
                         continue
-                    # FAILED / TIMEOUT / unknown are terminal, so hixl has
-                    # already released the record on this query. Mark the
-                    # req failed now and drop the handle; _notify_release
-                    # is gated on _failed_recv_reqs in _pop_done_transfers.
+                    # Terminal, so hixl released the record on this query —
+                    # mark failed now rather than deferring.
                     logger.error(
                         "HIXLEngine transfer failed during layer wait. "
                         "req=%s status=%s", req_id, sname,
@@ -3193,6 +3277,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._recving_metadata.pop(req_id, None)
             self._notified_release_ranks.pop(req_id, None)
             self._transferred_ranks.pop(req_id, None)
+            # Failed before any handle resolved: never reaches
+            # _log_transfer_bandwidth, so drop the accounting here.
+            self._xfer_bytes.pop(req_id, None)
+            self._xfer_start.pop(req_id, None)
         # Drain reqs whose handshakes finished during this step's forward:
         # issue their READ at step end so next step's wait_for_layer_load
         # sees COMPLETED handles sooner (one less step of cold-start KV-read
@@ -3309,6 +3397,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # the SCHEDULER shutdown would AttributeError on _hixl_lock.
         if self._scheduler is not None:
             return
+        # Drain before finalizing the engine below. Must sit after the
+        # SCHEDULER early-return: _notify_queue / _notify_thread are built with
+        # the worker data plane and do not exist on the scheduler side.
+        # Bounded join so a peer that stopped ACKing cannot hang shutdown.
+        if self._notify_thread is not None:
+            try:
+                self._notify_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self._notify_thread.join(timeout=2.0)
         # Let in-flight connect() finish before we pull the engine out from
         # under it (connect runs on the executor above and takes _hixl_lock —
         # finalizing underneath it would be a use-after-free).
