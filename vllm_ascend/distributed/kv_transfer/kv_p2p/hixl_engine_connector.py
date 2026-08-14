@@ -32,6 +32,7 @@ TODOs: Mamba conv decomposition, heterogeneous block_size reshard
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import queue
 import threading
@@ -69,6 +70,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
@@ -97,8 +99,6 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 # isort: on
 
-logger = logging.getLogger(__name__)
-
 # hixl_py (import hixl) is the address-level pybind11 binding built from
 # src/python/hixl_py/hixl_py.cc. Loaded lazily so vllm-ascend stays importable
 # without the hixl build artefact unless HIXLEngineConnector is selected.
@@ -122,6 +122,162 @@ GET_META_MSG = b"get_meta_msg"
 # Error-reply marker for a malformed GET_META handshake. A normal reply's
 # handshake_bytes is msgpack-encoded and never starts with this ASCII prefix.
 HIXL_ERR_PREFIX = b"__HIXL_ERR__"
+
+# EngineFactory selectors. Do not change engine_factory.cc; this connector
+# injects/strips Initialize options so 910 defaults to HixlCS.
+_HIXL_ENGINE_BACKEND_CS = "hixl_cs"
+_HIXL_ENGINE_BACKEND_COMM = "comm"
+_HIXL_ENGINE_BACKENDS = frozenset({
+    _HIXL_ENGINE_BACKEND_CS,
+    _HIXL_ENGINE_BACKEND_COMM,
+})
+_HIXL_CS_LOCAL_COMM_RES = '{"version":"1.3"}'
+_HIXL_OPTION_LOCAL_COMM_RES = "LocalCommRes"
+_HIXL_OPTION_GLOBAL_RESOURCE_CONFIG = "GlobalResourceConfig"
+_HIXL_PROTOCOL_DESC_FLAT = "comm_resource_config.protocol_desc"
+
+
+def _loads_json_object(raw: str) -> dict[str, Any] | None:
+    try:
+        obj = json.loads(raw)
+    except (TypeError, json.JSONDecodeError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _protocol_desc_from_grc(obj: dict[str, Any]) -> Any:
+    if _HIXL_PROTOCOL_DESC_FLAT in obj:
+        return obj[_HIXL_PROTOCOL_DESC_FLAT]
+    crc = obj.get("comm_resource_config")
+    if isinstance(crc, dict):
+        return crc.get("protocol_desc")
+    return None
+
+
+def _protocol_desc_nonempty(desc: Any) -> bool:
+    if desc is None:
+        return False
+    if isinstance(desc, str):
+        return bool(desc)
+    if isinstance(desc, list):
+        return any(bool(item) for item in desc)
+    return True
+
+
+def _local_comm_res_is_cs(raw: str) -> bool:
+    obj = _loads_json_object(raw)
+    return obj is not None and obj.get("version") == "1.3"
+
+
+def _has_protocol_desc(options: dict[str, str]) -> bool:
+    raw = options.get(_HIXL_OPTION_GLOBAL_RESOURCE_CONFIG)
+    if not raw:
+        return False
+    obj = _loads_json_object(raw)
+    if obj is None:
+        return False
+    return _protocol_desc_nonempty(_protocol_desc_from_grc(obj))
+
+
+def _strip_protocol_desc(grc_raw: str) -> tuple[str | None, bool]:
+    obj = _loads_json_object(grc_raw)
+    if obj is None:
+        return grc_raw, False
+    stripped = False
+    if _HIXL_PROTOCOL_DESC_FLAT in obj:
+        desc = obj.pop(_HIXL_PROTOCOL_DESC_FLAT)
+        stripped = stripped or _protocol_desc_nonempty(desc)
+    crc = obj.get("comm_resource_config")
+    if isinstance(crc, dict) and "protocol_desc" in crc:
+        desc = crc.pop("protocol_desc")
+        stripped = stripped or _protocol_desc_nonempty(desc)
+        if not crc:
+            obj.pop("comm_resource_config", None)
+    if not obj:
+        return None, stripped
+    return json.dumps(obj, separators=(",", ":")), stripped
+
+
+def _normalize_hixl_engine_options(raw: Any) -> dict[str, str]:
+    """Coerce hixl_engine.options to map<string,string> for pybind Initialize."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "hixl_engine.options must be a dict, "
+            f"got {type(raw).__name__}."
+        )
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key)
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            out[name] = json.dumps(value, separators=(",", ":"))
+        elif isinstance(value, str):
+            out[name] = value
+        else:
+            out[name] = str(value)
+    return out
+
+
+def _apply_hixl_engine_backend_options(
+    backend: str, options: dict[str, str]
+) -> tuple[dict[str, str], str]:
+    """Inject or strip EngineFactory CS selectors. Does not mutate `options`.
+
+    Factory order: nonempty LocalCommRes version=="1.3" → hixl_cs; other
+    nonempty LocalCommRes → comm (protocol_desc is never consulted); else
+    nonempty protocol_desc → hixl_cs. So a leftover 1.2 LCR would pin comm
+    even if protocol_desc is set — backend=hixl_cs replaces it.
+    """
+    out = dict(options)
+    if backend == _HIXL_ENGINE_BACKEND_CS:
+        lcr = out.get(_HIXL_OPTION_LOCAL_COMM_RES, "")
+        if lcr and _local_comm_res_is_cs(lcr):
+            return out, "none"
+        if lcr:
+            logger.warning(
+                "hixl_engine.backend=hixl_cs but LocalCommRes is not version "
+                "1.3; replacing it so EngineFactory selects hixl_cs. "
+                "original=%s",
+                lcr,
+            )
+            out[_HIXL_OPTION_LOCAL_COMM_RES] = _HIXL_CS_LOCAL_COMM_RES
+            return out, "LocalCommRes:1.3"
+        if _has_protocol_desc(out):
+            return out, "none"
+        out[_HIXL_OPTION_LOCAL_COMM_RES] = _HIXL_CS_LOCAL_COMM_RES
+        return out, "LocalCommRes:1.3"
+
+    if backend == _HIXL_ENGINE_BACKEND_COMM:
+        stripped: list[str] = []
+        lcr = out.get(_HIXL_OPTION_LOCAL_COMM_RES, "")
+        if lcr and _local_comm_res_is_cs(lcr):
+            out.pop(_HIXL_OPTION_LOCAL_COMM_RES)
+            stripped.append("LocalCommRes:1.3")
+        grc = out.get(_HIXL_OPTION_GLOBAL_RESOURCE_CONFIG)
+        if grc:
+            new_grc, did_strip = _strip_protocol_desc(grc)
+            if did_strip:
+                stripped.append("protocol_desc")
+                if new_grc is None:
+                    out.pop(_HIXL_OPTION_GLOBAL_RESOURCE_CONFIG)
+                else:
+                    out[_HIXL_OPTION_GLOBAL_RESOURCE_CONFIG] = new_grc
+        if stripped:
+            logger.warning(
+                "hixl_engine.backend=comm is authoritative; stripped CS "
+                "selector(s) %s from options.",
+                ",".join(stripped),
+            )
+        injected = "none" if not stripped else "stripped:" + ",".join(stripped)
+        return out, injected
+
+    raise ValueError(
+        "hixl_engine.backend must be 'hixl_cs' or 'comm', "
+        f"got {backend!r}."
+    )
 
 
 @contextmanager
@@ -1038,6 +1194,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         return getattr(self._hixl_mod.TransferOp, op)
 
     def _hixl_initialize(self, local_engine: str, options: dict[str, str]) -> None:
+        # EngineFactory 的 selected engine 走 CANN slog，不会进 vllm 日志。
+        logger.info(
+            "HIXLEngine Initialize backend=%s requested=%s injected=%s "
+            "local_engine=%s options=%s",
+            self._engine_backend,
+            self._engine_backend_requested,
+            self._engine_backend_injected,
+            local_engine,
+            options,
+        )
         status = self._hixl.initialize(local_engine, options)
         self._hixl_check(status, "Initialize")
         self._hixl_initialized = True
@@ -1102,16 +1268,35 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
     def _parse_hixl_engine_config(self, vllm_config: VllmConfig) -> None:
         """Read kv_connector_extra_config.hixl_engine (plan §2.5).
 
-        Fields: local_engine (host:port for hixl Initialize), options (dict
-        passed through to Initialize), link_timeout_ms, transfer_timeout_ms,
-        side_channel_port (base ZMQ handshake port; the scheduler-side single
-        ROUTER listener binds base + data_parallel_index, mirroring NIXL
-        base_scheduler.py:64-68 — the D side learns it via the remote_port
-        field that P's request_finished writes into kv_transfer_params).
+        Fields: local_engine (host:port for hixl Initialize), backend
+        (hixl_cs|comm, default hixl_cs), options (dict passed through to
+        Initialize after backend injection), link_timeout_ms,
+        transfer_timeout_ms, side_channel_port (base ZMQ handshake port;
+        the scheduler-side single ROUTER listener binds base +
+        data_parallel_index, mirroring NIXL base_scheduler.py:64-68 — the
+        D side learns it via the remote_port field that P's
+        request_finished writes into kv_transfer_params).
         """
         kvtc = vllm_config.kv_transfer_config
         cfg: dict[str, Any] = kvtc.get_from_extra_config("hixl_engine", {})
-        self._engine_options: dict[str, str] = cfg.get("options", {})
+        raw_backend = cfg.get("backend")
+        if raw_backend is None or (
+                isinstance(raw_backend, str) and not raw_backend.strip()):
+            self._engine_backend_requested = "default"
+            backend = _HIXL_ENGINE_BACKEND_CS
+        else:
+            backend = str(raw_backend).strip()
+            self._engine_backend_requested = backend
+        if backend not in _HIXL_ENGINE_BACKENDS:
+            raise ValueError(
+                "hixl_engine.backend must be 'hixl_cs' or 'comm', "
+                f"got {backend!r}."
+            )
+        options = _normalize_hixl_engine_options(cfg.get("options", {}))
+        options, injected = _apply_hixl_engine_backend_options(backend, options)
+        self._engine_backend = backend
+        self._engine_backend_injected = injected
+        self._engine_options: dict[str, str] = options
         self._link_timeout_ms: int = int(cfg.get("link_timeout_ms", 5000))
         self._transfer_timeout_ms: int = int(cfg.get("transfer_timeout_ms", 60_000))
         # Bounds how long one notify can freeze the data plane: SendNotify
