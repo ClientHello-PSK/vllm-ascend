@@ -178,6 +178,32 @@ def _has_protocol_desc(options: dict[str, str]) -> bool:
         return False
     return _protocol_desc_nonempty(_protocol_desc_from_grc(obj))
 
+def _flatten_grc_protocol_desc(options: dict[str, str]) -> bool:
+    """Rewrite nested protocol_desc to the flat key HixlOptions::from_json reads.
+
+    C++ only checks ``comm_resource_config.protocol_desc`` on the GRC root.
+    Nested ``{"comm_resource_config":{"protocol_desc":[...]}}`` is valid JSON
+    but ignored, so Factory falls through to CommEngine on 910.
+    """
+    raw = options.get(_HIXL_OPTION_GLOBAL_RESOURCE_CONFIG)
+    if not raw:
+        return False
+    obj = _loads_json_object(raw)
+    if obj is None:
+        return False
+    if _HIXL_PROTOCOL_DESC_FLAT in obj:
+        return False
+    crc = obj.get("comm_resource_config")
+    if not isinstance(crc, dict) or "protocol_desc" not in crc:
+        return False
+    desc = crc.pop("protocol_desc")
+    obj[_HIXL_PROTOCOL_DESC_FLAT] = desc
+    if not crc:
+        obj.pop("comm_resource_config", None)
+    options[_HIXL_OPTION_GLOBAL_RESOURCE_CONFIG] = json.dumps(
+        obj, separators=(",", ":")
+    )
+    return True
 
 def _strip_protocol_desc(grc_raw: str) -> tuple[str | None, bool]:
     obj = _loads_json_object(grc_raw)
@@ -233,6 +259,17 @@ def _apply_hixl_engine_backend_options(
     """
     out = dict(options)
     if backend == _HIXL_ENGINE_BACKEND_CS:
+        # CS branch only: flatten before the LCR/protocol_desc checks below
+        # (the _has_protocol_desc gate at "none" must see the form C++ reads).
+        # comm branch skips it — _strip_protocol_desc handles both forms and
+        # the CS-selection warning below would be off-topic there.
+        if _flatten_grc_protocol_desc(out):
+            logger.warning(
+                "hixl_engine.options GlobalResourceConfig used nested "
+                "comm_resource_config.protocol_desc; flattened to the key "
+                "HixlOptions parses. Nested form is ignored by C++ and would "
+                "silently select CommEngine."
+            )
         lcr = out.get(_HIXL_OPTION_LOCAL_COMM_RES, "")
         if lcr and _local_comm_res_is_cs(lcr):
             return out, "none"
