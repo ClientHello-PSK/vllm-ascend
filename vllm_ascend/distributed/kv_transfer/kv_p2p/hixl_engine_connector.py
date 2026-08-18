@@ -114,11 +114,15 @@ def _load_hixl():
 
 # ---------------------------------------------------------------------------
 # Control-plane constants & helpers (forked so this module does not import
-# hixl_connector — see Step R). done-notification runs over the hixl
-# data-plane (hixl.send_notify / get_notifies), so there is no
-# DONE_RECVING_MSG side-channel constant here.
+# hixl_connector — see Step R). DONE/HB go over the ZMQ side channel
+# (same ROUTER as GET_META) so they do not share the HIXL CommEngine
+# control TCP with Transfer BufferReq — that mix caused frame desync
+# (json parse_error / SendNotify 103901) under load.
 # ---------------------------------------------------------------------------
 GET_META_MSG = b"get_meta_msg"
+NOTIFY_MSG = b"notify_msg"
+_NOTIFY_ACK = b"ACK"
+_NOTIFY_ALL_RANKS = -1
 # Error-reply marker for a malformed GET_META handshake. A normal reply's
 # handshake_bytes is msgpack-encoded and never starts with this ASCII prefix.
 HIXL_ERR_PREFIX = b"__HIXL_ERR__"
@@ -539,6 +543,9 @@ class HIXLEngineConnectorMetadata(KVConnectorMetadata):
         self.reqs_not_processed: set[str] = set()
         # Heartbeat data grouped by remote engine, sent by D worker to P.
         self.heartbeat_by_engine: dict[str, Any] = {}
+        # P scheduler ROUTER → workers: (name, msg, target_tp). target_tp
+        # is -1 for all ranks (HB); DONE is the P tp rank that was read.
+        self.inbound_notifies: list[tuple[str, str, int]] = []
 
     def _add_new_req(
         self,
@@ -995,6 +1002,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._handshake_stop_event = threading.Event()
         self._handshake_listener_thread: threading.Thread | None = None
         self._handshake_payloads: dict[tuple[int, int], bytes] = {}
+        # DONE/HB received on the scheduler ROUTER; copied into metadata
+        # each step so P workers can apply lease/DONE counting.
+        self._inbound_notifies: list[tuple[str, str, int]] = []
+        self._inbound_notifies_lock = threading.Lock()
         if role == KVConnectorRole.SCHEDULER:
             # NIXL-style single scheduler-side ROUTER listener. The base port
             # comes from hixl_engine.side_channel_port; data_parallel_index
@@ -1148,10 +1159,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._xfer_bytes: dict[str, int] = {}
         self._xfer_start: dict[str, float] = {}
         # Started lazily on first enqueue so the SCHEDULER role never spawns it.
-        self._notify_queue: "queue.Queue[tuple[str, str, str] | None]" = (
+        # (host, port, name, msg, target_tp) or shutdown sentinel None.
+        self._notify_queue: "queue.Queue[tuple[str, int, str, str, int] | None]" = (
             queue.Queue(maxsize=self._notify_queue_size))
         self._notify_thread: threading.Thread | None = None
         self._notify_thread_lock = threading.Lock()
+        # endpoint -> perf_counter deadline; SendNotify failures trip this.
+        self._notify_dead_until: dict[str, float] = {}
+        # Handles abandoned after a wait-timeout so GetTransferStatus can
+        # still drain them (no cancel API; dropping leaks RDMA reqs).
+        self._orphan_xfer_handles: list[int] = []
         # request_id -> HIXLEngineReqMeta (for failure recovery / post-process)
         self._recving_metadata: dict[str, HIXLEngineReqMeta] = {}
         # Reqs whose handshake hadn't landed yet are parked on
@@ -1203,6 +1220,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # lease when its remaining < _lease_extension, so the lease converges
         # to now+extension instead of growing unboundedly on each heartbeat.
         self._lease_extension: int = self._kv_lease_duration * 2 // 3
+        if self._xfer_wait_timeout_s <= 0.0:
+            # Fail the req before P lease expiry so D does not keep READing
+            # blocks P already freed (log: 44s wait vs 30s lease).
+            self._xfer_wait_timeout_s = float(
+                max(1, int(self._kv_lease_duration) - 5)
+            )
         # (P-side handshake ROUTER lifecycle — _handshake_stop_event and
         # _handshake_listener_thread — built above, before the early-return.)
         # (SCHEDULER early-return + _handshake_payloads + _scheduler/
@@ -1292,6 +1315,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _hixl_send_notify(self, remote_engine: str, name: str, msg: str,
                          timeout_ms: int = 1000) -> None:
+        # Unused for DONE/HB (those go over ZMQ). Kept so a leftover
+        # GetNotifies drain and debug scripts still have a send path.
         nd = self._hixl_mod.NotifyDesc(name=name, notify_msg=msg)
         status = self._hixl.send_notify(remote_engine, nd, timeout_ms)
         self._hixl_check(status, "SendNotify")
@@ -1336,12 +1361,20 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._engine_options: dict[str, str] = options
         self._link_timeout_ms: int = int(cfg.get("link_timeout_ms", 5000))
         self._transfer_timeout_ms: int = int(cfg.get("transfer_timeout_ms", 60_000))
-        # Bounds how long one notify can freeze the data plane: SendNotify
-        # holds hixl_py's process-wide C++ mutex until the peer ACKs. hixl's
-        # own default (1000ms) is far too long for a call on the KV path;
-        # DONE loss is covered by the P-side lease, a lost HB is re-sent.
-        self._notify_timeout_ms: int = int(cfg.get("notify_timeout_ms", 100))
+        # ZMQ REQ timeout for DONE/HB. No longer bounds a HIXL C++ mutex
+        # (notifies left the HIXL control socket); 1000ms is enough for
+        # a side-channel RTT without stalling TransferAsync.
+        self._notify_timeout_ms: int = int(cfg.get("notify_timeout_ms", 1000))
         self._notify_queue_size: int = int(cfg.get("notify_queue_size", 1024))
+        # After a ZMQ DONE/HB send fails, stop hammering that scheduler
+        # side-channel for cooldown seconds (key is host:port).
+        self._notify_dead_cooldown_s: float = float(
+            cfg.get("notify_dead_cooldown_s", 5.0)
+        )
+        # 0 = derive from kv_lease_duration after worker init (lease - 5s).
+        self._xfer_wait_timeout_s: float = float(
+            cfg.get("transfer_wait_timeout_s", 0.0)
+        )
         # Opt-in only, to A/B the two behaviours without a rebuild; see
         # wait_for_layer_load for why blocking is not needed.
         self._blocking_layer_wait: bool = bool(
@@ -1781,6 +1814,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         for ep in self._remote_agents.get(remote_engine_id, {}).values():
             endpoints.add(ep)
         for endpoint in endpoints:
+            self._notify_dead_until.pop(endpoint, None)
             try:
                 with self._hixl_lock:
                     self._hixl_disconnect(
@@ -1803,12 +1837,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         logger.warning("HIXLEngine evicted stale remote engine %s.", remote_engine_id)
 
     # ==================================================================
-    # P-side ZMQ ROUTER handshake listener. Mirrors NIXL
-    # base_scheduler.py:291-332 _nixl_handshake_listener. Replies to
-    # GET_META_MSG with [handshake_bytes, perf_counter_ts] so the D side can
-    # estimate the clock offset. KVCacheSendingThread is NOT reused here:
-    # its reply frame layout ([identity, b"", encoded_metadata], hixl_connector
-    # :379) carries no perf ts and no handshake-payload envelope.
+    # P-side ZMQ ROUTER. Mirrors NIXL base_scheduler.py:291-332 for
+    # GET_META_MSG ([handshake_bytes, perf_counter_ts]). Also accepts
+    # NOTIFY_MSG (DONE/HB) so those never share the HIXL control TCP.
     # ==================================================================
     def start_handshake_listener(
         self, host: str, port: int, ready_event: threading.Event | None = None,
@@ -1895,7 +1926,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         except Exception:
             self._reject_handshake(sock, identity, "unparseable GET_META payload")
             return
-        if not isinstance(msg, (list, tuple)) or not msg or msg[0] != GET_META_MSG:
+        if not isinstance(msg, (list, tuple)) or not msg:
+            self._reject_handshake(sock, identity, "empty side-channel payload")
+            return
+        if msg[0] == NOTIFY_MSG:
+            self._handle_notify_request(sock, identity, msg)
+            return
+        if msg[0] != GET_META_MSG:
             self._reject_handshake(sock, identity, "not a GET_META message")
             return
         # NIXL single-listener routing (base_scheduler.py:316-322): the D side
@@ -1922,6 +1959,35 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             return
         perf_ts = msgspec.msgpack.encode(time.perf_counter())
         sock.send_multipart((identity, b"", handshake_bytes, perf_ts))
+
+    def _handle_notify_request(
+        self, sock: zmq.Socket, identity: bytes, msg: Any,  # type: ignore[name-defined]
+    ) -> None:
+        """Accept DONE/HB from D. Frame: [NOTIFY_MSG, name, body, target_tp].
+
+        target_tp is the P tp rank that should apply a DONE; -1 means all
+        ranks (HB). Queued here and copied into connector metadata next
+        step so each P worker applies locally.
+        """
+        if len(msg) < 4:
+            self._reject_handshake(sock, identity, "NOTIFY missing fields")
+            return
+        name, body, target_tp = msg[1], msg[2], msg[3]
+        if isinstance(name, bytes):
+            name = name.decode()
+        if isinstance(body, bytes):
+            body = body.decode()
+        try:
+            target_tp = int(target_tp)
+        except (TypeError, ValueError):
+            self._reject_handshake(sock, identity, "NOTIFY target_tp not int")
+            return
+        with self._inbound_notifies_lock:
+            self._inbound_notifies.append((str(name), str(body), target_tp))
+        try:
+            sock.send_multipart((identity, b"", _NOTIFY_ACK))
+        except Exception:  # noqa: BLE001
+            logger.error("HIXLEngine notify ACK failed: name=%s", name)
 
     @staticmethod
     def _reject_handshake(
@@ -1960,7 +2026,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        return self._scheduler.build_connector_meta(scheduler_output)
+        meta = self._scheduler.build_connector_meta(scheduler_output)
+        if isinstance(meta, HIXLEngineConnectorMetadata):
+            with self._inbound_notifies_lock:
+                if self._inbound_notifies:
+                    meta.inbound_notifies = list(self._inbound_notifies)
+                    self._inbound_notifies.clear()
+        return meta
 
     def request_finished_all_groups(
         self, request: "Request", block_ids: BlockIds
@@ -2488,7 +2560,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         hixl instance are serialized with _hixl_lock (hixl is not
         thread-safe; connect runs on the handshake thread, transfers here).
         """
-        remote_engine_id = req_meta.remote.engine_id
+        remote = req_meta.remote
+        assert remote is not None
+        remote_engine_id = remote.engine_id
         assert remote_engine_id in self._remote_metadata, (
             f"remote engine {remote_engine_id} not handshaken yet"
         )
@@ -2578,7 +2652,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             # Full prefix hit across all groups for this rank: no transfer,
             # just notify P to release (NIXL pull_worker.py:277-294).
             if not group_descs:
-                self._enqueue_notify(endpoint, "DONE", notif_id)
+                self._enqueue_notify(
+                    remote.host,
+                    remote.port,
+                    "DONE",
+                    notif_id,
+                    rank,
+                )
                 # Mark this rank notified so _notify_release skips it (the
                 # prefix-hit notify and the release notify share the same
                 # notif_id).
@@ -2664,6 +2744,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._connector_metadata
         if metadata is None:
             return
+        # P workers: apply DONE/HB that the scheduler ROUTER received last
+        # step. D workers see an empty list.
+        self._drain_inbound_notifies(metadata)
         for req_id in metadata.reqs_in_batch:
             self._task_tracker.add_req_to_process(req_id)
         for req_id, meta in metadata.reqs_to_recv.items():
@@ -2851,6 +2934,28 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             nbytes / elapsed / 1e9, had_failure,
         )
 
+    def _xfer_wait_timed_out(self, req_id: str, now: float) -> bool:
+        started = self._xfer_start.get(req_id)
+        if started is None:
+            return False
+        return (now - started) >= self._xfer_wait_timeout_s
+
+    def _poll_orphan_xfer_handles(self) -> None:
+        """Drain abandoned handles so a wait-timeout does not leak RDMA reqs."""
+        if not self._orphan_xfer_handles:
+            return
+        still: list[int] = []
+        for handle in self._orphan_xfer_handles:
+            try:
+                st = self._hixl_get_transfer_status(handle)
+                if st is None:
+                    continue
+                if self._transfer_status_name(st) == "WAITING":
+                    still.append(handle)
+            except Exception:  # noqa: BLE001
+                continue
+        self._orphan_xfer_handles = still
+
     def _transfer_status_name(self, status: Any) -> str:
         """Normalize a hixl TransferStatus enum value to a comparable name."""
         name = getattr(status, "name", None)
@@ -2871,6 +2976,8 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         (replaces NIXL's transfer notif_msg auto-delivery).
         """
         done_req_ids: set[str] = set()
+        self._poll_orphan_xfer_handles()
+        now = time.perf_counter()
         for req_id, handles in list(transfers.items()):
             in_progress: list[int] = []
             had_failure = False
@@ -2906,6 +3013,19 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     had_failure = True
                     self._handle_failed_transfer(req_id, handle)
+            if in_progress and self._xfer_wait_timed_out(req_id, now):
+                started = self._xfer_start.get(req_id)
+                elapsed_s = (now - started) if started is not None else -1.0
+                logger.error(
+                    "HIXLEngine transfer wait timeout. req=%s "
+                    "elapsed=%.1fs limit=%.1fs handles=%d",
+                    req_id, elapsed_s, self._xfer_wait_timeout_s,
+                    len(in_progress),
+                )
+                had_failure = True
+                self._handle_failed_transfer(req_id, None)
+                self._orphan_xfer_handles.extend(in_progress)
+                in_progress = []
             if not in_progress:
                 done_req_ids.add(req_id)
                 logger.debug(
@@ -3102,15 +3222,12 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     # ------------------------------------------------------------------
-    # Async notify sender.
+    # Async notify sender (ZMQ REQ → P scheduler ROUTER).
     #
-    # SendNotify blocks until the peer ACKs (adxl_inner_engine.cc:611-621), and
-    # hixl_py holds its one process-wide C++ mutex for the whole call
-    # (hixl_py.cc:195-202) — so a slow ACK freezes transfer_async /
-    # get_transfer_status / get_notifies too. Neither half of the fix is
-    # sufficient alone: this thread keeps the forward thread off the ACK wait,
-    # while a short _notify_timeout_ms bounds the freeze, which happens no
-    # matter which thread issues the call.
+    # DONE/HB must not share the HIXL CommEngine control TCP with
+    # Transfer BufferReq — that mix desynced the notify stream (P
+    # parse_error / D SendNotify 103901). The sender thread keeps the
+    # forward path off the side-channel RTT.
     # ------------------------------------------------------------------
     def _ensure_notify_sender(self) -> None:
         if self._notify_thread is not None:
@@ -3126,51 +3243,132 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             self._notify_thread = t
             t.start()
 
-    def _notify_sender_loop(self) -> None:
-        while True:
-            item = self._notify_queue.get()
-            if item is None:  # shutdown sentinel
-                return
-            endpoint, name, msg = item
-            try:
-                # No _hixl_lock: taking it would hand the ACK wait back to the
-                # forward thread, which is what this thread exists to avoid.
-                self._hixl_send_notify(
-                    endpoint, name, msg, self._notify_timeout_ms)
-            except Exception as e:  # noqa: BLE001
-                # DONE loss falls back to the P-side lease; HB is re-sent next
-                # round. Neither warrants a retry that could pile up behind a
-                # dead peer.
-                logger.warning(
-                    "HIXLEngine notify send failed. name=%s endpoint=%s err=%s",
-                    name, endpoint, e,
-                )
+    def _notify_endpoint_blocked(self, endpoint: str) -> bool:
+        return time.perf_counter() < self._notify_dead_until.get(endpoint, 0.0)
 
-    def _enqueue_notify(self, endpoint: str, name: str, msg: str) -> None:
+    def _trip_notify_circuit(self, endpoint: str, err: object) -> None:
+        self._notify_dead_until[endpoint] = (
+            time.perf_counter() + self._notify_dead_cooldown_s
+        )
+        logger.warning(
+            "HIXLEngine notify circuit-open. endpoint=%s cooldown=%.1fs err=%s",
+            endpoint, self._notify_dead_cooldown_s, err,
+        )
+
+    def _notify_sender_loop(self) -> None:
+        ctx = zmq.Context()  # type: ignore[attr-defined]
+        sockets: dict[str, Any] = {}
+        encoder = msgspec.msgpack.Encoder()
+        try:
+            while True:
+                item = self._notify_queue.get()
+                if item is None:  # shutdown sentinel
+                    return
+                host, port, name, msg, target_tp = item
+                dest = f"{host}:{port}"
+                if self._notify_endpoint_blocked(dest):
+                    logger.debug(
+                        "HIXLEngine notify skipped (circuit-open). name=%s "
+                        "dest=%s",
+                        name, dest,
+                    )
+                    continue
+                try:
+                    self._zmq_send_notify(
+                        ctx, sockets, encoder, host, port, name, msg, target_tp)
+                except Exception as e:  # noqa: BLE001
+                    # DONE loss falls back to the P-side lease; HB is re-sent
+                    # next round. A failed REQ must be dropped — the socket
+                    # is stuck until a reply arrives.
+                    logger.warning(
+                        "HIXLEngine notify send failed. name=%s dest=%s err=%s",
+                        name, dest, e,
+                    )
+                    self._close_notify_socket(sockets, dest)
+                    self._trip_notify_circuit(dest, e)
+        finally:
+            for dest in list(sockets):
+                self._close_notify_socket(sockets, dest)
+            ctx.destroy(linger=0)  # type: ignore[attr-defined]
+
+    def _zmq_send_notify(
+        self,
+        ctx: Any,
+        sockets: dict[str, Any],
+        encoder: msgspec.msgpack.Encoder,
+        host: str,
+        port: int,
+        name: str,
+        msg: str,
+        target_tp: int,
+    ) -> None:
+        dest = f"{host}:{port}"
+        sock = sockets.get(dest)
+        if sock is None:
+            path = make_zmq_path("tcp", host, port)
+            sock = make_zmq_socket(
+                ctx=ctx, path=path, socket_type=zmq.REQ, bind=False,
+            )
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.setsockopt(zmq.RCVTIMEO, self._notify_timeout_ms)
+            sock.setsockopt(zmq.SNDTIMEO, self._notify_timeout_ms)
+            sockets[dest] = sock
+        payload = encoder.encode((NOTIFY_MSG, name, msg, target_tp))
+        sock.send_multipart((payload,))
+        reply = sock.recv_multipart()
+        if not reply or reply[0] != _NOTIFY_ACK:
+            raise RuntimeError(
+                f"unexpected notify ACK from {dest}: {reply!r}"
+            )
+
+    @staticmethod
+    def _close_notify_socket(sockets: dict[str, Any], dest: str) -> None:
+        sock = sockets.pop(dest, None)
+        if sock is None:
+            return
+        try:
+            sock.close(linger=0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _enqueue_notify(
+        self, host: str, port: int, name: str, msg: str, target_tp: int,
+    ) -> None:
         """Hand a notify to the sender thread; never blocks the caller."""
+        dest = f"{host}:{port}"
+        if self._notify_endpoint_blocked(dest):
+            if name == "HB":
+                logger.debug(
+                    "HIXLEngine notify circuit-open, dropping HB to %s",
+                    dest,
+                )
+            else:
+                logger.warning(
+                    "HIXLEngine notify circuit-open, dropping %s to %s; "
+                    "P-side lease expiry is the backstop.",
+                    name, dest,
+                )
+            return
         self._ensure_notify_sender()
         try:
-            self._notify_queue.put_nowait((endpoint, name, msg))
+            self._notify_queue.put_nowait((host, port, name, msg, target_tp))
         except queue.Full:
             if name == "HB":
                 logger.debug(
-                    "HIXLEngine notify queue full, dropping HB to %s", endpoint)
+                    "HIXLEngine notify queue full, dropping HB to %s", dest)
             else:
-                # Loud on purpose: a full queue means the peer is not ACKing.
                 logger.warning(
                     "HIXLEngine notify queue full (%d), dropping %s to %s; "
                     "P-side lease expiry is the backstop.",
-                    self._notify_queue_size, name, endpoint,
+                    self._notify_queue_size, name, dest,
                 )
 
     def _notify_release(self, req_id: str) -> None:
         """Tell every P-side source rank this req actually read from that its
         reads are done.
 
-        Replaces NIXL's make_prepped_xfer(notif_msg=...) auto-delivery
-        (pull_worker.py:335). The P-side get_notifies() consumes
-        ``("DONE", "<remote_request_id>:<world_size>")`` and decrements its
-        per-req consumer counter.
+        DONE goes to the P scheduler ROUTER with target_tp=rank so only
+        the P worker that was read decrements its consumer count.
 
         Only notify ranks this request issued an async READ to
         (``_transferred_ranks``), never broadcast to ``plan.all_source_ranks``.
@@ -3178,52 +3376,41 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         in _read_blocks and are skipped here to avoid a double-notify.
         """
         meta = self._recving_metadata.get(req_id)
-        if meta is None:
+        if meta is None or meta.remote is None:
             return
-        remote_agents = self._remote_agents.get(meta.remote.engine_id, {})
         notif_id = f"{meta.remote.request_id}:{self._world_size}"
-        # Prefix-hit ranks already got a DONE in _read_blocks.
         already_notified = self._notified_release_ranks.pop(req_id, set())
-        # Real readers only (transfer_async issued in _read_blocks).
         to_notify = self._transferred_ranks.pop(req_id, set()) - already_notified
         for rank in to_notify:
-            endpoint = remote_agents.get((0, rank))
-            if endpoint is None:
-                continue
-            self._enqueue_notify(endpoint, "DONE", notif_id)
+            self._enqueue_notify(
+                meta.remote.host, meta.remote.port, "DONE", notif_id, rank,
+            )
 
     def _send_heartbeats(self, metadata: "HIXLEngineConnectorMetadata") -> None:
         """D-side: extend P-side leases for reqs still WAITING in scheduler.
 
-        Mirrors NIXL base_worker.py:2157-2187. For each remote engine in
-        metadata.heartbeat_by_engine, send an "HB" notify whose msg is a
-        comma-separated list of P-side request ids; the P side extends
-        _reqs_to_send expiry on receipt (_handle_heartbeat). Skips engines
-        not yet handshaken (the next heartbeat round picks them up).
+        One HB to the P scheduler ROUTER (target_tp=-1); every P rank
+        extends its own lease table. Handshake is still kicked if this
+        engine is unseen, but HB no longer waits on HIXL Connect.
         """
         for engine_id, hb_info in metadata.heartbeat_by_engine.items():
             if engine_id not in self._remote_agents:
-                # Proactive handshake (NIXL base_worker.py:2162-2175). The
-                # req behind this heartbeat may still be waiting for peer
-                # metadata + Connect to land, so THIS heartbeat round has no
-                # agent to send to. Kick off _ensure_handshake now so the
-                # NEXT round (one step later) actually delivers the HB and
-                # extends the P-side lease — otherwise a first-sight
-                # engine's lease is never extended and the P blocks expire
-                # before the read.
                 self._ensure_handshake(
                     engine_id,
                     hb_info.host,
                     hb_info.port,
                     hb_info.tp_size,
                 )
-                continue
             req_ids = [rid for rid in hb_info.req_ids if rid]
-            if not req_ids:
+            if not req_ids or not hb_info.host or not hb_info.port:
                 continue
-            hb_msg = ",".join(req_ids)
-            for agent_endpoint in self._remote_agents[engine_id].values():
-                self._enqueue_notify(agent_endpoint, "HB", hb_msg)
+            self._enqueue_notify(
+                hb_info.host,
+                hb_info.port,
+                "HB",
+                ",".join(req_ids),
+                _NOTIFY_ALL_RANKS,
+            )
 
     def _handle_heartbeat(self, payload: str) -> None:
         """P-side: extend leases for reqs referenced in a heartbeat.
@@ -3239,75 +3426,98 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 old = self._reqs_to_send[req_id]
                 self._reqs_to_send[req_id] = max(old, new_expiry)
 
-    def _get_new_notifs(self) -> set[str]:
-        """P-side: drain DONE/HB notifies from the hixl data plane.
+    def _drain_inbound_notifies(
+        self, metadata: "HIXLEngineConnectorMetadata"
+    ) -> set[str]:
+        """Apply ZMQ DONE/HB copied into this step's metadata. Clears the
+        list so get_finished in the same step does not double-count.
+        """
+        inbound = getattr(metadata, "inbound_notifies", None)
+        if not inbound:
+            return set()
+        notified = self._apply_inbound_notifies(inbound)
+        inbound.clear()
+        return notified
 
-        Fork of NIXL pull_worker._get_new_notifs (pull_worker.py:355-408).
-        - DONE msg "<remote_request_id>:<world_size>": increment the per-req
-          consumer count; release (promote to finished) when it reaches
-          consumers_per_producer. For homogeneous TP (D_TP==P_TP) this is 1;
-          for D_TP>P_TP (one P rank serves multiple D ranks) it is
-          D_TP//P_TP. D_TP<P_TP is 1 (each P rank expects the one D rank
-          that read it). TODO(hetero-gather): complex GQA/MLA heterogeneous gather
-          needs transfer_topo.tp_ratio for exact per-producer counts.
-        - HB: extend lease via _handle_heartbeat.
+    def _apply_inbound_notifies(
+        self, inbound: list[tuple[str, str, int]]
+    ) -> set[str]:
+        notified_req_ids: set[str] = set()
+        for name, msg, target_tp in inbound:
+            if target_tp >= 0 and target_tp != self._tp_rank:
+                continue
+            notified_req_ids |= self._apply_one_notify(name, msg)
+        return notified_req_ids
+
+    def _apply_one_notify(self, name: str, msg: str) -> set[str]:
+        """Apply one DONE/HB. Returns req ids released this call."""
+        notified_req_ids: set[str] = set()
+        try:
+            if name == "HB":
+                self._handle_heartbeat(msg)
+                return notified_req_ids
+            if name != "DONE":
+                return notified_req_ids
+            req_id, tp_size = msg.rsplit(":", 1)
+            if req_id not in self._reqs_to_send:
+                # Distinguish a premature DONE (D finished reading
+                # before this P worker's request_finished moved the req
+                # into _reqs_to_send — NIXL guards on _reqs_to_process
+                # membership the same way) from a truly unknown/expired
+                # req. The premature case is benign: the lease-expiry
+                # sweep is the backstop that eventually frees the P
+                # blocks, and a later DONE (D re-reads on recompute) will
+                # find the req in _reqs_to_send.
+                if req_id in self._task_tracker:
+                    logger.debug(
+                        "HIXLEngine premature DONE for in-process req %s; "
+                        "dropping (lease expiry is the backstop).", req_id,
+                    )
+                else:
+                    logger.warning(
+                        "HIXLEngine DONE notify for unknown/expired request "
+                        "%s; ignoring.", req_id,
+                    )
+                return notified_req_ids
+            n_consumers = int(tp_size)  # D-side world_size (= D_TP)
+            # Mirror NIXL pull_worker.py:388-396: tp_ratio asserts TP
+            # divisibility and yields the correct per-producer consumer
+            # count for split (D_TP>P_TP => -tp_ratio) and 1 otherwise.
+            assert self._transfer_topo is not None
+            tp_ratio = self._transfer_topo.tp_ratio(n_consumers)
+            consumers_per_producer = (
+                -tp_ratio if n_consumers > self._world_size else 1
+            )
+            self._consumer_notification_counts_by_req[req_id] += 1
+            if (self._consumer_notification_counts_by_req[req_id]
+                    >= consumers_per_producer):
+                notified_req_ids.add(req_id)
+                del self._consumer_notification_counts_by_req[req_id]
+                self._task_tracker.update_done_task_count(req_id)
+                self._reqs_to_send.pop(req_id, None)
+        except Exception:
+            logger.error(
+                "HIXLEngine notify handling failed for %s:%s",
+                name, msg, exc_info=True,
+            )
+        return notified_req_ids
+
+    def _get_new_notifs(self) -> set[str]:
+        """P-side: drain leftover HIXL GetNotifies (should be empty).
+
+        DONE/HB now arrive via the ZMQ side channel and are applied from
+        metadata.inbound_notifies. This drain stays so an old peer that
+        still SendNotify's cannot leak a handle, and unit tests that stub
+        _hixl_get_notifies keep working.
         """
         notified_req_ids: set[str] = set()
         try:
-            # Read-only drain; hixl_py serializes it internally.
             notifs = self._hixl_get_notifies()
         except Exception:
             logger.error("HIXLEngine get_notifies failed", exc_info=True)
             return notified_req_ids
         for name, msg in notifs:
-            try:
-                if name == "HB":
-                    self._handle_heartbeat(msg)
-                    continue
-                if name != "DONE":
-                    continue
-                req_id, tp_size = msg.rsplit(":", 1)
-                if req_id not in self._reqs_to_send:
-                    # Distinguish a premature DONE (D finished reading
-                    # before this P worker's request_finished moved the req
-                    # into _reqs_to_send — NIXL guards on _reqs_to_process
-                    # membership the same way) from a truly unknown/expired
-                    # req. The premature case is benign: the lease-expiry
-                    # sweep is the backstop that eventually frees the P
-                    # blocks, and a later DONE (D re-reads on recompute) will
-                    # find the req in _reqs_to_send.
-                    if req_id in self._task_tracker:
-                        logger.debug(
-                            "HIXLEngine premature DONE for in-process req %s; "
-                            "dropping (lease expiry is the backstop).", req_id,
-                        )
-                    else:
-                        logger.warning(
-                            "HIXLEngine DONE notify for unknown/expired request "
-                            "%s; ignoring.", req_id,
-                        )
-                    continue
-                n_consumers = int(tp_size)  # D-side world_size (= D_TP)
-                # Mirror NIXL pull_worker.py:388-396: tp_ratio asserts TP
-                # divisibility and yields the correct per-producer consumer
-                # count for split (D_TP>P_TP => -tp_ratio) and 1 otherwise.
-                assert self._transfer_topo is not None
-                tp_ratio = self._transfer_topo.tp_ratio(n_consumers)
-                consumers_per_producer = (
-                    -tp_ratio if n_consumers > self._world_size else 1
-                )
-                self._consumer_notification_counts_by_req[req_id] += 1
-                if (self._consumer_notification_counts_by_req[req_id]
-                        >= consumers_per_producer):
-                    notified_req_ids.add(req_id)
-                    del self._consumer_notification_counts_by_req[req_id]
-                    self._task_tracker.update_done_task_count(req_id)
-                    self._reqs_to_send.pop(req_id, None)
-            except Exception:
-                logger.error(
-                    "HIXLEngine notify handling failed for %s:%s",
-                    name, msg, exc_info=True,
-                )
+            notified_req_ids |= self._apply_one_notify(name, msg)
         return notified_req_ids
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None) -> None:
@@ -3475,9 +3685,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         base_worker.py:1958-1968 drains _failed_recv_reqs into done_recving
         for the same reason).
         """
-        # P-side: drain DONE/HB notifies; a DONE whose consumer count reaches
-        # consumers_per_producer promotes the req to finished via
-        # update_done_task_count (NIXL pull_worker._get_new_notifs:355-408).
+        # P-side: apply ZMQ DONE/HB from this step's metadata, then drain
+        # any leftover HIXL GetNotifies (should be empty).
+        metadata = self._connector_metadata
+        if metadata is not None:
+            self._drain_inbound_notifies(metadata)
         self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
         # Drop metadata for completed reqs (NIXL base_worker.py:1984). Without
