@@ -182,6 +182,7 @@ def _has_protocol_desc(options: dict[str, str]) -> bool:
         return False
     return _protocol_desc_nonempty(_protocol_desc_from_grc(obj))
 
+
 def _flatten_grc_protocol_desc(options: dict[str, str]) -> bool:
     """Rewrite nested protocol_desc to the flat key HixlOptions::from_json reads.
 
@@ -208,6 +209,7 @@ def _flatten_grc_protocol_desc(options: dict[str, str]) -> bool:
         obj, separators=(",", ":")
     )
     return True
+
 
 def _strip_protocol_desc(grc_raw: str) -> tuple[str | None, bool]:
     obj = _loads_json_object(grc_raw)
@@ -263,10 +265,10 @@ def _apply_hixl_engine_backend_options(
     """
     out = dict(options)
     if backend == _HIXL_ENGINE_BACKEND_CS:
-        # CS branch only: flatten before the LCR/protocol_desc checks below
-        # (the _has_protocol_desc gate at "none" must see the form C++ reads).
-        # comm branch skips it — _strip_protocol_desc handles both forms and
-        # the CS-selection warning below would be off-topic there.
+        # CS only: flatten before the LCR/protocol_desc checks so
+        # _has_protocol_desc sees the form C++ reads. comm skips it —
+        # _strip_protocol_desc handles both forms, and the warning
+        # below is off-topic on the comm path.
         if _flatten_grc_protocol_desc(out):
             logger.warning(
                 "hixl_engine.options GlobalResourceConfig used nested "
@@ -349,7 +351,7 @@ class KVCacheTaskTracker:
 
     add_req_to_process (start_load_kv) registers a req as in-batch;
     discard_from_process drops aborted reqs (metadata.reqs_not_processed);
-    update_done_task_count is called from _get_new_notifs once a req's
+    update_done_task_count is called from _count_done_notify once a req's
     consumer count reaches consumers_per_producer, moving it to finished;
     get_and_clear_finished_requests drains finished for get_finished.
     """
@@ -368,10 +370,10 @@ class KVCacheTaskTracker:
             self._reqs_to_process.discard(request_id)
 
     def __contains__(self, request_id: str) -> bool:
-        # _get_new_notifs uses this to distinguish a premature DONE (D finished
-        # reading before this P worker's request_finished moved the req into
-        # _reqs_to_send) from a truly unknown/expired req; the former is a
-        # debug log, not an error.
+        # _park_pending_done uses this to distinguish a DONE that arrived
+        # ahead of this P worker's request_finished (req still in batch) from
+        # one for a req this worker never owned; only the log level differs,
+        # both are parked for replay.
         with self._lock:
             return request_id in self._reqs_to_process
 
@@ -497,7 +499,12 @@ def compute_hixl_engine_compat_hash(
     the hash itself). Bump the prefix string when the on-wire metadata schema
     changes in a backward-incompatible way.
     """
-    prefix = "hixl-engine-v1"
+    # v2: region enumeration changed (E5). A logical region is now keyed by
+    # (base, per_block, group) instead of base alone, so kv_caches_base_addr /
+    # block_lens gained one entry per sharing group. A v1 peer would pass the
+    # handshake and then fail the region-parity assert deep inside
+    # _build_op_descs; bumping the prefix rejects it at handshake time.
+    prefix = "hixl-engine-v2"
     payload = "|".join(
         [
             prefix,
@@ -1210,16 +1217,26 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._handshake_futures: dict[str, Future] = {}
         # req_id -> perf_counter lease expiry (P-side delayed free).
         self._reqs_to_send: dict[str, float] = {}
+        # DONE notifies that arrived before _reqs_to_send knew the req, parked
+        # for replay: req_id -> (msg, count, first_seen). The count matters —
+        # with D_TP > P_TP one req draws consumers_per_producer > 1 DONEs, and
+        # collapsing them would leave the req short of its promote threshold.
+        # first_seen is only written on insert so the TTL measures age, not
+        # last touch.
+        self._pending_dones: dict[str, tuple[str, int, float]] = {}
         # Multi-consumer done-notification counting (mirrors NIXL).
         self._consumer_notification_counts_by_req: dict[str, int] = defaultdict(int)
         # P-side lease / heartbeat timing (mirrors NIXL base_worker). Used by
-        # _get_new_notifs (lease expiry) and _handle_heartbeat (extension).
+        # get_finished (lease expiry) and _handle_heartbeat (extension).
         self._kv_lease_duration: int = kvtc.get_from_extra_config(
             "kv_lease_duration", 30)
         # 2/3 factor (NIXL base_worker.py:268): heartbeats only extend the
         # lease when its remaining < _lease_extension, so the lease converges
         # to now+extension instead of growing unboundedly on each heartbeat.
         self._lease_extension: int = self._kv_lease_duration * 2 // 3
+        # Parking a DONE longer than the lease is pointless: by then the
+        # expiry sweep has already released the blocks the DONE would free.
+        self._pending_done_ttl_s: float = float(self._kv_lease_duration)
         if self._xfer_wait_timeout_s <= 0.0:
             # Fail the req before P lease expiry so D does not keep READing
             # blocks P already freed (log: 44s wait vs 30s lease).
@@ -1379,6 +1396,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # wait_for_layer_load for why blocking is not needed.
         self._blocking_layer_wait: bool = bool(
             cfg.get("blocking_layer_wait", False))
+        # DONE/HB arrive over the ZMQ side channel, so GetNotifies returns
+        # empty while still taking the global hixl_py mutex on every engine
+        # step. Only a peer old enough to still SendNotify needs this drain.
+        self._drain_hixl_notifies: bool = bool(
+            cfg.get("drain_hixl_notifies", False))
+        # Cap on DONE notifies parked for replay (see _pending_dones). A flood
+        # of ids this worker never owned must not grow without bound.
+        self._pending_done_max: int = int(cfg.get("pending_done_max", 1024))
         self._side_channel_port_base: int = int(cfg.get("side_channel_port", 0))
         raw_local_engine: str = cfg.get("local_engine", "")
         if not raw_local_engine:
@@ -2068,12 +2093,19 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register each layer's KV tensor with hixl::Hixl.
 
-        Address-level: one mem handle per tensor region, MEM_DEVICE. No
-        BlocksCacheKey/CacheDesc — heterogeneous shapes (conv 2D / ssm 3D /
-        MLA latent) coexist as separate handles on the same engine. Mirrors
-        NIXL base_worker.register_kv_caches (L1024-1275) but uses the
-        address-level RegisterMem API and skips NIXL's prep_xfer_dlist /
-        get_agent_metadata (hixl Connect uses the endpoint string directly).
+        Address-level, MEM_DEVICE. No BlocksCacheKey/CacheDesc —
+        heterogeneous shapes (conv 2D / ssm 3D / MLA latent) coexist on the
+        same engine. Mirrors NIXL base_worker.register_kv_caches (L1024-1275)
+        but uses the address-level RegisterMem API and skips NIXL's
+        prep_xfer_dlist / get_agent_metadata (hixl Connect uses the endpoint
+        string directly).
+
+        Physical registration and logical regions are counted separately, so
+        n_regions >= n_handles. HMA pools several layers onto one tensor, and
+        every logical view of that tensor needs its own region record (it is
+        addressed with its own per_block stride and its own group's block
+        ids) while the segment only needs registering once. See the
+        registered_bases / seen_logical comment below.
         """
         # Read NZ switch + save layer tensors for post-transfer ND->NZ
         # reformat. Imported lazily so the module stays importable without
@@ -2114,11 +2146,30 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             seen_base_addresses
         )
 
+        # A logical region is identified by (base, per_block, group) — NOT by
+        # base alone. HMA pools one layer from *every* kv_cache_group onto a
+        # single KVCacheTensor (kv_cache_utils.py:1309-1326) and each shared
+        # layer receives the same tensor object
+        # (model_runner_v1.py:4073-4075), so a base-only key collapses regions
+        # that must be addressed with different per-group block ids. That
+        # collapse silently dropped the conv state of every mamba group but the
+        # first (bug E5). register_mem still keys on base alone: TransferAsync
+        # addresses by (addr, len) and never dereferences a mem handle, so one
+        # registration per physical segment covers every logical view of it.
+        registered_bases: set[int] = set()
+        seen_logical: set[tuple[int, int, int]] = set()
+
         for layer_name, cache_or_caches in kv_caches.items():
             layer_spec = self._layer_specs.get(layer_name)
             if layer_spec is None:
-                # Layer shares another tensor's KV cache (hybrid allocator);
-                # nothing to register for this name.
+                # No kv_cache_group owns this layer, so no block table
+                # addresses it and nothing can be transferred for it. Warn
+                # instead of dropping silently: a spec-lookup miss on a real
+                # layer loses that layer's whole KV with no other symptom.
+                logger.warning(
+                    "HIXLEngine layer %s has no kv_cache_group spec; its KV "
+                    "will NOT be registered or transferred.", layer_name,
+                )
                 continue
             if isinstance(layer_spec, UniformTypeKVCacheSpecs):
                 # MLA DSv32 Indexer: merge specs, pick this layer's own.
@@ -2141,71 +2192,41 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             is_mla_region = isinstance(
                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
             )
+            group_idx = self._layer_to_group.get(layer_name, 0)
             for i, t in enumerate(tensors):
                 base_addr = int(t.data_ptr())
                 per_block = t[0].numel() * t.element_size()
                 is_mamba_region = isinstance(layer_spec, MambaSpec)
-                if base_addr in seen_base_addresses:
-                    dup_idx = seen_base_addresses.index(base_addr)
-                    dup_per_block = self._per_block_per_layer[dup_idx]
-                    # SSM state shares the same base/length as an
-                    # already-registered attn region (HMA pools attn K and
-                    # mamba ssm_state onto one raw_tensor — same base, same
-                    # length, different block view). The physical segment is
-                    # already covered by attn's register_mem, and
-                    # TransferAsync addresses purely by (addr, len) without
-                    # referencing mem handles — so ssm needs neither
-                    # register_mem nor a mem handle. But its logical region
-                    # record MUST be appended: the is_ssm branch of
-                    # _build_op_descs takes per_block from
-                    # _per_block_per_layer[i], so without this entry ssm is
-                    # never iterated and its state is never transferred. A
-                    # conv duplicate (same per_block) is a true HMA shared_by
-                    # re-reference and stays skipped.
-                    if is_mamba_region and per_block != dup_per_block:
-                        seen_base_addresses.append(base_addr)
-                        self._block_len_per_layer.append(block_len)
-                        self._per_block_per_layer.append(per_block)
-                        self._region_is_mla.append(is_mla_region)
-                        self._region_group_idx.append(
-                            self._layer_to_group.get(layer_name, 0)
-                        )
-                        self._device_id = max(t.get_device(), 0)
-                        logger.debug(
-                            "HIXLTRACE reg_ssm_alias layer=%s sub=%d "
-                            "base=0x%x length=%d per_block=%d group=%d "
-                            "shape=%s dup_seen_idx=%d dup_per_block=%d "
-                            "(ssm reuses attn registered segment; "
-                            "no register_mem, no mem handle)",
-                            layer_name, i, base_addr,
-                            t.numel() * t.element_size(), per_block,
-                            self._layer_to_group.get(layer_name, 0),
-                            tuple(t.shape), dup_idx, dup_per_block,
-                        )
-                        continue
+                length = t.numel() * t.element_size()
+                logical_key = (base_addr, per_block, group_idx)
+                if logical_key in seen_logical:
+                    # Same segment, same block view, same group: a genuine
+                    # duplicate. The hybrid attn-mamba path aliases k and v
+                    # onto one tensor (model_runner_v1.py:4442-4444), which
+                    # would otherwise transfer the same bytes twice.
                     logger.debug(
                         "HIXLTRACE reg_dedup_skip layer=%s sub=%d base=0x%x "
-                        "length=%d per_block=%d is_mamba=%d group=%d shape=%s "
-                        "dup_seen_idx=%d",
-                        layer_name, i, base_addr,
-                        t.numel() * t.element_size(),
-                        per_block,
-                        is_mamba_region,
-                        self._layer_to_group.get(layer_name, 0),
-                        tuple(t.shape),
-                        dup_idx,
+                        "length=%d per_block=%d is_mamba=%d group=%d shape=%s",
+                        layer_name, i, base_addr, length, per_block,
+                        is_mamba_region, group_idx, tuple(t.shape),
                     )
-                    # HMA memory pooling: same backing tensor shared across
-                    # groups; register the region once.
                     continue
-                length = t.numel() * t.element_size()
-                with self._hixl_lock:
-                    handle = self._hixl_register_mem(
-                        base_addr, length, is_device=True
+                seen_logical.add(logical_key)
+                if base_addr in registered_bases:
+                    # Another group's layer (or another block view of this
+                    # layer) already registered this segment. Record the
+                    # logical region, skip register_mem.
+                    kind = "reg_alias"
+                else:
+                    with self._hixl_lock:
+                        handle = self._hixl_register_mem(
+                            base_addr, length, is_device=True
+                        )
+                    self._kv_mem_handles[f"{layer_name}/{i}"] = (
+                        handle, base_addr, length,
                     )
-                self._kv_mem_handles[f"{layer_name}/{i}"] = (
-                    handle, base_addr, length,
-                )
+                    registered_bases.add(base_addr)
+                    kind = "reg_region"
                 seen_base_addresses.append(base_addr)
                 self._block_len_per_layer.append(block_len)
                 # Real per-logical-block bytes from the tensor's own shape
@@ -2213,19 +2234,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 # vllm-ascend mamba page padding; used by SSM addressing.
                 self._per_block_per_layer.append(per_block)
                 self._region_is_mla.append(is_mla_region)
-                self._region_group_idx.append(
-                    self._layer_to_group.get(layer_name, 0)
-                )
+                self._region_group_idx.append(group_idx)
                 # Torch uses -1 for CPU; hixl needs a non-negative device id.
                 self._device_id = max(t.get_device(), 0)
                 logger.debug(
-                    "HIXLTRACE reg_region layer=%s sub=%d base=0x%x "
-                    "length=%d per_block=%d is_mamba=%d group=%d shape=%s",
-                    layer_name, i, base_addr, length,
-                    self._per_block_per_layer[-1],
-                    is_mamba_region,
-                    self._layer_to_group.get(layer_name, 0),
-                    tuple(t.shape),
+                    "HIXLTRACE %s layer=%s sub=%d base=0x%x length=%d "
+                    "per_block=%d is_mamba=%d group=%d shape=%s",
+                    kind, layer_name, i, base_addr, length, per_block,
+                    is_mamba_region, group_idx, tuple(t.shape),
                 )
 
         self._build_transfer_topology(kv_caches)
@@ -2236,7 +2252,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         _grp_counts: dict[int, int] = {}
         for _g in self._region_group_idx:
             _grp_counts[_g] = _grp_counts.get(_g, 0) + 1
-        logger.debug(
+        # INFO, not DEBUG: group_dist is the acceptance criterion for the E5
+        # fix (every kv_cache_group of the same spec type must hold the same
+        # number of regions — an asymmetry means a group's state is not being
+        # transferred). Printed once per worker at startup, not a hot path.
+        logger.info(
             "HIXLTRACE reg_summary n_regions=%d n_handles=%d "
             "per_block_dist=%s group_dist=%s",
             len(self._per_block_per_layer), len(self._kv_mem_handles),
@@ -2606,6 +2626,16 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             trimmed_remote.append(rb)
 
         local_phys = self._physical_blocks_per_logical_kv_block
+        # OPT-2 gate: split this request's model-thread cost into building
+        # descs versus submitting them. build >> submit argues for moving desc
+        # construction to a worker thread; submit >> build means the cost is
+        # the hixl_py mutex / syscall, which a worker thread hides from the
+        # model thread but does not remove. n_descs travels with them because
+        # build cost tracks desc count — a coalescing regression shows up here
+        # before it shows up as bandwidth.
+        t_desc = 0.0
+        t_submit = 0.0
+        n_descs_total = 0
         for rank in plan.all_source_ranks:
             endpoint = remote_agents.get((0, rank))
             assert endpoint is not None, (
@@ -2644,9 +2674,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                         f"{remote_physical_per_logical}); heterogeneous "
                         "block_size not supported by the zip-pair path."
                     )
+                _t0 = time.perf_counter()
                 _g_descs, _g_bytes = self._build_op_descs(
                     list(lb), list(rb), plan, remote_engine_id, g, rank,
                 )
+                t_desc += time.perf_counter() - _t0
                 group_descs.extend(_g_descs)
                 rank_bytes += _g_bytes
             # Full prefix hit across all groups for this rank: no transfer,
@@ -2680,11 +2712,14 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     min(_la), max(_la), min(_ra), max(_ra),
                     min(_ln), max(_ln),
                 )
+            n_descs_total += len(group_descs)
             try:
+                _t0 = time.perf_counter()
                 with self._hixl_lock:
                     handle = self._hixl_transfer_async(
                         endpoint, "READ", group_descs
                     )
+                t_submit += time.perf_counter() - _t0
                 self._recving_transfers.setdefault(
                     request_id, []
                 ).append(handle)
@@ -2720,7 +2755,35 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 # land on a block the scheduler will recompute; the recompute
                 # retry overwrites.
                 self._handle_failed_transfer(request_id, None)
+                self._log_read_blocks_timing(
+                    request_id, plan, n_descs_total, t_desc, t_submit,
+                )
                 return
+        self._log_read_blocks_timing(
+            request_id, plan, n_descs_total, t_desc, t_submit,
+        )
+
+    def _log_read_blocks_timing(
+        self,
+        request_id: str,
+        plan: TPMapping,
+        n_descs: int,
+        t_desc: float,
+        t_submit: float,
+    ) -> None:
+        """Report the model-thread cost of one request's READ submission.
+
+        INFO rather than DEBUG on purpose: DEBUG also turns on the per-region
+        HIXLTRACE logs inside the same loops, which would dominate the very
+        numbers this is measuring. One line per request, same volume as the
+        bandwidth log.
+        """
+        logger.info(
+            "HIXLEngine read_blocks timing. req=%s n_ranks=%d n_descs=%d "
+            "build=%.2fms submit=%.2fms",
+            request_id, len(plan.all_source_ranks), n_descs,
+            t_desc * 1000.0, t_submit * 1000.0,
+        )
 
     # ==================================================================
     # Worker-side: load/save lifecycle (poll handles, no reformat)
@@ -2744,11 +2807,26 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._connector_metadata
         if metadata is None:
             return
+        for req_id in metadata.reqs_in_batch:
+            self._task_tracker.add_req_to_process(req_id)
+        # Track lease expiry for reqs awaiting remote read (P-side delayed
+        # free). NIXL guards on _reqs_to_process membership to avoid
+        # resurrecting an already-freed req; here _reqs_to_send is the
+        # authoritative expiry table and DONE notifies / lease-expiry are the
+        # only removers (NIXL pull_worker:96-99).
+        #
+        # This must precede the inbound drain below: a DONE riding in the same
+        # metadata packet as its own reqs_to_send entry would otherwise look
+        # premature and only get promoted a step later (before OPT-4: dropped
+        # outright, costing the P blocks a full lease). add_req_to_process
+        # stays ahead of both because _apply_one_notify only parks a DONE whose
+        # req is still in batch — an id missing from the tracker is discarded.
+        for req_id, expiration_time in metadata.reqs_to_send.items():
+            self._reqs_to_send[req_id] = expiration_time
+        self._replay_pending_dones()
         # P workers: apply DONE/HB that the scheduler ROUTER received last
         # step. D workers see an empty list.
         self._drain_inbound_notifies(metadata)
-        for req_id in metadata.reqs_in_batch:
-            self._task_tracker.add_req_to_process(req_id)
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_engine_id = meta.remote.engine_id
             # Always store metadata (NIXL pull_worker.py:66) so the
@@ -2786,13 +2864,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # Drop aborted reqs from the in-process set (NIXL pull_worker:90-94).
         for req_id in metadata.reqs_not_processed:
             self._task_tracker.discard_from_process(req_id)
-        # Track lease expiry for reqs awaiting remote read (P-side delayed
-        # free). NIXL guards on _reqs_to_process membership to avoid
-        # resurrecting an already-freed req; here _reqs_to_send is the
-        # authoritative expiry table and _get_new_notifs / lease-expiry are
-        # the only removers (NIXL pull_worker:96-99).
-        for req_id, expiration_time in metadata.reqs_to_send.items():
-            self._reqs_to_send[req_id] = expiration_time
         # D-side: extend P-side leases for reqs still WAITING in scheduler
         # (NIXL pull_worker:101-103).
         self._send_heartbeats(metadata)
@@ -3429,15 +3500,20 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
     def _drain_inbound_notifies(
         self, metadata: "HIXLEngineConnectorMetadata"
     ) -> set[str]:
-        """Apply ZMQ DONE/HB copied into this step's metadata. Clears the
-        list so get_finished in the same step does not double-count.
+        """Apply ZMQ DONE/HB copied into this step's metadata.
+
+        start_load_kv is the only caller; it applies metadata.reqs_to_send
+        first so a DONE riding in the same packet as its lease entry is not
+        seen as premature. Clears the list once applied.
         """
         inbound = getattr(metadata, "inbound_notifies", None)
         if not inbound:
-            return set()
+            return self._replay_pending_dones()
         notified = self._apply_inbound_notifies(inbound)
         inbound.clear()
-        return notified
+        # A DONE parked earlier in this very drain may already be replayable
+        # (its lease entry was written before the drain started).
+        return notified | self._replay_pending_dones()
 
     def _apply_inbound_notifies(
         self, inbound: list[tuple[str, str, int]]
@@ -3460,41 +3536,24 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 return notified_req_ids
             req_id, tp_size = msg.rsplit(":", 1)
             if req_id not in self._reqs_to_send:
-                # Distinguish a premature DONE (D finished reading
-                # before this P worker's request_finished moved the req
-                # into _reqs_to_send — NIXL guards on _reqs_to_process
-                # membership the same way) from a truly unknown/expired
-                # req. The premature case is benign: the lease-expiry
-                # sweep is the backstop that eventually frees the P
-                # blocks, and a later DONE (D re-reads on recompute) will
-                # find the req in _reqs_to_send.
                 if req_id in self._task_tracker:
-                    logger.debug(
-                        "HIXLEngine premature DONE for in-process req %s; "
-                        "dropping (lease expiry is the backstop).", req_id,
-                    )
+                    # Still in batch, so request_finished has not published
+                    # its lease entry yet. start_load_kv applies
+                    # metadata.reqs_to_send before draining inbound, so
+                    # same-packet ordering is already covered; a DONE can
+                    # still land a step ahead of its own request_finished.
+                    # Park it — dropping costs the P blocks a full lease.
+                    self._park_pending_done(req_id, msg)
                 else:
+                    # Never owned here, or already released by an earlier
+                    # DONE / the expiry sweep. Nothing to wait for.
                     logger.warning(
                         "HIXLEngine DONE notify for unknown/expired request "
                         "%s; ignoring.", req_id,
                     )
                 return notified_req_ids
-            n_consumers = int(tp_size)  # D-side world_size (= D_TP)
-            # Mirror NIXL pull_worker.py:388-396: tp_ratio asserts TP
-            # divisibility and yields the correct per-producer consumer
-            # count for split (D_TP>P_TP => -tp_ratio) and 1 otherwise.
-            assert self._transfer_topo is not None
-            tp_ratio = self._transfer_topo.tp_ratio(n_consumers)
-            consumers_per_producer = (
-                -tp_ratio if n_consumers > self._world_size else 1
-            )
-            self._consumer_notification_counts_by_req[req_id] += 1
-            if (self._consumer_notification_counts_by_req[req_id]
-                    >= consumers_per_producer):
+            if self._count_done_notify(req_id, tp_size):
                 notified_req_ids.add(req_id)
-                del self._consumer_notification_counts_by_req[req_id]
-                self._task_tracker.update_done_task_count(req_id)
-                self._reqs_to_send.pop(req_id, None)
         except Exception:
             logger.error(
                 "HIXLEngine notify handling failed for %s:%s",
@@ -3502,13 +3561,104 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return notified_req_ids
 
+    def _count_done_notify(self, req_id: str, tp_size: str) -> bool:
+        """Count one DONE for a req known to _reqs_to_send.
+
+        Returns True when the req reached consumers_per_producer and was
+        promoted. Split out of _apply_one_notify so the replay path in
+        _replay_pending_dones counts through the same tp_ratio logic instead
+        of duplicating it.
+        """
+        n_consumers = int(tp_size)  # D-side world_size (= D_TP)
+        # Mirror NIXL pull_worker.py:388-396: tp_ratio asserts TP
+        # divisibility and yields the correct per-producer consumer
+        # count for split (D_TP>P_TP => -tp_ratio) and 1 otherwise.
+        assert self._transfer_topo is not None
+        tp_ratio = self._transfer_topo.tp_ratio(n_consumers)
+        consumers_per_producer = (
+            -tp_ratio if n_consumers > self._world_size else 1
+        )
+        self._consumer_notification_counts_by_req[req_id] += 1
+        if (self._consumer_notification_counts_by_req[req_id]
+                < consumers_per_producer):
+            return False
+        del self._consumer_notification_counts_by_req[req_id]
+        self._task_tracker.update_done_task_count(req_id)
+        self._reqs_to_send.pop(req_id, None)
+        return True
+
+    def _park_pending_done(self, req_id: str, msg: str) -> None:
+        """Hold a DONE whose req is not in _reqs_to_send yet, for replay."""
+        prev = self._pending_dones.get(req_id)
+        if prev is not None:
+            self._pending_dones[req_id] = (msg, prev[1] + 1, prev[2])
+            return
+        if len(self._pending_dones) >= self._pending_done_max:
+            # Bound the table even if reqs somehow never reach the lease
+            # table; the oldest entry is the one closest to its TTL anyway.
+            oldest = min(
+                self._pending_dones, key=lambda r: self._pending_dones[r][2]
+            )
+            del self._pending_dones[oldest]
+            logger.warning(
+                "HIXLEngine pending DONE table full (%d); dropped oldest "
+                "entry %s to park %s.",
+                self._pending_done_max, oldest, req_id,
+            )
+        self._pending_dones[req_id] = (msg, 1, time.perf_counter())
+        logger.debug(
+            "HIXLEngine DONE for in-process req %s arrived before its lease "
+            "entry; parked for replay.", req_id,
+        )
+
+    def _replay_pending_dones(self) -> set[str]:
+        """Apply parked DONEs whose reqs have since entered _reqs_to_send.
+
+        Called right after every write to _reqs_to_send and at the end of
+        _drain_inbound_notifies. Entries older than the lease are discarded —
+        past that point the expiry sweep has already freed the blocks.
+        """
+        notified_req_ids: set[str] = set()
+        if not self._pending_dones:
+            return notified_req_ids
+        now = time.perf_counter()
+        for req_id in list(self._pending_dones):
+            msg, count, first_seen = self._pending_dones[req_id]
+            if req_id in self._reqs_to_send:
+                del self._pending_dones[req_id]
+                try:
+                    _, tp_size = msg.rsplit(":", 1)
+                    for _ in range(count):
+                        if req_id not in self._reqs_to_send:
+                            # Promoted on an earlier iteration; the remaining
+                            # parked DONEs are duplicates (a recompute re-read
+                            # sends its own). Counting them again would warn
+                            # from update_done_task_count.
+                            break
+                        if self._count_done_notify(req_id, tp_size):
+                            notified_req_ids.add(req_id)
+                except Exception:
+                    logger.error(
+                        "HIXLEngine pending DONE replay failed for %s",
+                        msg, exc_info=True,
+                    )
+                continue
+            if now - first_seen >= self._pending_done_ttl_s:
+                del self._pending_dones[req_id]
+                logger.warning(
+                    "HIXLEngine dropping parked DONE for %s after %.1fs; it "
+                    "never entered the lease table.", req_id, now - first_seen,
+                )
+        return notified_req_ids
+
     def _get_new_notifs(self) -> set[str]:
         """P-side: drain leftover HIXL GetNotifies (should be empty).
 
         DONE/HB now arrive via the ZMQ side channel and are applied from
-        metadata.inbound_notifies. This drain stays so an old peer that
-        still SendNotify's cannot leak a handle, and unit tests that stub
-        _hixl_get_notifies keep working.
+        metadata.inbound_notifies, so get_finished only calls this when
+        hixl_engine.drain_hixl_notifies is set — every call takes the global
+        hixl_py mutex, which the engine step cannot afford to pay for an
+        always-empty result. Kept for a peer old enough to still SendNotify.
         """
         notified_req_ids: set[str] = set()
         try:
@@ -3685,12 +3835,20 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         base_worker.py:1958-1968 drains _failed_recv_reqs into done_recving
         for the same reason).
         """
-        # P-side: apply ZMQ DONE/HB from this step's metadata, then drain
-        # any leftover HIXL GetNotifies (should be empty).
-        metadata = self._connector_metadata
-        if metadata is not None:
-            self._drain_inbound_notifies(metadata)
-        self._get_new_notifs()
+        # Inbound DONE/HB are applied only in start_load_kv, which binds the
+        # same metadata object one call earlier in this step
+        # (kv_connector_model_runner_mixin.py:89-112) and clears the list —
+        # draining again here was always a no-op. Keeping one drain site also
+        # keeps the "lease table written before DONEs are applied" ordering in
+        # one place.
+        #
+        # GetNotifies is likewise skipped: DONE/HB left the HIXL control
+        # socket for the ZMQ side channel, so it returns empty while still
+        # taking the global hixl_py mutex once per engine step. Opt back in
+        # via hixl_engine.drain_hixl_notifies for a peer that still
+        # SendNotify's.
+        if self._drain_hixl_notifies:
+            self._get_new_notifs()
         done_recving = self._pop_done_transfers(self._recving_transfers)
         # Drop metadata for completed reqs (NIXL base_worker.py:1984). Without
         # this pop _recving_metadata grew monotonically — _pop_done_transfers
