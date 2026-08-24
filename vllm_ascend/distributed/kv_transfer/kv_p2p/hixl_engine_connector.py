@@ -478,6 +478,14 @@ class HIXLEngineReqMeta:
     local_block_ids: list[list[int]]
     tp_size: int
     remote: HIXLEngineRemoteMeta | None = None
+    # P writes tokens, not full scheduler blocks. D uses these to drop the
+    # unwritten hybrid-alignment tail after logical→kernel expand
+    # (Mooncake _get_kernel_block_ids). 0 / missing → no kernel clip.
+    num_external_tokens: int = 0
+    num_computed_tokens: int = 0
+    # Filled by _read_blocks after prefix trim + kernel clip. NZ reformat
+    # uses these so it only touches pages that were actually written.
+    local_kernel_ids: list[list[int]] | None = None
 
 
 def compute_hixl_engine_compat_hash(
@@ -558,10 +566,15 @@ class HIXLEngineConnectorMetadata(KVConnectorMetadata):
         self,
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
+        num_external_tokens: int = 0,
     ) -> HIXLEngineReqMeta:
         return HIXLEngineReqMeta(
             local_block_ids=local_block_ids,
             tp_size=kv_transfer_params.get("tp_size", 1),
+            num_external_tokens=num_external_tokens,
+            num_computed_tokens=int(
+                kv_transfer_params.get("num_computed_tokens", 0) or 0
+            ),
         )
 
     def add_new_req_to_recv(
@@ -569,8 +582,11 @@ class HIXLEngineConnectorMetadata(KVConnectorMetadata):
         request_id: str,
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
+        num_external_tokens: int = 0,
     ) -> None:
-        req = self._add_new_req(local_block_ids, kv_transfer_params)
+        req = self._add_new_req(
+            local_block_ids, kv_transfer_params, num_external_tokens,
+        )
         req.remote = HIXLEngineRemoteMeta(
             block_ids=kv_transfer_params["remote_block_ids"],
             engine_id=kv_transfer_params["remote_engine_id"],
@@ -639,7 +655,10 @@ class HIXLEngineConnectorScheduler:
         # attention/compress) need it too. Forked from hixl_connector L1316-1319.
         self._use_compress = self._model_uses_compress()
         self._need_truncate = self._use_compress or self._has_mamba
-        self._reqs_need_recv: dict[str, tuple["Request", BlockIds]] = {}
+        # (request, local_block_ids, num_external_tokens). Token count is
+        # required on the worker for attn kernel-tail clip; block ids alone
+        # cannot express a partial 1536-token scheduler block.
+        self._reqs_need_recv: dict[str, tuple["Request", BlockIds, int]] = {}
         self._reqs_need_send: dict[str, float] = {}
         self._reqs_in_batch: set[str] = set()
         self._reqs_not_processed: set[str] = set()
@@ -753,6 +772,10 @@ class HIXLEngineConnectorScheduler:
     ) -> tuple[int, bool]:
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_prefill"):
+            # Worker kernel-tail clip reads this off ReqMeta. Block ids
+            # lose the intra-block token count (1 and 1536 both look
+            # like 1 scheduler block).
+            params["num_computed_tokens"] = num_computed_tokens
             token_ids = request.prompt_token_ids or []
             actual = self._get_remote_prefill_token_count(len(token_ids))
             count = actual - num_computed_tokens
@@ -808,7 +831,7 @@ class HIXLEngineConnectorScheduler:
                         if num_external_tokens > 0 else ())
                     local_block_ids = self.get_sw_clipped_blocks(unhashed)
                     self._reqs_need_recv[request.request_id] = (
-                        request, local_block_ids)
+                        request, local_block_ids, num_external_tokens)
                 else:
                     logger.error(
                         "Got invalid KVTransferParams: %s. This request "
@@ -830,7 +853,7 @@ class HIXLEngineConnectorScheduler:
         is_d_node = not is_p_node
         self._stop_heartbeat(request.request_id)
         if params.get("do_remote_prefill"):
-            self._reqs_need_recv[request.request_id] = (request, [])
+            self._reqs_need_recv[request.request_id] = (request, [], 0)
             params["do_remote_prefill"] = False
             return False, None
         if is_d_node and not self.is_bidirectional_kv_xfer_enabled:
@@ -877,12 +900,15 @@ class HIXLEngineConnectorScheduler:
         self, scheduler_output: "SchedulerOutput"
     ) -> "KVConnectorMetadata":
         meta = HIXLEngineConnectorMetadata()
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
+        for req_id, (req, block_ids, num_external_tokens) in (
+            self._reqs_need_recv.items()
+        ):
             assert req.kv_transfer_params is not None
             meta.add_new_req_to_recv(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
+                num_external_tokens=num_external_tokens,
             )
         meta.reqs_to_send = self._reqs_need_send
         meta.reqs_in_batch = self._reqs_in_batch
@@ -926,6 +952,15 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._vllm_config = vllm_config
         self._kv_cache_config = kv_cache_config
         self._parse_hixl_engine_config(vllm_config)
+        # Align / MTP: SSM block table is 1 committed + N speculative slots.
+        # _apply_prefix_caching picks remote[len - spec - 1] (Mooncake /
+        # hixl_connector). 0 when speculative_config is absent.
+        spec_cfg = getattr(vllm_config, "speculative_config", None)
+        self._num_speculative_tokens = (
+            int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
+            if spec_cfg is not None
+            else 0
+        )
 
         # Parallel / model identity (mirrors NIXL base_worker.py:470-510).
         kvtc = vllm_config.kv_transfer_config
@@ -1047,6 +1082,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._num_blocks = kv_cache_config.num_blocks if kv_cache_config else 0
         self._logical_num_blocks = self._num_blocks
         self._physical_blocks_per_logical_kv_block = 1
+        self._attn_compress_ratio = 1
         self._sync_block_size_with_kernel()
 
         # Layer specs from kv_cache_groups (mirrors NIXL _layer_specs).
@@ -1068,6 +1104,15 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
                 for layer in group.layer_names
             }
+            for group in kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                cr = getattr(spec, "compress_ratio", None)
+                if not isinstance(cr, int):
+                    inner = getattr(spec, "kv_cache_spec", None)
+                    cr = getattr(inner, "compress_ratio", None)
+                if isinstance(cr, int) and cr > 1:
+                    self._attn_compress_ratio = cr
+                    break
 
         # Per-region bookkeeping (mirrors NIXL block_len_per_layer /
         # kv_caches_base_addr[engine_id][tp_rank]).
@@ -2114,6 +2159,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._enable_kv_nz = bool(
             getattr(get_ascend_config(), "enable_kv_nz", False))
         self._kv_caches = kv_caches
+        self._warn_if_kv_zeroing_disabled()
         # ensure_linked: Initialize the hixl engine on first registration.
         # All wrapper calls hold _hixl_lock — hixl::Hixl is not thread-safe
         # and a handshake callback on _handshake_initiation_executor may be
@@ -2258,15 +2304,47 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         # transferred). Printed once per worker at startup, not a hot path.
         logger.info(
             "HIXLTRACE reg_summary n_regions=%d n_handles=%d "
-            "per_block_dist=%s group_dist=%s",
+            "per_block_dist=%s group_dist=%s phys=%d logical_blocks=%d",
             len(self._per_block_per_layer), len(self._kv_mem_handles),
             _pb_counts, _grp_counts,
+            self._physical_blocks_per_logical_kv_block,
+            self._logical_num_blocks,
         )
         logger.info(
             "HIXLEngineConnector registered %d KV regions on rank %s "
             "(num_blocks=%d, block_size=%d, layout=%s).",
             len(self._kv_mem_handles), self._tp_rank,
             self._num_blocks, self._block_size, self._kv_cache_layout,
+        )
+
+    def _warn_if_kv_zeroing_disabled(self) -> None:
+        """Surface the platform's silently-skipped mamba block zeroing.
+
+        vllm_ascend/worker/worker.py gates _init_kv_zero_meta() on
+        speculative method == "eagle3"; upstream vLLM (gpu_worker.py) gates
+        only on needs_kv_cache_zeroing, which is True for any model with
+        mamba layers. When the gate misses, _kv_block_zeroer is never built
+        and gpu_model_runner._zero_block_ids() is a hasattr-guarded no-op,
+        so every new_block_ids_to_zero the scheduler produces is dropped
+        without a word. The worker comment at that gate states the
+        consequence: stale mamba state reused across requests degrades MTP
+        acceptance. Re-derived here rather than probed, because the
+        connector has no handle on the model runner — keep in sync with
+        worker.py:917-925.
+        """
+        spec_cfg = getattr(self._vllm_config, "speculative_config", None)
+        if spec_cfg is None or not self._has_mamba:
+            return
+        method = getattr(spec_cfg, "method", None)
+        num_spec = getattr(spec_cfg, "num_speculative_tokens", 0)
+        if method == "eagle3" or num_spec <= 1:
+            return
+        logger.warning(
+            "HIXLEngine: mamba KV block zeroing is DISABLED. worker.py gates "
+            "_init_kv_zero_meta on method=='eagle3', but this deployment has "
+            "method=%s num_speculative_tokens=%d with mamba layers. Stale "
+            "mamba state will be reused across requests and MTP acceptance "
+            "will be degraded.", method, num_spec,
         )
 
     def _build_transfer_topology(self, kv_caches: dict[str, torch.Tensor]) -> None:
@@ -2608,10 +2686,20 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         remote_info = self._transfer_topo.get_engine_info(remote_engine_id)
         remote_physical_per_logical = remote_info.remote_physical_blocks_per_logical
 
-        # Pre-trim per group (SSM tail-trim to last block, FA tail-trim
-        # when same phys / front-trim to min when heterogeneous phys).
+        # Pre-trim per group (SSM: one committed slot; FA tail-trim when
+        # same phys / front-trim to min when heterogeneous phys). Then
+        # expand FA logical ids to kernel pages and clip the unwritten
+        # hybrid-alignment tail (1 token must not pull 12 pages).
         trimmed_local: list[list[int]] = []
         trimmed_remote: list[list[int]] = []
+        pre_remote_lens: list[int] = []
+        # Diagnostic: pairs with the read_blocks timing line on req=.
+        # SSM lists printed whole; FA adds k{expanded}->{clipped}.
+        trim_probe: list[str] = []
+        same_phys = (
+            self._physical_blocks_per_logical_kv_block
+            == remote_physical_per_logical
+        )
         for g in range(num_groups):
             lb = list(req_meta.local_block_ids[g])
             rb = (
@@ -2619,13 +2707,79 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 if g < len(req_meta.remote.block_ids)
                 else []
             )
+            pre_local, pre_remote = len(lb), len(rb)
+            pre_remote_lens.append(pre_remote)
+            is_ssm = (
+                g < len(self._group_spec_types)
+                and self._is_ssm_spec(self._group_spec_types[g])
+            )
             lb, rb = self._apply_prefix_caching(
                 lb, rb, g, remote_physical_per_logical
             )
+            # Mirrors _apply_prefix_caching's returns, reconstructed from
+            # the shapes it was handed so the hot path stays untouched.
+            if pre_local == 0:
+                branch = "empty"
+            elif is_ssm:
+                branch = "ssm_align"
+            elif pre_local == pre_remote:
+                branch = "passthrough"
+            elif same_phys:
+                branch = "fa_tail"
+            else:
+                branch = "fa_front"
+            probe = (
+                f"g{g}{'/ssm' if is_ssm else ''}="
+                f"{pre_local}->{len(lb)}/{pre_remote}->{len(rb)}:{branch}"
+            )
+            if is_ssm:
+                probe += f" L{lb} R{rb}"
+            trim_probe.append(probe)
             trimmed_local.append(lb)
             trimmed_remote.append(rb)
 
         local_phys = self._physical_blocks_per_logical_kv_block
+        num_computed = int(getattr(req_meta, "num_computed_tokens", 0) or 0)
+        num_external = int(getattr(req_meta, "num_external_tokens", 0) or 0)
+        for g in range(num_groups):
+            lb, rb = trimmed_local[g], trimmed_remote[g]
+            is_ssm = (
+                g < len(self._group_spec_types)
+                and self._is_ssm_spec(self._group_spec_types[g])
+            )
+            if is_ssm or not lb:
+                continue
+            # Expand once (not per rank). _build_op_descs addresses by
+            # physical id; SSM stays logical (phys==1 today).
+            lb = self._expand_physical(lb, local_phys)
+            rb = self._expand_physical(rb, remote_physical_per_logical)
+            assert len(lb) == len(rb), (
+                f"group {g}: physical id count mismatch after expand: "
+                f"local={len(lb)} remote={len(rb)} (local_phys="
+                f"{local_phys} remote_phys="
+                f"{remote_physical_per_logical}); heterogeneous "
+                "block_size not supported by the zip-pair path."
+            )
+            dropped = (
+                (pre_remote_lens[g] - len(trimmed_remote[g]))
+                * remote_physical_per_logical
+            )
+            pre_k = len(lb)
+            lb, rb = self._clip_attn_kernel_pages(
+                lb, rb,
+                num_computed_tokens=num_computed,
+                num_external_tokens=num_external,
+                dropped_kernels=dropped,
+            )
+            trim_probe[g] += f" k{pre_k}->{len(lb)}"
+            trimmed_local[g] = lb
+            trimmed_remote[g] = rb
+        req_meta.local_kernel_ids = [list(x) for x in trimmed_local]
+        logger.info(
+            "HIXLEngine trim probe. req=%s ext=%d computed=%d %s",
+            request_id, num_external, num_computed, " ".join(trim_probe),
+        )
+
         # OPT-2 gate: split this request's model-thread cost into building
         # descs versus submitting them. build >> submit argues for moving desc
         # construction to a worker thread; submit >> build means the cost is
@@ -2651,29 +2805,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 rb = trimmed_remote[g]
                 if not lb:
                     continue
-                # Expand logical -> physical block ids for non-Mamba groups
-                # so _build_op_descs (which addresses by physical id with
-                # per-physical-block spans) lands on the right offset when
-                # physical_blocks_per_logical>1. Mamba state regions keep the
-                # TODO conv-decomposition path (phys==1 there today).
-                if g < len(self._group_spec_types) and not self._is_ssm_spec(
-                    self._group_spec_types[g]
-                ):
-                    lb = self._expand_physical(lb, local_phys)
-                    rb = self._expand_physical(rb, remote_physical_per_logical)
-                    # zip() in _build_op_descs pairs local/remote physical
-                    # ids positionally; heterogeneous phys (different kernel
-                    # block_size) makes the expanded lengths diverge. Fail
-                    # closed — the address-offset path cannot express a
-                    # per-side desc count without NIXL-style desc decoupling
-                    # (not ported).
-                    assert len(lb) == len(rb), (
-                        f"group {g}: physical id count mismatch after expand: "
-                        f"local={len(lb)} remote={len(rb)} (local_phys="
-                        f"{local_phys} remote_phys="
-                        f"{remote_physical_per_logical}); heterogeneous "
-                        "block_size not supported by the zip-pair path."
-                    )
                 _t0 = time.perf_counter()
                 _g_descs, _g_bytes = self._build_op_descs(
                     list(lb), list(rb), plan, remote_engine_id, g, rank,
@@ -2904,8 +3035,11 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
 
         Branch per group:
 
-        - SSM state: only the last block holds the full in-place state;
-          assert num_local==1 and tail-trim remote to it.
+        - SSM state: align / MTP block table is 1 committed + N speculative
+          slots. Only the committed slot is live (Mooncake /
+          hixl_connector). Pick local[0] and remote[len - spec - 1]
+          (clamp idx < 0 to 0). Zip-pairing all slots writes P's draft
+          slots into D and kills MTP acceptance.
         - FA, same phys: tail-trim remote to len(local) (skip cached prefix).
         - FA, heterogeneous phys: front-trim both to min. This is the only
           pairing that keeps the physical-id arrays zip-aligned after
@@ -2918,6 +3052,18 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         """
         num_local = len(local_block_ids)
         num_remote = len(remote_block_ids)
+        is_ssm = (
+            group_idx < len(self._group_spec_types)
+            and self._is_ssm_spec(self._group_spec_types[group_idx])
+        )
+        if is_ssm:
+            if num_local == 0 or num_remote == 0:
+                return local_block_ids, []
+            spec = int(getattr(self, "_num_speculative_tokens", 0) or 0)
+            idx = num_remote - spec - 1
+            if idx < 0:
+                idx = 0
+            return [local_block_ids[0]], [remote_block_ids[idx]]
         assert num_local <= num_remote, (
             f"group {group_idx}: local {num_local} > remote {num_remote}; "
             "prefix trim invariant violated"
@@ -2928,16 +3074,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             return local_block_ids, []
         if num_local == num_remote:
             return local_block_ids, remote_block_ids
-        is_ssm = (
-            group_idx < len(self._group_spec_types)
-            and self._is_ssm_spec(self._group_spec_types[group_idx])
-        )
-        if is_ssm:
-            assert num_local == 1, (
-                f"group {group_idx}: SSM state expects exactly one local "
-                f"block, got {num_local}"
-            )
-            return local_block_ids, remote_block_ids[-num_local:]
         if self._physical_blocks_per_logical_kv_block == remote_physical_per_logical:
             return local_block_ids, remote_block_ids[-num_local:]
         max_padding = max(
@@ -2982,6 +3118,39 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             base = b * phys
             out.extend(range(base, base + phys))
         return out
+
+    def _clip_attn_kernel_pages(
+        self,
+        kernel_local: list[int],
+        kernel_remote: list[int],
+        *,
+        num_computed_tokens: int,
+        num_external_tokens: int,
+        dropped_kernels: int = 0,
+    ) -> tuple[list[int], list[int]]:
+        """Drop unwritten hybrid-alignment tail pages after expand.
+
+        Scheduler attention blocks are sized to share a page with mamba
+        (1536 tokens here); the kernel page is 128 tokens. Expanding a
+        partial block yields empty tail pages (1 token → 11 unused / 12).
+        Mooncake `_get_kernel_block_ids` keeps ``cdiv(t, kernel)`` pages.
+        ``dropped_kernels`` is how many prefix kernel pages
+        ``_apply_prefix_caching`` already removed, so the start index
+        stays aligned with Mooncake's full-list expand. ``num_external_tokens
+        == 0`` leaves the lists untouched (no pull in that case).
+        """
+        if num_external_tokens <= 0 or not kernel_local or not kernel_remote:
+            return kernel_local, kernel_remote
+        cr = int(getattr(self, "_attn_compress_ratio", 1) or 1)
+        kernel_token_size = max(1, int(self._block_size)) * max(1, cr)
+        remote_start_idx = num_computed_tokens // kernel_token_size
+        tokens_to_cover = num_computed_tokens + num_external_tokens
+        needed = cdiv(tokens_to_cover, kernel_token_size) - remote_start_idx
+        if needed <= 0:
+            return [], []
+        skip = max(0, remote_start_idx - max(0, dropped_kernels))
+        end = skip + needed
+        return kernel_local[skip:end], kernel_remote[skip:end]
 
     def _log_transfer_bandwidth(self, req_id: str, had_failure: bool) -> None:
         """Report effective bandwidth for one request's KV pull.
@@ -3155,24 +3324,26 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         if meta is None:
             return
         local_phys = self._physical_blocks_per_logical_kv_block
+        kernel_groups = getattr(meta, "local_kernel_ids", None)
         for g, block_ids in enumerate(meta.local_block_ids):
             if g >= len(self._group_spec_types):
                 continue
             if self._is_ssm_spec(self._group_spec_types[g]):
                 continue  # state group: no NZ reformat
-            if not block_ids:
+            # Prefer the kernel ids _read_blocks already clipped; otherwise
+            # expand the scheduler logical ids (tests / NZ-before-read).
+            if kernel_groups is not None and g < len(kernel_groups):
+                phys_block_ids = list(kernel_groups[g])
+            else:
+                if not block_ids:
+                    continue
+                phys_block_ids = block_ids
+                if local_phys > 1:
+                    phys_block_ids = self._expand_physical(
+                        list(block_ids), local_phys
+                    )
+            if not phys_block_ids:
                 continue
-            # _reformat_kv_cache_nz indexes the D paged cache by physical
-            # block id (block_table -> npu_paged_cache_load). With phys>1 the
-            # logical ids from the scheduler must be expanded to physical ids
-            # or the ND->NZ scatter lands on wrong slots. SSM groups keep
-            # logical-id addressing (Mamba phys==1 in practice) and are skipped
-            # above.
-            phys_block_ids = block_ids
-            if local_phys > 1:
-                phys_block_ids = self._expand_physical(
-                    list(block_ids), local_phys
-                )
             group_kv = {
                 name: t for name, t in self._kv_caches.items()
                 if self._layer_to_group.get(name) == g
