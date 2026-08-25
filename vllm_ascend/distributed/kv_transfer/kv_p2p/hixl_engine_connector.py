@@ -654,6 +654,34 @@ class HIXLEngineConnectorScheduler:
         self.blocks_per_sw = [
             cdiv(n, b) + 1 if n else 0 for n, b in sw_sizes
         ]
+        # Per-group prompt span for P-side MTP-extra clip (Mooncake
+        # _get_transfer_block_ids). State groups keep the full table;
+        # attention is cut to cdiv(prompt_len, tokens_per_block * cp).
+        pc = vllm_config.parallel_config
+        self._cp_size = max(
+            1,
+            int(getattr(pc, "prefill_context_parallel_size", 1) or 1)
+            * int(getattr(pc, "decode_context_parallel_size", 1) or 1),
+        )
+        self._group_is_state: list[bool] = []
+        self._group_tokens_per_block: list[int] = []
+        for group in kv_cache_config.kv_cache_groups:
+            specs = self._group_unique_specs(group)
+            is_state = any(isinstance(spec, MambaSpec) for spec in specs)
+            first = specs[0] if specs else group.kv_cache_spec
+            block_size = getattr(
+                group.kv_cache_spec, "block_size",
+                getattr(first, "block_size", self.block_size),
+            )
+            compress = 1
+            for spec in specs:
+                ratio = getattr(spec, "compress_ratio", None)
+                if ratio:
+                    compress = int(ratio)
+            self._group_is_state.append(is_state)
+            self._group_tokens_per_block.append(
+                int(block_size) * max(1, compress)
+            )
         self.kv_recompute_threshold = int(
             kvtc.get_from_extra_config("kv_recompute_threshold", 64)
         )
@@ -707,6 +735,49 @@ class HIXLEngineConnectorScheduler:
             else blocks
             for i, blocks in enumerate(block_ids)
         )
+
+    @staticmethod
+    def _group_unique_specs(group: Any) -> list[Any]:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            return [spec]
+        specs: list[Any] = []
+        for layer_name in group.layer_names:
+            layer_spec = spec.kv_cache_specs[layer_name]
+            if layer_spec not in specs:
+                specs.append(layer_spec)
+        return specs
+
+    def _get_transfer_block_ids(
+        self, block_ids: BlockIds, prompt_len: int,
+    ) -> BlockIds:
+        """Keep prompt KV blocks; drop MTP extras on attention groups.
+
+        Mirrors MooncakeConnectorScheduler._get_transfer_block_ids. State
+        groups (Mamba) are not context-aligned with attention, so they
+        pass through. Attention is cut to
+        ``cdiv(prompt_len, tokens_per_block * cp_size)`` from the front
+        — the prefix that holds prompt tokens, not the tail (which is
+        where align / MTP extra slots land).
+        """
+        if len(block_ids) == 0:
+            return block_ids
+        assert len(block_ids) == len(self._group_is_state), (
+            f"block groups {len(block_ids)} != "
+            f"kv_cache_groups {len(self._group_is_state)}"
+        )
+        cp_size = max(1, self._cp_size)
+        out: list[list[int]] = []
+        for blocks, is_state, tokens_per_block in zip(
+            block_ids, self._group_is_state, self._group_tokens_per_block,
+        ):
+            if is_state:
+                out.append(list(blocks))
+                continue
+            span = max(1, int(tokens_per_block)) * cp_size
+            n = cdiv(max(0, int(prompt_len)), span)
+            out.append(list(blocks[:n]))
+        return tuple(out)
 
     # -- truncate helpers (Mamba + compress-ratio) ----------------------
     def _model_uses_compress(self) -> bool:
@@ -841,6 +912,20 @@ class HIXLEngineConnectorScheduler:
                                   RequestStatus.FINISHED_STOPPED):
             self._reqs_not_processed.add(request.request_id)
             return False, None
+        token_ids = request.prompt_token_ids or []
+        prompt_len = (
+            len(token_ids)
+            if token_ids
+            else int(getattr(request, "num_prompt_tokens", 0) or 0)
+        )
+        if block_ids:
+            # P only: drop MTP extras from the front, then SWA tail.
+            # Same order as Mooncake request_finished. D bidirectional
+            # must not clip to prompt_len — those blocks include decode.
+            if is_p_node:
+                block_ids = self._get_transfer_block_ids(
+                    block_ids, prompt_len)
+            block_ids = self.get_sw_clipped_blocks(block_ids)
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         blocks_expiry_time = None
@@ -852,13 +937,12 @@ class HIXLEngineConnectorScheduler:
                 time.perf_counter() + request_kv_blocks_ttl)
             if is_d_node:
                 blocks_expiry_time = self._reqs_need_send[request.request_id]
-            block_ids = self.get_sw_clipped_blocks(block_ids)
             remote_num_tokens = request.num_computed_tokens
         logger.debug(
             "HIXLTRACE P-request_finished req=%s is_p=%d delay_free=%d "
-            "remote_port=%d n_blocks=%s",
+            "remote_port=%d prompt_len=%d n_blocks=%s",
             request.request_id, is_p_node, delay_free_blocks,
-            self.side_channel_port,
+            self.side_channel_port, prompt_len,
             [len(g) for g in block_ids] if block_ids else [],
         )
         return delay_free_blocks, dict(
@@ -2108,11 +2192,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         self._block_len_per_layer.clear()
         self._region_is_mla.clear()
         self._region_group_idx.clear()
-        # Real per-logical-block bytes from each tensor's own shape, used by
-        # SSM addressing. vllm-ascend pads MambaSpec.page_size_bytes to align
-        # mamba/attn blocks for HMA pooling, which would inflate
-        # block_len_per_layer past the real ssm per-block; FA regions keep
-        # block_len_per_layer (FA page_size is not padded).
+        # Real per-page bytes from each tensor's own shape. vllm-ascend
+        # pads spec.page_size_bytes so attn and mamba share an HMA page
+        # (attn + conv). That inflates FA to 66816 (65536+1280) and SSM
+        # past the real state. Addressing always uses this tensor size.
         self._per_block_per_layer = []
         seen_base_addresses: list[int] = []
         self._kv_caches_base_addr[self._engine_id][self._tp_rank] = (
@@ -2152,15 +2235,6 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 else [cache_or_caches]
             )
             # Per-tensor page stride after K/V split.
-            physical_page_size = layer_spec.page_size_bytes
-            if not isinstance(layer_spec, MambaSpec):
-                physical_page_size //= self._physical_blocks_per_logical_kv_block
-            physical_page_size //= len(tensors)
-            block_len = (
-                physical_page_size // self._physical_blocks_per_logical_kv_block
-                if isinstance(layer_spec, MambaSpec)
-                else physical_page_size
-            )
             is_mla_region = isinstance(
                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
             )
@@ -2200,10 +2274,10 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                     registered_bases.add(base_addr)
                     kind = "reg_region"
                 seen_base_addresses.append(base_addr)
-                self._block_len_per_layer.append(block_len)
-                # Real per-logical-block bytes from the tensor's own shape
-                # (block-0 element count * dtype size), immune to the
-                # vllm-ascend mamba page padding; used by SSM addressing.
+                # Handshake block_lens and FA/SSM addressing both use the
+                # tensor page. spec.page_size_bytes is HMA-padded
+                # (66816 = 65536 + conv/12/2) and must not be shipped.
+                self._block_len_per_layer.append(per_block)
                 self._per_block_per_layer.append(per_block)
                 self._region_is_mla.append(is_mla_region)
                 self._region_group_idx.append(group_idx)
@@ -2368,7 +2442,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
         offset. reshard is expressed purely as
         address offsets, no staging cache:
 
-          stride       = block_len_per_layer[i] // block_size_ratio
+          stride       = per_block_per_layer[i] // block_size_ratio
           chunk        = stride // num_reads            (transfer length)
           rank_offset  = 0 if replicated else plan.rank_offset_factor * stride
           slot         = 0 if replicated
@@ -2380,7 +2454,7 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
 
         stride (full block, for addressing) and chunk (divided, for transfer
         length) are kept separate — NIXL _build_fa_local uses
-        block_len_per_layer//ratio as page_stride while _build_fa_remote
+        per_block//ratio as page_stride while _build_fa_remote
         uses the same value //num_reads as length.
 
         ``remote_base`` is per-source-rank: each remote TP rank exposes its
@@ -2487,19 +2561,13 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
             elif self._region_group_idx[i] != group_idx:
                 continue
             replicated = self._region_is_mla[i]
-            if is_ssm_group:
-                # Mamba state: logical-id addressing (expansion is skipped
-                # for state groups). stride/page_size use the real
-                # per-logical-block bytes from the tensor shape, not the
-                # padded MambaSpec.page_size_bytes (see register_kv_caches).
-                # P/D run the same model/spec, so local per_block is valid
-                # for the remote side too.
-                per_block = self._per_block_per_layer[i]
-                stride = per_block // block_size_ratio
-                page_size = per_block
-            else:
-                stride = self._block_len_per_layer[i] // block_size_ratio
-                page_size = remote_meta.block_lens[i]
+            # Tensor page, not padded spec.page_size_bytes (E1 SSM, E9 FA).
+            # 0958: spec gave FA 66816, tensor 65536; Mooncake uses
+            # stride(0)*element_size. P/D same model, so local per_block
+            # is valid for the remote side too (same as SSM).
+            per_block = self._per_block_per_layer[i]
+            stride = per_block // block_size_ratio
+            page_size = per_block
             num_reads = 1 if replicated else split_reads
             chunk = stride // num_reads
             rank_offset = (
@@ -2649,7 +2717,9 @@ class HIXLEngineConnector(KVConnectorBase_V1, SupportsHMA):
                 f"g{g}{'/ssm' if is_ssm else ''}="
                 f"{pre_local}->{len(lb)}/{pre_remote}->{len(rb)}:{branch}"
             )
-            if is_ssm:
+            if lb or rb:
+                # Logical ids after prefix trim, before kernel expand.
+                # 21k / g0=28 needs FA ids, not just lengths.
                 probe += f" L{lb} R{rb}"
             trim_probe.append(probe)
             trimmed_local.append(lb)
