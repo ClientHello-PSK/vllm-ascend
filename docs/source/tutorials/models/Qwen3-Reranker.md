@@ -6,7 +6,7 @@ The Qwen3 Reranker model series is the latest proprietary model of the Qwen fami
 
 ## 2 Supported Features
 
-Refer to [supported features](../../user_guide/support_matrix/supported_models.md) to get the model's supported feature matrix.
+Refer to [Supported Features List](../../user_guide/support_matrix/supported_models.md) to get the model's supported feature matrix.
 
 ## 3 Prerequisites
 
@@ -24,7 +24,7 @@ It is recommended to download the model weight to the shared directory of multip
 
 You can use our official docker image to run `Qwen3-Reranker` model directly.
 
-Select an image based on your machine type and start the docker image on your node, refer to [using docker](../../installation.md#set-up-using-docker).
+Select an image based on your machine type and start the docker image on your node, refer to [using docker](../../getting_started/installation.md#installation-prebuilt-image).
 
 === "A3 series"
 
@@ -107,11 +107,11 @@ After a successful docker run, you can verify the running container service by e
 
 If you don't want to use the docker image as above, you can also build all from source:
 
-- Install `vllm-ascend` from source, refer to [installation](../../installation.md).
+- Install `vllm-ascend` from source, refer to [installation](../../getting_started/installation.md).
 
 If you want to deploy multi-node environment, you need to set up environment on each node.
 
-## 5 Online Service Deployment
+## 5 Online Service Deployment {: #5-online-service-deployment }
 
 === "A3/A2 series"
 
@@ -120,7 +120,7 @@ If you want to deploy multi-node environment, you need to set up environment on 
     vllm serve Qwen/Qwen3-Reranker-0.6B \
         --served-model-name Qwen/Qwen3-Reranker-0.6B \
         --runner pooling \
-        --hf_overrides '{"architectures": ["Qwen3VLForSequenceClassification"],"classifier_from_token": ["no", "yes"],"is_original_qwen3_reranker": true}' \
+        --hf_overrides '{"architectures": ["Qwen3ForSequenceClassification"],"classifier_from_token": ["no", "yes"],"is_original_qwen3_reranker": true}' \
         --port 8000 \
         --max-model-len 1024
     ```
@@ -132,7 +132,7 @@ If you want to deploy multi-node environment, you need to set up environment on 
     vllm serve Qwen/Qwen3-Reranker-0.6B \
         --served-model-name Qwen/Qwen3-Reranker-0.6B \
         --runner pooling \
-        --hf_overrides '{"architectures": ["Qwen3VLForSequenceClassification"],"classifier_from_token": ["no", "yes"],"is_original_qwen3_reranker": true}' \
+        --hf_overrides '{"architectures": ["Qwen3ForSequenceClassification"],"classifier_from_token": ["no", "yes"],"is_original_qwen3_reranker": true}' \
         --compilation-config '{"cudagraph_capture_sizes": [1024,512]}' \
         --additional-config '{"ascend_compilation_config": {"fuse_norm_quant": false}}' \
         --dtype float16 \
@@ -147,7 +147,7 @@ Key Parameter Descriptions:
 
 - `--max-model-len` represents the context length, which is the maximum value of the input plus output for a single request. For Atlas 300I DUO if automatic parsing resolves to a large context length, allocating this mask (O(max_model_len^2)) may exceed NPU memory and trigger OOM. Be sure to set an explicit and conservative value, such as --max-model-len 1024.
 
-Common Issues Tip: If you encounter issues, please refer to the [Public FAQ](https://docs.vllm.ai/projects/ascend/en/latest/faqs.html) for troubleshooting.
+Common Issues Tip: If you encounter issues, please refer to the [Public FAQs](../../faqs.md) for troubleshooting.
 
 ## 6 Functional Verification
 
@@ -256,7 +256,7 @@ Here are two accuracy evaluation methods.
                                     dtype="float16",
                                     enforce_eager=True,
                                     max_model_len=10240,
-                                    hf_overrides={"architectures": ["Qwen3VLForSequenceClassification"],"classifier_from_token": ["no", "yes"],"is_original_qwen3_reranker": True})
+                                    hf_overrides={"architectures": ["Qwen3ForSequenceClassification"],"classifier_from_token": ["no", "yes"],"is_original_qwen3_reranker": True})
 
         cache = mteb.ResultCache("/home/data/mteb_data")
         tasks = mteb.get_tasks(
@@ -288,4 +288,4 @@ After about several minutes, you can get the performance evaluation result.
 
 ## 9 FAQ
 
-For common environment, installation, and general parameter issues, please refer to the [Public FAQ](https://docs.vllm.ai/projects/ascend/en/latest/faqs.html).
+For common environment, installation, and general parameter issues, please refer to the [Public FAQs](../../faqs.md).

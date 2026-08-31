@@ -59,6 +59,10 @@ if not _npu_available:
     torch_npu.npu_format_cast = MagicMock(side_effect=lambda weight, fmt: weight)  # type: ignore[attr-defined]
     torch_npu._C = MagicMock()  # type: ignore[attr-defined]
     torch_npu._C._NPUTaskGroupHandle = MagicMock
+    # Note: Assign missing attributes with values from real scenarios
+    torch_npu.float4_e2m1fn_x2 = 296  # type: ignore[attr-defined]
+    torch_npu.hifloat8 = 290  # type: ignore[attr-defined]
+    torch_npu.float8_e8m0fnu = 293  # type: ignore[attr-defined]
     sys.modules["torch_npu"] = torch_npu
     sys.modules["torch_npu._C"] = torch_npu._C
     sys.modules["torch_npu._C._distributed_c10d"] = torch_npu._C._distributed_c10d
@@ -120,6 +124,9 @@ if not _npu_available:
     sys.modules["torch_npu"].npu_rms_norm = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_swiglu = MagicMock()  # type: ignore[attr-defined]
     sys.modules["torch_npu"].npu_convert_weight_to_int4pack = MagicMock()  # type: ignore[attr-defined]
+    sys.modules["torch_npu"].npu_transpose_batchmatmul = MagicMock()  # type: ignore[attr-defined]
+    sys.modules["torch_npu"].npu_scatter_nd_update_ = MagicMock()  # type: ignore[attr-defined]
+    sys.modules["torch_npu"].npu_dynamic_mx_quant = MagicMock()  # type: ignore[attr-defined]
 
 adapt_patch()
 adapt_patch(True)
@@ -160,6 +167,6 @@ def _mock_ascend_store_deps(request):
     with (
         patch(f"{_pfx}.pool_worker.get_attention_compute_start_gate"),
         patch(f"{_pfx}.pool_worker.reset_attention_compute_start_gate"),
-        patch(f"{_pfx}.config_data.AttentionComputeStartGate", type("AttentionComputeStartGate", (), {})),
+        patch(f"{_pfx}.metadata.AttentionComputeStartGate", type("AttentionComputeStartGate", (), {})),
     ):
         yield
