@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HIXLEngineConnectorV2 — Mooncake control/geometry + hixl.Hixl data plane.
-
-Forked from mooncake_connector.py. TransferEngine / global_te are replaced
-by the address-level ``hixl`` binding (import hixl). The frozen
-hixl_engine_connector.py must not be imported or modified from here.
+"""HIXLEngineConnectorV2 — ZMQ control/geometry + hixl.Hixl data plane.
 """
 import contextlib
 import copy
@@ -610,11 +606,12 @@ class RemotePortInfo(TypedDict):
     host: str
 
 
-class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
+class HIXLAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     engine_id: str
-    # HIXL listen port written by the local transport. Same wire field as
-    # Mooncake V1 te_rpc_port; peers must read this value, not recompute it.
-    te_rpc_port: int
+    # HIXL listen port written by the local transport. The field name is part
+    # of the wire protocol (msgspec encodes field names); peers must read this
+    # value, not recompute it.
+    listen_port: int
     kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]]
     block_size: int
     kv_caches_base_addr: list[list[int]]
@@ -711,7 +708,7 @@ class KVCacheTaskTracker:
                 self.delayed_free_requests.pop(request_id, None)
             else:
                 logger.warning(
-                    "MooncakeConnector finish req not in reqs to process. "
+                    "HIXLConnectorfinish req not in reqs to process. "
                     "request_id=%s. "
                     "Possible cause: Request was already completed or not properly tracked. "
                     "Check: Verify request lifecycle and tracking logic.",
@@ -770,7 +767,7 @@ class KVCacheSendingThread(threading.Thread):
         local_engine_id: str,
         side_channel_host: str,
         side_channel_port: int,
-        metadata: MooncakeAgentMetadata,
+        metadata: HIXLAgentMetadata,
         ready_event: threading.Event,
         kv_caches: dict[str, Any],
         pcp_rank: int,
@@ -829,7 +826,7 @@ class KVCacheSendingThread(threading.Thread):
                 self.run_busy_loop(sock)
         except Exception as e:
             logger.exception(
-                "Mooncake KVCacheSendingThread encountered exception. "
+                "HIXLConnector KVCacheSendingThread encountered exception. "
                 "Thread: tp_rank=%d, pp_rank=%d, listening_path=%s. "
                 "Error: %s",
                 self.tp_rank,
@@ -843,7 +840,7 @@ class KVCacheSendingThread(threading.Thread):
         encoded_data = encoder.encode(self.metadata)
         size_in_bytes = len(encoded_data)
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes", str(size_in_bytes))
+            logger.debug("Size of encoded HIXLAgentMetadata: %s bytes", str(size_in_bytes))
 
         decoder = msgspec.msgpack.Decoder(type=tuple)
         while True:
@@ -978,7 +975,7 @@ class KVCacheRecvingThread(threading.Thread):
                         compress_ratio = max(1, spec["compress_ratio"])
                         break
             self.group_compress_ratios[group_id] = compress_ratio
-        self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
+        self.remote_transfer_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_block_size_scale: dict[str, dict[int, list[list[int]]]] = SizedDict()
         self.remote_block_stride_per_addr: dict[str, dict[int, list[list[int]]]] = SizedDict()
         self.remote_kv_group2layeridx: dict[str, dict[int, dict[int, tuple[dict[str, Any], list[int]]]]] = SizedDict()
@@ -1014,7 +1011,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.task_tracker = KVCacheTaskTracker()
 
         self.encoder = msgspec.msgpack.Encoder()
-        self.decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
+        self.decoder = msgspec.msgpack.Decoder(HIXLAgentMetadata)
         self.remote_sockets_lock = threading.Lock()
         self.remote_sockets: dict[  # type: ignore
             str, deque[zmq.Socket]
@@ -1319,7 +1316,7 @@ class KVCacheRecvingThread(threading.Thread):
         with self.remote_metadata_lock:
             remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
-            remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
+            remote_transfer_port = self.remote_transfer_port[remote_engine_id][remote_handshake_port]
             remote_block_stride_per_addr = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
         session_id = f"{remote_host}:{remote_transfer_port}"
 
@@ -1410,7 +1407,7 @@ class KVCacheRecvingThread(threading.Thread):
                             src_list[start_meta_idx:], dst_list[start_meta_idx:], length_list[start_meta_idx:]
                         ):
                             logger.debug(
-                                "Mooncake mamba transfer meta: request_id=%s group_idx=%s layer_idx=%s "
+                                "HIXL mamba transfer meta: request_id=%s group_idx=%s layer_idx=%s "
                                 "local_block_id=%s remote_block_id=%s tp_num_need_pulls=%s "
                                 "remote_tp_offset=%s  session_id=%s",
                                 remote_request_id,
@@ -1456,7 +1453,7 @@ class KVCacheRecvingThread(threading.Thread):
                         dst_list.append(dst)
                         length_list.append(length)
                     logger.debug(
-                        "Mooncake kv transfer meta: request_id=%s group_idx=%s layer_idx=%s local_block_ids=%s "
+                        "HIXL kv transfer meta: request_id=%s group_idx=%s layer_idx=%s local_block_ids=%s "
                         "remote_block_ids=%s tp_num_need_pulls=%s remote_tp_offset=%s session_id=%s",
                         remote_request_id,
                         group_idx,
@@ -1578,7 +1575,7 @@ class KVCacheRecvingThread(threading.Thread):
         uniform_num_pulls = {num_group_pulls for _, _, num_group_pulls, _ in ready_attention_group_reformat_block_ids}
         if len(uniform_num_pulls) != 1:
             raise RuntimeError(
-                f"Non-hybrid Mooncake KV reformat expects uniform group pulls, but got {uniform_num_pulls}."
+                f"Non-hybrid HIXL KV reformat expects uniform group pulls, but got {uniform_num_pulls}."
             )
 
         num_group_pulls = next(iter(uniform_num_pulls))
@@ -1912,7 +1909,7 @@ class KVCacheRecvingThread(threading.Thread):
             with self.remote_metadata_lock:
                 self.remote_kv_group2layeridx[engine_id][remote_handshake_port] = agent_meta.kv_group2layeridx
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
-                self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
+                self.remote_transfer_port[engine_id][remote_handshake_port] = agent_meta.listen_port
                 self.remote_block_size_scale[engine_id][remote_handshake_port] = agent_meta.block_size_scale
                 self.remote_block_stride_per_addr[engine_id][remote_handshake_port] = agent_meta.block_strides
         except Exception:
@@ -1997,7 +1994,7 @@ class KVCacheRecvingThread(threading.Thread):
             self.remote_sockets[remote_path].append(sock)
 
 
-class MooncakeConnectorMetadata(KVConnectorMetadata):
+class HIXLConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
@@ -2034,16 +2031,16 @@ class HIXLEngineConnectorV2(KVConnectorBase_V1, SupportsHMA):
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         assert vllm_config.kv_transfer_config is not None
         self.engine_id = vllm_config.kv_transfer_config.engine_id
-        self._connector_metadata = MooncakeConnectorMetadata()
+        self._connector_metadata = HIXLConnectorMetadata()
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler: MooncakeConnectorScheduler | None = MooncakeConnectorScheduler(
+            self.connector_scheduler: HIXLConnectorScheduler | None = HIXLConnectorScheduler(
                 vllm_config, str(self.engine_id), kv_cache_config
             )
-            self.connector_worker: MooncakeConnectorWorker | None = None
+            self.connector_worker: HIXLConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = MooncakeConnectorWorker(vllm_config, str(self.engine_id), kv_cache_config)
+            self.connector_worker = HIXLConnectorWorker(vllm_config, str(self.engine_id), kv_cache_config)
 
     ############################################################
     # Scheduler Side Methods
@@ -2099,21 +2096,21 @@ class HIXLEngineConnectorV2(KVConnectorBase_V1, SupportsHMA):
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
-        assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
+        assert isinstance(self._connector_metadata, HIXLConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """MooncakeConnector does not do layerwise saving."""
+        """HIXLConnectordoes not do layerwise saving."""
         pass
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
-        """MooncakeConnector does not save explicitly."""
+        """HIXLConnectordoes not save explicitly."""
         pass
 
     def wait_for_save(self):
-        """MooncakeConnector does not save explicitly."""
+        """HIXLConnectordoes not save explicitly."""
         pass
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
@@ -2154,7 +2151,7 @@ class HIXLEngineConnectorV2(KVConnectorBase_V1, SupportsHMA):
             self.connector_worker.shutdown()
 
 
-class MooncakeConnectorScheduler:
+class HIXLConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
@@ -2165,7 +2162,7 @@ class MooncakeConnectorScheduler:
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id = engine_id
         self.local_ip = get_ip()
-        logger.info("Initializing Mooncake Scheduler %s", engine_id)
+        logger.info("Initializing HIXLConnector Scheduler %s", engine_id)
 
         self.side_channel_host = get_ip()
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
@@ -2332,7 +2329,7 @@ class MooncakeConnectorScheduler:
 
         params = request.kv_transfer_params
         logger.debug(
-            "MooncakeConnector get_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
+            "HIXLConnectorget_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
             num_computed_tokens,
             params,
         )
@@ -2355,7 +2352,7 @@ class MooncakeConnectorScheduler:
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         params = request.kv_transfer_params
         logger.debug(
-            "MooncakeConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
+            "HIXLConnectorupdate_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
             num_external_tokens,
             params,
         )
@@ -2385,7 +2382,7 @@ class MooncakeConnectorScheduler:
         self,
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
-        meta = MooncakeConnectorMetadata()
+        meta = HIXLConnectorMetadata()
 
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids, full_block_ids, num_external_tokens) in self._reqs_need_recv.items():
@@ -2422,7 +2419,7 @@ class MooncakeConnectorScheduler:
 
         params = request.kv_transfer_params
         logger.debug(
-            "MooncakeConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
+            "HIXLConnectorrequest_finished, request_status=%s, kv_transfer_params=%s", request.status, params
         )
 
         if (
@@ -2469,7 +2466,7 @@ class MooncakeConnectorScheduler:
             return handshake_port - kv_port
         if isinstance(metadata_key, int):
             return metadata_key
-        raise ValueError(f"Mooncake handshake metadata missing handshake_port for worker key {metadata_key}")
+        raise ValueError(f"HIXL handshake metadata missing handshake_port for worker key {metadata_key}")
 
     def set_xfer_handshake_metadata_from_workers(
         self,
@@ -2491,7 +2488,7 @@ class MooncakeConnectorScheduler:
 
         self.multi_nodes_meta_mapping.update(updated_mapping)
         logger.info(
-            "MooncakeConnector set_xfer_handshake_metadata: worker_count=%d, updated=%s, multi_nodes_meta_mapping=%s",
+            "HIXLConnectorset_xfer_handshake_metadata: worker_count=%d, updated=%s, multi_nodes_meta_mapping=%s",
             len(metadata),
             updated_mapping,
             self.multi_nodes_meta_mapping,
@@ -2504,7 +2501,7 @@ class MooncakeConnectorScheduler:
         self.set_xfer_handshake_metadata_from_workers(metadata)
 
 
-class MooncakeConnectorWorker:
+class HIXLConnectorWorker:
     """Implementation of Worker side methods"""
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
@@ -2575,14 +2572,14 @@ class MooncakeConnectorWorker:
             device_index=device_index,
         )
         self.engine.initialize()
-        self.te_rpc_port = self.engine.listen_port
+        self.listen_port = self.engine.listen_port
 
         # Background thread for sending or receiving KV caches.
         self.kv_send_thread: KVCacheSendingThread | None = None
         self.kv_recv_thread: KVCacheRecvingThread | None = None
 
         # Handshake metadata of this worker
-        self.xfer_handshake_metadata: MooncakeAgentMetadata | None = None
+        self.xfer_handshake_metadata: HIXLAgentMetadata | None = None
 
         # kv_transfer variables
         self.vllm_config = vllm_config
@@ -2651,7 +2648,7 @@ class MooncakeConnectorWorker:
         serialized_kv_cache_spec = to_msgpackable(spec)
         if not isinstance(serialized_kv_cache_spec, dict):
             serialized_kv_cache_spec = {"repr": serialized_kv_cache_spec}
-        num_key_value_heads = MooncakeConnectorWorker._get_spec_num_key_value_heads(spec)
+        num_key_value_heads = HIXLConnectorWorker._get_spec_num_key_value_heads(spec)
         if num_key_value_heads is not None:
             serialized_kv_cache_spec["num_kv_heads"] = num_key_value_heads
             serialized_kv_cache_spec["num_key_value_heads"] = num_key_value_heads
@@ -2752,7 +2749,7 @@ class MooncakeConnectorWorker:
 
             if len(spec_groups) > 1:
                 logger.info(
-                    "Split KV cache manager group %d into %d Mooncake transfer groups by KV spec: %s",
+                    "Split KV cache manager group %d into %d HIXL transfer groups by KV spec: %s",
                     kv_cache_group_id,
                     len(spec_groups),
                     list(spec_groups),
@@ -2914,7 +2911,7 @@ class MooncakeConnectorWorker:
                 self.block_size_scale[layer_idx].append(block_size_scale)
                 self.kv_caches_base_addr[layer_idx].append(single_kv_cache.data_ptr())
 
-        # Registration granularity is Mooncake's, unchanged: the allocator
+        # Registration granularity is unchanged from the original connector: the allocator
         # 2M-aligns each raw KV tensor for disaggregation, and views inside it
         # (conv at kv_padding, ssm after k) start at unaligned offsets, so
         # registering whole storage keeps the aligned base and leaves room to
@@ -2950,9 +2947,9 @@ class MooncakeConnectorWorker:
             n_registered,
         )
         # After KV Caches registered, start the sending or receiving thread.
-        metadata = MooncakeAgentMetadata(
+        metadata = HIXLAgentMetadata(
             engine_id=self.engine_id,
-            te_rpc_port=self.te_rpc_port,
+            listen_port=self.listen_port,
             kv_group2layeridx=self.kv_group2layeridx,
             block_size=self.block_size,
             kv_caches_base_addr=self.kv_caches_base_addr,
@@ -3922,7 +3919,7 @@ class MooncakeConnectorWorker:
         local_block_ids = local_block_ids[: len(remote_block_ids)]
 
         logger.debug(
-            "Mooncake SFA replicate-K block ids prepared from aligned full blocks. "
+            "HIXL SFA replicate-K block ids prepared from aligned full blocks. "
             "remote_cp_size=%s local_cp_size=%s num_prompt_blocks=%s num_computed_tokens=%s "
             "num_external_blocks=%s local_len=%s remote_len=%s",
             remote_cp_size,
@@ -3936,7 +3933,7 @@ class MooncakeConnectorWorker:
 
         return (local_block_ids,), (remote_block_ids,)
 
-    def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+    def start_load_kv(self, metadata: HIXLConnectorMetadata):
         """Enqueue pulls only. Submit and wait stay on the receiving thread."""
         for req_id in metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
