@@ -708,7 +708,7 @@ class KVCacheTaskTracker:
                 self.delayed_free_requests.pop(request_id, None)
             else:
                 logger.warning(
-                    "HIXLConnectorfinish req not in reqs to process. "
+                    "HIXLConnector finish req not in reqs to process. "
                     "request_id=%s. "
                     "Possible cause: Request was already completed or not properly tracked. "
                     "Check: Verify request lifecycle and tracking logic.",
@@ -2100,17 +2100,17 @@ class HIXLConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """HIXLConnectordoes not do layerwise saving."""
+        """HIXLConnector does not do layerwise saving."""
         pass
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
-        """HIXLConnectordoes not save explicitly."""
+        """HIXLConnector does not save explicitly."""
         pass
 
     def wait_for_save(self):
-        """HIXLConnectordoes not save explicitly."""
+        """HIXLConnector does not save explicitly."""
         pass
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
@@ -2329,7 +2329,7 @@ class HIXLConnectorScheduler:
 
         params = request.kv_transfer_params
         logger.debug(
-            "HIXLConnectorget_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
+            "HIXLConnector get_num_new_matched_tokens: num_computed_tokens=%s, kv_transfer_params=%s",
             num_computed_tokens,
             params,
         )
@@ -2352,7 +2352,7 @@ class HIXLConnectorScheduler:
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         params = request.kv_transfer_params
         logger.debug(
-            "HIXLConnectorupdate_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
+            "HIXLConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
             num_external_tokens,
             params,
         )
@@ -2419,7 +2419,7 @@ class HIXLConnectorScheduler:
 
         params = request.kv_transfer_params
         logger.debug(
-            "HIXLConnectorrequest_finished, request_status=%s, kv_transfer_params=%s", request.status, params
+            "HIXLConnector request_finished, request_status=%s, kv_transfer_params=%s", request.status, params
         )
 
         if (
@@ -2488,7 +2488,7 @@ class HIXLConnectorScheduler:
 
         self.multi_nodes_meta_mapping.update(updated_mapping)
         logger.info(
-            "HIXLConnectorset_xfer_handshake_metadata: worker_count=%d, updated=%s, multi_nodes_meta_mapping=%s",
+            "HIXLConnector set_xfer_handshake_metadata: worker_count=%d, updated=%s, multi_nodes_meta_mapping=%s",
             len(metadata),
             updated_mapping,
             self.multi_nodes_meta_mapping,
