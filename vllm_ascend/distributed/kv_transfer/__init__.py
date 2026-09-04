@@ -30,12 +30,12 @@ def register_connector():
         "MooncakeConnectorV1", "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector", "MooncakeConnector"
     )
 
-    # HIXLEngineConnectorV2 — ZMQ control/geometry + hixl.Hixl data plane.
+    # HIXLConnector — ZMQ control/geometry + hixl.Hixl data plane.
     # Address-level pull connector driving hixl::Hixl directly (no LLM-DataDist
     # block API, no staging/post-transpose). Selected via
-    # `kv_connector=HIXLEngineConnectorV2`.
+    # `kv_connector=HIXLConnector`.
     KVConnectorFactory.register_connector(
-        "HIXLEngineConnectorV2", "vllm_ascend.distributed.kv_transfer.kv_p2p.hixl_engine_connector_v2", "HIXLEngineConnectorV2"
+        "HIXLConnector", "vllm_ascend.distributed.kv_transfer.kv_p2p.hixl_engine_connector_v2", "HIXLConnector"
     )
 
     KVConnectorFactory.register_connector(

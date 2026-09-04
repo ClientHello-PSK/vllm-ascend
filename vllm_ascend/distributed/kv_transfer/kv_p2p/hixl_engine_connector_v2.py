@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HIXLEngineConnectorV2 — ZMQ control/geometry + hixl.Hixl data plane.
+"""HIXLConnector — ZMQ control/geometry + hixl.Hixl data plane.
 """
 import contextlib
 import copy
@@ -361,7 +361,7 @@ class _Hixl:
             self._hixl_mod = _load_hixl()
         self._hixl = self._hixl_mod.Hixl()
         logger.info(
-            "HIXLEngineV2 Initialize backend=%s requested=%s injected=%s endpoint=%s options=%s",
+            "HIXLConnector Initialize backend=%s requested=%s injected=%s endpoint=%s options=%s",
             self.backend,
             self.backend_requested,
             self.backend_injected,
@@ -406,7 +406,7 @@ class _Hixl:
             self._initialized = False
             self._connected.clear()
             self._orphan_handles.clear()
-        logger.info("HIXLEngineV2 finalized endpoint=%s", self.endpoint)
+        logger.info("HIXLConnector finalized endpoint=%s", self.endpoint)
 
     def _deregister_all_locked(self) -> None:
         for addr, (handle, _length) in self._registered_bases.items():
@@ -416,7 +416,7 @@ class _Hixl:
             except Exception:  # noqa: BLE001
                 # A stale handle must not block re-registration or shutdown.
                 logger.warning(
-                    "HIXLEngineV2 DeregisterMem failed for base=%#x handle=%s; continuing.", addr, handle
+                    "HIXLConnector DeregisterMem failed for base=%#x handle=%s; continuing.", addr, handle
                 )
         self._registered_bases.clear()
 
@@ -452,8 +452,8 @@ class _Hixl:
                 try:
                     self._hixl.disconnect(remote_engine, self.link_timeout_ms)
                 except Exception:  # noqa: BLE001
-                    logger.warning("HIXLEngineV2 Disconnect(%s) raised; reconnecting anyway.", remote_engine)
-        logger.warning("HIXLEngineV2 dropped the link to %s; the next pull reconnects.", remote_engine)
+                    logger.warning("HIXLConnector Disconnect(%s) raised; reconnecting anyway.", remote_engine)
+        logger.warning("HIXLConnector dropped the link to %s; the next pull reconnects.", remote_engine)
 
     def sync_read(
         self,
@@ -518,7 +518,7 @@ class _Hixl:
                     # force a needless recompute.
                     self._forget_orphan(handle)
                     logger.warning(
-                        "HIXLEngineV2 transfer to %s completed late, past its %d ms deadline.",
+                        "HIXLConnector transfer to %s completed late, past its %d ms deadline.",
                         remote_engine,
                         self.transfer_timeout_ms,
                     )
@@ -534,7 +534,7 @@ class _Hixl:
                 overdue = True
                 self._remember_orphan(handle, remote_engine)
                 logger.warning(
-                    "HIXLEngineV2 transfer to %s still WAITING after %d ms; draining up to %d ms more "
+                    "HIXLConnector transfer to %s still WAITING after %d ms; draining up to %d ms more "
                     "before abandoning it.",
                     remote_engine,
                     self.transfer_timeout_ms,
@@ -542,7 +542,7 @@ class _Hixl:
                 )
             if overdue and now >= hard_deadline:
                 logger.error(
-                    "HIXLEngineV2 abandoning an in-flight READ from %s after %d ms. The engine may still "
+                    "HIXLConnector abandoning an in-flight READ from %s after %d ms. The engine may still "
                     "write into this request's KV blocks after they are recycled.",
                     remote_engine,
                     self.transfer_timeout_ms + _ORPHAN_DRAIN_MS,
@@ -1468,7 +1468,7 @@ class KVCacheRecvingThread(threading.Thread):
             return
 
         logger.debug(
-            "HIXLEngineV2 transfer request=%s session id=%s src=%s dst=%s length=%s",
+            "HIXLConnector transfer request=%s session id=%s src=%s dst=%s length=%s",
             remote_request_id,
             session_id,
             src_list,
@@ -1478,11 +1478,11 @@ class KVCacheRecvingThread(threading.Thread):
         ret = self.engine.sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error(
-                "HIXLEngineV2 transfer failed for request. remote_request_id=%s, ret=%d. ",
+                "HIXLConnector transfer failed for request. remote_request_id=%s, ret=%d. ",
                 req_meta["remote_request_id"],
                 ret,
             )
-            raise RuntimeError(f"HIXLEngineV2 transfer failed, ret: {ret}")
+            raise RuntimeError(f"HIXLConnector transfer failed, ret: {ret}")
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -2027,7 +2027,7 @@ class HIXLConnectorMetadata(KVConnectorMetadata):
         )
 
 
-class HIXLEngineConnectorV2(KVConnectorBase_V1, SupportsHMA):
+class HIXLConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):
         assert vllm_config.kv_transfer_config is not None
         self.engine_id = vllm_config.kv_transfer_config.engine_id
@@ -2933,7 +2933,7 @@ class HIXLConnectorWorker:
         )
 
         logger.debug(
-            "HIXLEngineV2 register kv caches metadata: kv_group2layeridx=%s, kv_caches_base_addr=%s, "
+            "HIXLConnector register kv caches metadata: kv_group2layeridx=%s, kv_caches_base_addr=%s, "
             "block_len_per_addr=%s, block_stride_per_addr=%s, block_shape_per_addr=%s, "
             "block_size_scale=%s, ptrs=%s, lengths=%s, n_registered=%s",
             self.kv_group2layeridx,
@@ -3019,7 +3019,7 @@ class HIXLConnectorWorker:
         try:
             engine.finalize()
         except Exception:  # noqa: BLE001
-            logger.warning("HIXLEngineV2 finalize failed during shutdown.", exc_info=True)
+            logger.warning("HIXLConnector finalize failed during shutdown.", exc_info=True)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_sending = (
