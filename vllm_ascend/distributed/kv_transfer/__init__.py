@@ -35,7 +35,7 @@ def register_connector():
     # block API, no staging/post-transpose). Selected via
     # `kv_connector=HIXLConnector`.
     KVConnectorFactory.register_connector(
-        "HIXLConnector", "vllm_ascend.distributed.kv_transfer.kv_p2p.hixl_engine_connector_v2", "HIXLConnector"
+        "HIXLConnector", "vllm_ascend.distributed.kv_transfer.kv_p2p.hixl_connector", "HIXLConnector"
     )
 
     KVConnectorFactory.register_connector(

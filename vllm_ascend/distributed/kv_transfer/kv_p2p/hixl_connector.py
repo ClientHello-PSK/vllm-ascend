@@ -383,12 +383,41 @@ class _Hixl:
             # may now need a wider span.
             self._deregister_all_locked()
             mt = self._hixl_mod.MemType.MEM_DEVICE
-            for addr, length in _unique_physical_regions(regions):
-                status, handle = self._hixl.register_mem(self._hixl_mod.MemDesc(addr, length), mt)
-                self._check(status, "RegisterMem")
-                self._registered_bases[addr] = (handle, length)
-                added += 1
+            try:
+                for addr, length in _unique_physical_regions(regions):
+                    status, handle = self._hixl.register_mem(self._hixl_mod.MemDesc(addr, length), mt)
+                    self._check(status, "RegisterMem")
+                    self._registered_bases[addr] = (handle, length)
+                    added += 1
+            except Exception:
+                # A mid-loop failure must not leave this round's already
+                # registered segments behind in the engine and the ledger: the
+                # ledger was empty when the loop started, so deregistering
+                # everything rolls back exactly this round, then re-raise.
+                self._deregister_all_locked()
+                raise
         return added
+
+    def disconnect_all(self) -> None:
+        """Disconnect every connected peer. Best effort; called during
+        shutdown before ``finalize`` so the engine's links are closed
+        cleanly instead of dying with the process."""
+        with self._lock:
+            peers = list(self._connected)
+            live = self._initialized and self._hixl is not None
+        for peer in peers:
+            if not live:
+                break
+            try:
+                self._hixl.disconnect(peer, self.link_timeout_ms)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "HIXLConnector Disconnect(%s) during shutdown raised; continuing.",
+                    peer,
+                )
+        with self._lock:
+            for peer in peers:
+                self._connected.discard(peer)
 
     def finalize(self) -> None:
         """Deregister every KV segment and shut the engine down. Idempotent.
@@ -600,6 +629,11 @@ class _Hixl:
 # other peers already waiting in the global executor queue can make progress.
 MAX_REQUESTS_PER_PEER_HANDLER = 5
 
+# Bounded retries (~1 s at 10 ms apart) for sending a ZMQ ACK on the P-side
+# ROUTER loop. A vanished or busy peer must not stall the whole loop, or
+# GET_META / DONE processing would stop for this rank.
+ACK_SEND_MAX_RETRIES = 100
+
 
 class RemotePortInfo(TypedDict):
     num: int
@@ -693,7 +727,11 @@ class KVCacheTaskTracker:
         self.reqs_to_process: set[str] = set()
 
     def add_req_to_process(self, request_id: str):
-        self.reqs_to_process.add(request_id)
+        # reqs_to_process is shared with the done_task_lock-protected paths
+        # (add_not_transfer_request / update_done_task_count / expiry); take
+        # the same lock so concurrent updates cannot be lost.
+        with self.done_task_lock:
+            self.reqs_to_process.add(request_id)
 
     def add_not_transfer_request(self, request_id: str):
         with self.done_task_lock:
@@ -758,6 +796,51 @@ class KVCacheTaskTracker:
         return expired_requests
 
 
+def _capture_acl_runtime_context() -> Any:
+    """Capture the calling thread's ACL context for executor-thread handoff.
+
+    HIXL binds its engine session to the ACL context of the thread that calls
+    Initialize/RegisterMem, while Connect/TransferAsync run on executor
+    threads; ACL contexts are thread-local, so each executor thread must
+    re-enter the same context before touching the engine. pyACL (``import acl``)
+    may be absent in stub/test environments; return None then and fall back to
+    plain device selection.
+    """
+    try:
+        import acl  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        ret, context = acl.rt.get_context()
+    except (AttributeError, TypeError, ValueError) as e:
+        logger.warning("Failed to get ACL runtime context. error=%s.", e)
+        return None
+    if ret != 0:
+        logger.warning("Failed to get ACL runtime context, ret=%d.", ret)
+        return None
+    return context
+
+
+def _apply_acl_runtime_context(context: Any) -> None:
+    """Re-enter the captured ACL context on the calling (executor) thread."""
+    if context is None:
+        return
+    import acl  # type: ignore[import-not-found]
+
+    ret = acl.rt.set_context(context)
+    if ret != 0:
+        raise RuntimeError(f"Failed to set ACL runtime context, ret={ret}.")
+
+
+def _init_executor_thread(device: Any, acl_context: Any) -> None:
+    # NPU device selection is thread-local: executor workers do not inherit
+    # the device selected by the model worker thread and would otherwise use
+    # device 0 on their first NPU operation. The ACL context is thread-local
+    # too; re-enter the engine's context before any HIXL call on this thread.
+    torch.npu.set_device(device)
+    _apply_acl_runtime_context(acl_context)
+
+
 class KVCacheSendingThread(threading.Thread):
     def __init__(
         self,
@@ -789,6 +872,15 @@ class KVCacheSendingThread(threading.Thread):
         self.port_send_num: dict[str, int] = {}
 
         self.task_tracker = KVCacheTaskTracker()
+        self._stopped = threading.Event()
+
+    def shutdown(self):
+        """Ask the ROUTER loop to exit.
+
+        Best effort: the thread is a daemon and also dies with the process if
+        it is still busy when shutdown() is called.
+        """
+        self._stopped.set()
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -822,9 +914,13 @@ class KVCacheSendingThread(threading.Thread):
                 self.pcp_rank,
             )
             with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
+                # Wake up periodically so the loop can observe shutdown().
+                sock.setsockopt(zmq.RCVTIMEO, 1000)  # type: ignore[attr-defined]
                 self.ready_event.set()
                 self.run_busy_loop(sock)
         except Exception as e:
+            if self._stopped.is_set():
+                return
             logger.exception(
                 "HIXLConnector KVCacheSendingThread encountered exception. "
                 "Thread: tp_rank=%d, pp_rank=%d, listening_path=%s. "
@@ -843,9 +939,13 @@ class KVCacheSendingThread(threading.Thread):
             logger.debug("Size of encoded HIXLAgentMetadata: %s bytes", str(size_in_bytes))
 
         decoder = msgspec.msgpack.Decoder(type=tuple)
-        while True:
+        while not self._stopped.is_set():
             try:
                 frames = sock.recv_multipart()
+            except zmq.Again:  # type: ignore[attr-defined]
+                # RCVTIMEO elapsed; loop back to re-check shutdown().
+                continue
+            try:
                 if len(frames) < 2:
                     logger.error(
                         "Invalid message format in KVCacheSendingThread. "
@@ -885,21 +985,45 @@ class KVCacheSendingThread(threading.Thread):
                         self.port_send_num[request_id] += 1
                         device_index = (self.pp_rank * self.pcp_size + self.pcp_rank) * self.tp_size + self.tp_rank
                         handshake_port = self.side_channel_port + device_index
-                        if self.port_send_num[request_id] >= remote_port_send_num[handshake_port]["num"]:
+                        # The count map comes from the remote side; a missing or
+                        # malformed entry must not wedge the delayed free. Fall
+                        # back to finishing on this DONE signal and log loudly.
+                        port_info = remote_port_send_num.get(handshake_port) or {}
+                        expected_done = port_info.get("num", 0)
+                        if self.port_send_num[request_id] >= expected_done:
+                            if not port_info:
+                                logger.error(
+                                    "DONE message carries no expected count for "
+                                    "handshake port %d; finishing request %s on "
+                                    "this signal alone.",
+                                    handshake_port,
+                                    request_id,
+                                )
                             self.task_tracker.update_done_task_count(request_id)
                             del self.port_send_num[request_id]
                     else:
                         self.task_tracker.update_done_task_count(request_id)
-                    # Acknowledge the request completion.
-                    while True:
+                    # Acknowledge the request completion. Bounded retries: a
+                    # vanished or busy peer must not stall this rank's whole
+                    # ROUTER loop (GET_META / DONE would stop being served).
+                    ack_sent = False
+                    for _ in range(ACK_SEND_MAX_RETRIES):
                         try:
                             # Send ACK to the sender.
                             sock.send_multipart((identity, b"", b"ACK"), flags=zmq.NOBLOCK)  # type: ignore
+                            ack_sent = True
                             break
                         except zmq.Again:  # type: ignore
                             # If the socket is not ready, retry sending.
-                            logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
+                    if not ack_sent:
+                        logger.error(
+                            "Failed to send ACK after %d retries; giving up so the "
+                            "control loop can continue. The decode side may retry "
+                            "or rely on the delayed-free timeout. request_id=%s.",
+                            ACK_SEND_MAX_RETRIES,
+                            request_id,
+                        )
                 else:
                     logger.error(
                         "Connection listener received unexpected message type. "
@@ -989,17 +1113,17 @@ class KVCacheRecvingThread(threading.Thread):
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         first_kv_cache = next(iter(self.kv_caches.values()), None)
+        # ACL contexts are thread-local; capture the engine thread's context so
+        # executor workers can re-enter it before calling into HIXL.
+        self._acl_context = _capture_acl_runtime_context()
         if first_kv_cache is None:
             self.executor = ThreadPoolExecutor(max_workers=32)
         else:
-            # NPU device selection is thread-local. Executor workers do not
-            # inherit the device selected by the model worker thread and would
-            # otherwise use device 0 on their first NPU operation.
             kv_cache_device = first_kv_cache[0].device
             self.executor = ThreadPoolExecutor(
                 max_workers=32,
-                initializer=torch.npu.set_device,
-                initargs=(kv_cache_device,),
+                initializer=_init_executor_thread,
+                initargs=(kv_cache_device, self._acl_context),
             )
         self.peer_request_queues: defaultdict[tuple[str, int], deque[dict[str, Any]]] = defaultdict(deque)
         self.active_peer_request_handlers: set[tuple[str, int]] = set()
@@ -1018,6 +1142,11 @@ class KVCacheRecvingThread(threading.Thread):
         ] = defaultdict(  # type: ignore
             deque
         )
+        # Shared ZMQ context for the REQ socket pool: created lazily, closed
+        # together with the pool in shutdown() instead of leaking one context
+        # (and its IO thread) per socket for the life of the process.
+        self._remote_zmq_ctx: zmq.Context | None = None  # type: ignore[valid-type]
+        self._stopped = threading.Event()
         self.timeout = 1.0  # seconds
 
         assert vllm_config is not None
@@ -1129,7 +1258,11 @@ class KVCacheRecvingThread(threading.Thread):
     def _mark_failed_recv_request(self, request_id: str, local_block_ids: BlockIds) -> None:
         with self.failed_recv_requests_lock:
             self.failed_recv_requests.add(request_id)
-            self.invalid_block_ids.update(local_block_ids[0])
+            # local_block_ids is grouped per KV cache group; report failed
+            # blocks from every group (not just the first one) so partially
+            # loaded requests are never treated as cache hits.
+            for group_block_ids in local_block_ids:
+                self.invalid_block_ids.update(group_block_ids)
 
     def _clear_failed_recv_request(self, request_id: str) -> None:
         with self.failed_recv_requests_lock:
@@ -1138,16 +1271,31 @@ class KVCacheRecvingThread(threading.Thread):
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         self.ready_event.set()
-        while True:
+        while not self._stopped.is_set():
             try:
-                request_data = self.request_queue.get()
+                request_data = self.request_queue.get(timeout=1.0)
                 if request_data is None:
                     logger.warning("Received a None request. ")
                     self.request_queue.task_done()
                     continue
                 self._submit_request(request_data)
+            except queue.Empty:
+                continue
             except Exception as e:
                 logger.error("Error in KVCacheTransferThread. error=%s. ", e)
+
+    def shutdown(self):
+        """Close the transfer lifecycle: stop dispatching, drain in-flight
+        pulls, then close the ZMQ socket pool.
+
+        ``executor.shutdown(wait=True)`` blocks until running pulls reach a
+        terminal state (bounded by the transfer timeouts), so the engine can
+        be deregistered and finalized afterwards without racing an in-flight
+        DMA into freed memory.
+        """
+        self._stopped.set()
+        self.executor.shutdown(wait=True)
+        self._close_remote_sockets()
 
     def _submit_request(self, request_data: dict[str, Any]) -> None:
         peer_key = (request_data["remote_host"], request_data["remote_handshake_port"])
@@ -1193,7 +1341,11 @@ class KVCacheRecvingThread(threading.Thread):
                 self.active_peer_request_handlers.discard(peer_key)
 
         if should_resubmit:
-            self.executor.submit(self._handle_peer_requests, peer_key)
+            try:
+                self.executor.submit(self._handle_peer_requests, peer_key)
+            except RuntimeError:
+                # The executor was shut down; the drain loop stops here.
+                pass
 
     def _mark_request_task_submitted(self, req_meta: dict[str, Any]) -> None:
         request_id = req_meta["request_id"]
@@ -1312,7 +1464,7 @@ class KVCacheRecvingThread(threading.Thread):
                 and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
             )
         if not has_remote_metadata:
-            self._get_remote_metadata(remote_host, remote_handshake_port)
+            self._get_remote_metadata(remote_host, remote_handshake_port, remote_engine_id)
         with self.remote_metadata_lock:
             remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
@@ -1649,8 +1801,16 @@ class KVCacheRecvingThread(threading.Thread):
         remote_tp_offset: int,
     ) -> None:
         remote_tp_size = self.tp_size * tp_num_need_pulls
-        assert remote_tp_size >= self.tp_size, "Mamba prefill TP size must be >= decode TP size."
-        assert remote_tp_size % self.tp_size == 0, "Mamba prefill TP size must be divisible by decode TP size."
+        if remote_tp_size < self.tp_size:
+            raise ValueError(
+                f"Mamba prefill TP size({remote_tp_size}) must be >= decode TP "
+                f"size({self.tp_size})."
+            )
+        if remote_tp_size % self.tp_size != 0:
+            raise ValueError(
+                f"Mamba prefill TP size({remote_tp_size}) must be divisible by "
+                f"decode TP size({self.tp_size})."
+            )
 
         remote_conv_addr, remote_ssm_addr = dst_layer_base_addr[:2]
         local_conv_addr, local_ssm_addr = src_layer_base_addr[:2]
@@ -1888,7 +2048,7 @@ class KVCacheRecvingThread(threading.Thread):
         )
         torch_npu.npu_scatter_pa_kv_cache(k_buffer, v_buffer, k_cache_layer, v_cache_layer, slot_mapping)
 
-    def _get_remote_metadata(self, remote_host: str, remote_handshake_port: int) -> None:
+    def _get_remote_metadata(self, remote_host: str, remote_handshake_port: int, expected_engine_id: str) -> None:
         """Get the metadata from the remote host."""
         sock: zmq.Socket | None = None  # type: ignore
         try:
@@ -1897,14 +2057,36 @@ class KVCacheRecvingThread(threading.Thread):
             metadata_bytes = ensure_zmq_recv(sock, f"{remote_host}:{remote_handshake_port}")
             agent_meta = self.decoder.decode(metadata_bytes)
             engine_id = agent_meta.engine_id
-            assert engine_id != self.local_engine_id, (
-                f"Conflict engine id {engine_id} with local engine id {self.local_engine_id}."
-            )
+            if engine_id == self.local_engine_id:
+                raise RuntimeError(
+                    f"Conflict engine id {engine_id} with local engine id "
+                    f"{self.local_engine_id}; the P and D sides must use "
+                    "different engine_id values."
+                )
+            if engine_id != expected_engine_id:
+                # The caches are keyed by the routed remote_engine_id while the
+                # metadata is stored under the engine the peer reports; a
+                # mismatch (stale routing, reused engine_id) would silently
+                # index a wrong or auto-created empty entry, so fail the pull.
+                raise RuntimeError(
+                    "Remote metadata engine_id does not match the routed engine. "
+                    f"expected={expected_engine_id}, reported={engine_id}, "
+                    f"peer={remote_host}:{remote_handshake_port}. "
+                    "Check: verify kv_transfer_params routing and that every "
+                    "P/D engine uses a unique engine_id."
+                )
             if agent_meta.kv_group2layeridx != self.kv_group2layeridx:
-                logger.warning(
-                    "Remote kv_group2layeridx is inconsistent with local. remote=%s, local=%s. ",
-                    agent_meta.kv_group2layeridx,
-                    self.kv_group2layeridx,
+                # Layer ids index the remote base addresses below; with a
+                # mismatched layout a descriptor can land inside another
+                # registered segment and silently read wrong memory, so fail
+                # the pull instead of continuing with the local layout.
+                raise RuntimeError(
+                    "Remote kv_group2layeridx is inconsistent with the local layout. "
+                    f"remote_engine_id={engine_id}, "
+                    f"remote_layout={agent_meta.kv_group2layeridx}, "
+                    f"local_layout={self.kv_group2layeridx}. "
+                    "Check: ensure both sides run the same model and connector "
+                    "version with identical layer partitioning."
                 )
             with self.remote_metadata_lock:
                 self.remote_kv_group2layeridx[engine_id][remote_handshake_port] = agent_meta.kv_group2layeridx
@@ -1952,7 +2134,16 @@ class KVCacheRecvingThread(threading.Thread):
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
                 sock = None
-                logger.warning("Unexpected error occurred in socket. error=%s. ", e)
+            # Deliberately not re-raising: this runs in a finally block where a
+            # raise would mask the original transfer error. The prefill side
+            # still frees the blocks via the delayed-free timeout, so log an
+            # error to make the missed notification visible.
+            logger.error(
+                "Failed to send done-recving signal; the prefill side will "
+                "force-free this request only after the delayed-free timeout. "
+                "error=%s.",
+                e,
+            )
         finally:
             if sock is not None:
                 self._return_remote_socket(sock, remote_host, remote_handshake_port)
@@ -1965,7 +2156,9 @@ class KVCacheRecvingThread(threading.Thread):
             if self.remote_sockets[remote_path]:
                 return self.remote_sockets[remote_path].popleft()
 
-            ctx = zmq.Context()  # type: ignore
+            if self._remote_zmq_ctx is None:
+                self._remote_zmq_ctx = zmq.Context()  # type: ignore[assignment]
+            ctx = self._remote_zmq_ctx
             sock = make_zmq_socket(
                 ctx=ctx,
                 path=remote_path,
@@ -1992,6 +2185,18 @@ class KVCacheRecvingThread(threading.Thread):
         remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
         with self.remote_sockets_lock:
             self.remote_sockets[remote_path].append(sock)
+
+    def _close_remote_sockets(self) -> None:
+        """Close every pooled remote socket and destroy the shared context."""
+        with self.remote_sockets_lock:
+            for sockets in self.remote_sockets.values():
+                while sockets:
+                    sockets.popleft().close(linger=0)
+            self.remote_sockets.clear()
+            ctx = self._remote_zmq_ctx
+            self._remote_zmq_ctx = None
+        if ctx is not None:
+            ctx.destroy(linger=0)
 
 
 class HIXLConnectorMetadata(KVConnectorMetadata):
@@ -2247,7 +2452,11 @@ class HIXLConnectorScheduler:
         if len(block_ids) == 0:
             return block_ids
 
-        assert len(block_ids) == len(self.group_transfer_info), "Number of KV cache groups must match"
+        if len(block_ids) != len(self.group_transfer_info):
+            raise ValueError(
+                f"Number of KV cache groups({len(block_ids)}) does not match the "
+                f"transfer layout({len(self.group_transfer_info)})."
+            )
 
         transfer_block_ids = []
         cp_size = max(1, self.pcp_size * self.dcp_size)
@@ -2267,7 +2476,11 @@ class HIXLConnectorScheduler:
         if len(block_ids) == 0:
             return block_ids
 
-        assert len(block_ids) == len(self.group_transfer_info), "Number of KV cache groups must match"
+        if len(block_ids) != len(self.group_transfer_info):
+            raise ValueError(
+                f"Number of KV cache groups({len(block_ids)}) does not match the "
+                f"transfer layout({len(self.group_transfer_info)})."
+            )
 
         transfer_block_ids = []
         for blocks, group_info in zip(block_ids, self.group_transfer_info):
@@ -2373,8 +2586,12 @@ class HIXLConnectorScheduler:
                     )
                 else:
                     logger.warning("Got invalid KVTransferParams. params=%s. ", params)
-            else:
-                assert num_external_tokens == 0
+            elif num_external_tokens != 0:
+                raise ValueError(
+                    f"Request {request.request_id} reports "
+                    f"num_external_tokens({num_external_tokens}) without remote "
+                    "block ids in kv_transfer_params."
+                )
             # Only trigger 1 KV transfer per request.
             params["do_remote_prefill"] = False
 
@@ -2528,8 +2745,12 @@ class HIXLConnectorWorker:
         self.side_channel_host = get_ip()
         self.pcp_size = get_pcp_group().world_size
         self.total_layers = vllm_config.model_config.get_total_num_hidden_layers()
-        # Assert that pp_size and pcp_size cannot both be greater than 1
-        assert not (self.pp_size > 1 and self.pcp_size > 1), "pp and pcp cannot open in same time"
+        # pp_size and pcp_size cannot both be greater than 1
+        if self.pp_size > 1 and self.pcp_size > 1:
+            raise ValueError(
+                f"pp_size({self.pp_size}) and pcp_size({self.pcp_size}) cannot "
+                "both be greater than 1."
+            )
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_decode_context_model_parallel_world_size()
         self.dcp_rank = get_decode_context_model_parallel_rank() if self.dcp_size > 1 else 0
@@ -2597,22 +2818,38 @@ class HIXLConnectorWorker:
         # get prefill tp and dp size from extra config
         prefill_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {})
 
-        assert "tp_size" in prefill_parallel_config
+        if "tp_size" not in prefill_parallel_config:
+            raise ValueError(
+                "extra_config.prefill.tp_size is required in kv_transfer_config."
+            )
         self._prefill_tp_size = prefill_parallel_config["tp_size"]
 
-        assert "dp_size" in prefill_parallel_config
+        if "dp_size" not in prefill_parallel_config:
+            raise ValueError(
+                "extra_config.prefill.dp_size is required in kv_transfer_config."
+            )
         self._prefill_dp_size = prefill_parallel_config["dp_size"]
         # get prefill pp size from extra config
         self._prefill_pp_size = prefill_parallel_config.get("pp_size", 1)
         # get decode tp and dp size from extra config
         decode_parallel_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("decode", {})
-        assert "tp_size" in decode_parallel_config
+        if "tp_size" not in decode_parallel_config:
+            raise ValueError(
+                "extra_config.decode.tp_size is required in kv_transfer_config."
+            )
         self._decode_tp_size = decode_parallel_config["tp_size"]
-        assert "dp_size" in decode_parallel_config
+        if "dp_size" not in decode_parallel_config:
+            raise ValueError(
+                "extra_config.decode.dp_size is required in kv_transfer_config."
+            )
         self._decode_dp_size = decode_parallel_config["dp_size"]
         # get prefill pp size from extra config
         self._decode_pp_size = decode_parallel_config.get("pp_size", 1)
-        assert self._decode_pp_size == 1, "decode pp size must be 1"
+        if self._decode_pp_size != 1:
+            raise ValueError(
+                f"decode pp_size({self._decode_pp_size}) must be 1; pipeline "
+                "parallelism on the decode side is not supported."
+            )
         self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
 
     @staticmethod
@@ -2823,7 +3060,8 @@ class HIXLConnectorWorker:
             base_addr = min(shared_addrs)
             if has_mtp:
                 base_addr -= conv_padding
-            assert base_addr % (2 * 1024 * 1024) == 0, f"Tensor start addr {base_addr} is not align with 2M."
+            if base_addr % (2 * 1024 * 1024) != 0:
+                raise ValueError(f"Tensor start addr {base_addr} is not aligned to 2M.")
             ptrs.append(base_addr)
             lengths.append(kv_cache_tensor.size)
 
@@ -2844,7 +3082,8 @@ class HIXLConnectorWorker:
             if not shared_addrs:
                 continue
             base_addr = min(shared_addrs)
-            assert base_addr % (2 * 1024 * 1024) == 0, f"Tensor start addr {base_addr} is not align with 2M."
+            if base_addr % (2 * 1024 * 1024) != 0:
+                raise ValueError(f"Tensor start addr {base_addr} is not aligned to 2M.")
             ptrs.append(base_addr)
             lengths.append(kv_cache_tensor.size)
 
@@ -3009,13 +3248,22 @@ class HIXLConnectorWorker:
             time.sleep(3)
 
     def shutdown(self):
-        # Deregisters the KV segments and finalizes the engine. The transfer
-        # threads are daemons that die with the process; finalize takes the
-        # engine lock, so a pull racing this teardown fails instead of
-        # touching a freed engine.
+        # Close the transfer lifecycle in order: stop dispatching new pulls,
+        # drain in-flight pulls (the executor shutdown waits for them so a
+        # late DMA never races the teardown), disconnect peers, then
+        # deregister the KV segments, finalize the engine and close the ZMQ
+        # pool.
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread.shutdown()
+        if self.kv_send_thread is not None:
+            self.kv_send_thread.shutdown()
         engine = getattr(self, "engine", None)
         if engine is None:
             return
+        try:
+            engine.disconnect_all()
+        except Exception:  # noqa: BLE001
+            logger.warning("HIXLConnector disconnect-all failed during shutdown.", exc_info=True)
         try:
             engine.finalize()
         except Exception:  # noqa: BLE001
@@ -3152,9 +3400,11 @@ class HIXLConnectorWorker:
         # kernel_size is the shared (P==D) granularity; remote_scale is derived from it.
         local_scale = self.block_size_scale[layer_indices[0]][0]
         kernel_size = self.block_size // local_scale
-        assert remote_block_size % kernel_size == 0, (
-            f"remote_block_size({remote_block_size}) not divisible by kernel_size({kernel_size})"
-        )
+        if remote_block_size % kernel_size != 0:
+            raise ValueError(
+                f"remote_block_size({remote_block_size}) is not divisible by "
+                f"kernel_size({kernel_size})."
+            )
 
         remote_scale = remote_block_size // kernel_size
         kernel_local = self._expand_block_ids(list(meta.local_block_ids[kv_cache_group_id]), local_scale)
@@ -3187,9 +3437,11 @@ class HIXLConnectorWorker:
                 continue
             local_scale = self.block_size_scale[layer_indices[0]][0]
             kernel_size = self.block_size // local_scale
-            assert remote_block_size % kernel_size == 0, (
-                f"remote_block_size({remote_block_size}) not divisible by kernel_size({kernel_size})"
-            )
+            if remote_block_size % kernel_size != 0:
+                raise ValueError(
+                    f"remote_block_size({remote_block_size}) is not divisible by "
+                    f"kernel_size({kernel_size})."
+                )
             remote_scale = remote_block_size // kernel_size
             group_kernel_params[group_idx] = (local_scale, remote_scale, kernel_size)
         return group_kernel_params
@@ -3205,18 +3457,29 @@ class HIXLConnectorWorker:
         remote_cp_size = meta.remote_pcp_size * meta.remote_dcp_size
 
         if remote_block_size != self.block_size:
-            assert self.block_size % remote_block_size == 0 or remote_block_size % self.block_size == 0, (
-                f"Block sizes of P ({remote_block_size}) and D ({self.block_size}) must be divisible by each other."
-            )
+            if (
+                self.block_size % remote_block_size != 0
+                and remote_block_size % self.block_size != 0
+            ):
+                raise ValueError(
+                    f"Block sizes of P ({remote_block_size}) and D ({self.block_size}) "
+                    "must be divisible by each other."
+                )
             if local_cp_size > 1:
-                assert self.block_size % remote_block_size == 0, (
-                    f"D node DCP not support P node block_size({remote_block_size}) > D block_size({self.block_size})"
-                )
+                if self.block_size % remote_block_size != 0:
+                    raise ValueError(
+                        f"D node DCP does not support P node block_size"
+                        f"({remote_block_size}) > D block_size({self.block_size})."
+                    )
                 # Ensure that the blocks of each P cp rank belong to the same D rank.
-                assert (remote_cp_size // local_cp_size) % (self.block_size // remote_block_size) == 0, (
-                    f"remote_cp_size({remote_cp_size}) must be an integer multiple of"
-                    f"r({self.block_size // remote_block_size}) * local_cp_size({local_cp_size})"
-                )
+                if (remote_cp_size // local_cp_size) % (
+                    self.block_size // remote_block_size
+                ) != 0:
+                    raise ValueError(
+                        f"remote_cp_size({remote_cp_size}) must be an integer multiple "
+                        f"of r({self.block_size // remote_block_size}) * "
+                        f"local_cp_size({local_cp_size})."
+                    )
 
         r_blk = self.block_size // remote_block_size if self.block_size > remote_block_size else 1
         return remote_block_size, local_cp_rank, local_cp_size, remote_cp_size, r_blk
@@ -3280,11 +3543,21 @@ class HIXLConnectorWorker:
             )
 
         def context_parallel_parameters_check():
-            assert (meta.remote_pcp_size * meta.remote_dcp_size) % (self.pcp_size * self.dcp_size) == 0
+            remote_cp = meta.remote_pcp_size * meta.remote_dcp_size
+            local_cp = self.pcp_size * self.dcp_size
+            if remote_cp % local_cp != 0:
+                raise ValueError(
+                    f"remote CP size({remote_cp}) must be an integer multiple of "
+                    f"local CP size({local_cp})."
+                )
             if not (self.use_mla or self.use_sparse):
                 p_node_heads_per_rank = math.ceil(self.num_key_value_heads / prefill_tp_size)
                 d_node_heads_per_rank = math.ceil(self.num_key_value_heads / self.tp_size)
-                assert d_node_heads_per_rank % p_node_heads_per_rank == 0
+                if d_node_heads_per_rank % p_node_heads_per_rank != 0:
+                    raise ValueError(
+                        f"D node kv heads per rank({d_node_heads_per_rank}) must be "
+                        f"divisible by P node kv heads per rank({p_node_heads_per_rank})."
+                    )
 
         def get_kv_head_groups(tp_size):
             if self.use_mla or self.use_sparse:
@@ -3481,15 +3754,19 @@ class HIXLConnectorWorker:
             ),
             0,
         )
-        assert math.ceil(num_external_blocks / (self.pcp_size * self.dcp_size)) == len(
+        if math.ceil(num_external_blocks / (self.pcp_size * self.dcp_size)) != len(
             meta.local_block_ids[sequence_group_idx]
-        ), (
-            f"num_external_blocks({num_external_blocks}), cp_size({self.pcp_size * self.dcp_size}), "
-            f"local_block_ids_len ({len(meta.local_block_ids[sequence_group_idx])})"
-        )
-        assert meta.num_prompt_blocks >= num_external_blocks_p, (
-            f"meta.num_prompt_blocks({meta.num_prompt_blocks}), num_external_blocks({num_external_blocks})"
-        )
+        ):
+            raise ValueError(
+                f"num_external_blocks({num_external_blocks}) divided by "
+                f"cp_size({self.pcp_size * self.dcp_size}) does not match "
+                f"local_block_ids length({len(meta.local_block_ids[sequence_group_idx])})."
+            )
+        if meta.num_prompt_blocks < num_external_blocks_p:
+            raise ValueError(
+                f"meta.num_prompt_blocks({meta.num_prompt_blocks}) is smaller than "
+                f"num_external_blocks({num_external_blocks_p})."
+            )
 
         remote_block_nums_all = [meta.num_prompt_blocks // remote_cp_size] * remote_cp_size
         num_remain_blocks = meta.num_prompt_blocks % remote_cp_size
@@ -3530,9 +3807,11 @@ class HIXLConnectorWorker:
         num_prefix_p_blocks = num_prefix_cached_blocks
         if r_blk > 1:
             # The prefix match granularity for D is Bd = r_blk * Bp, so P0 must be an integer multiple of r_blk.
-            assert num_prefix_p_blocks % r_blk == 0, (
-                f"P0({num_prefix_p_blocks}) should be  r_blk({r_blk}) integer multiple "
-            )
+            if num_prefix_p_blocks % r_blk != 0:
+                raise ValueError(
+                    f"num_prefix_p_blocks({num_prefix_p_blocks}) must be an integer "
+                    f"multiple of r_blk({r_blk})."
+                )
 
         # The first D-block in the external zone (global block ID in D-units)
         # and the first external D-block owned by this rank.
@@ -3609,12 +3888,15 @@ class HIXLConnectorWorker:
         if self._is_hma_required:
             # HMA: The final shard might be padded with Mamba ports;
             # the total port count is permitted to exceed the number required by attention.
-            assert len(remote_handshake_port_list[0]) >= tp_num_need_pulls, (
-                f"tp_num_need_pulls: {tp_num_need_pulls}, remote_handshake_port_list: {remote_handshake_port_list}"
-            )
-        else:
-            assert tp_num_need_pulls == len(remote_handshake_port_list[0]), (
-                f"tp_num_need_pulls: {tp_num_need_pulls}, remote_handshake_port_list: {remote_handshake_port_list}"
+            if len(remote_handshake_port_list[0]) < tp_num_need_pulls:
+                raise ValueError(
+                    f"tp_num_need_pulls({tp_num_need_pulls}) exceeds the number of "
+                    f"remote ports({remote_handshake_port_list[0]})."
+                )
+        elif tp_num_need_pulls != len(remote_handshake_port_list[0]):
+            raise ValueError(
+                f"tp_num_need_pulls({tp_num_need_pulls}) does not match the number "
+                f"of remote ports({remote_handshake_port_list[0]})."
             )
 
         return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
@@ -3740,9 +4022,11 @@ class HIXLConnectorWorker:
                     // prefill_tp_size
                 ]
             else:
-                assert len(remote_ports) % tp_num_need_pulls == 0, (
-                    f"tp_num_need_pulls: {tp_num_need_pulls}, remote_ports: {remote_ports}"
-                )
+                if len(remote_ports) % tp_num_need_pulls != 0:
+                    raise ValueError(
+                        f"Number of remote ports({remote_ports}) must be divisible "
+                        f"by tp_num_need_pulls({tp_num_need_pulls})."
+                    )
                 remote_tp_offsets = [rank_idx % tp_num_need_pulls for rank_idx in range(len(remote_ports))]
                 prefill_pp_ranks = [
                     ((remote_port - remote_base_port) % (prefill_tp_size * self._prefill_pp_size)) // prefill_tp_size
@@ -3771,10 +4055,11 @@ class HIXLConnectorWorker:
                 continue
 
             if group_spec["kv_cache_spec_type"] == "MambaSpec":
-                assert prefill_tp_size % self.tp_size == 0, (
-                    f"Hybrid Mamba prefill tp size({prefill_tp_size}) must be divisible by "
-                    f"decode tp size({self.tp_size})."
-                )
+                if prefill_tp_size % self.tp_size != 0:
+                    raise ValueError(
+                        f"Hybrid Mamba prefill tp size({prefill_tp_size}) must be "
+                        f"divisible by decode tp size({self.tp_size})."
+                    )
                 num_group_pulls = prefill_tp_size // self.tp_size
                 for pp_rank in range(self._prefill_pp_size):
                     pp_rank_offset = pp_rank * prefill_tp_size
@@ -3795,10 +4080,12 @@ class HIXLConnectorWorker:
 
             num_group_pulls = self._get_attention_group_num_need_pulls(group_spec, prefill_tp_size)
             chosen_rank_list = self._get_attention_group_remote_rank(req_id, group_spec, prefill_tp_size)
-            assert len(chosen_rank_list) == num_group_pulls * self._prefill_pp_size, (
-                f"chosen_rank_list({chosen_rank_list}) does not match num_group_pulls({num_group_pulls}) "
-                f"and prefill pp size({self._prefill_pp_size})."
-            )
+            if len(chosen_rank_list) != num_group_pulls * self._prefill_pp_size:
+                raise ValueError(
+                    f"chosen_rank_list({chosen_rank_list}) does not match "
+                    f"num_group_pulls({num_group_pulls}) and prefill pp "
+                    f"size({self._prefill_pp_size})."
+                )
             for rank_idx, remote_rank in enumerate(chosen_rank_list):
                 prefill_pp_rank = rank_idx // num_group_pulls
                 add_group_pull(
@@ -4082,10 +4369,11 @@ class HIXLConnectorWorker:
 
     def _get_prefill_ranks_for_group(self, req_id: str, group_spec: dict[str, Any]) -> set[int]:
         if group_spec["kv_cache_spec_type"] == "MambaSpec":
-            assert self._prefill_tp_size % self._decode_tp_size == 0, (
-                f"Hybrid Mamba prefill tp size({self._prefill_tp_size}) must be divisible by "
-                f"decode tp size({self._decode_tp_size})."
-            )
+            if self._prefill_tp_size % self._decode_tp_size != 0:
+                raise ValueError(
+                    f"Hybrid Mamba prefill tp size({self._prefill_tp_size}) must be "
+                    f"divisible by decode tp size({self._decode_tp_size})."
+                )
             return set(range(self._prefill_tp_size * self._prefill_pp_size))
 
         num_key_value_heads = self._get_attention_group_num_key_value_heads(group_spec)
