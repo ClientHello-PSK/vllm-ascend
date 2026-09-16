@@ -252,7 +252,7 @@ def _apply_hixl_engine_backend_options(backend: str, options: dict[str, str]) ->
     raise ValueError(f"hixl_engine.backend must be 'hixl_cs' or 'comm', got {backend!r}.")
 
 
-def _parse_hixl_engine_v2_extra(
+def _parse_hixl_engine_extra(
     extra: dict[str, Any] | None, *, host: str, kv_port: int, dp_offset: int, device_index: int
 ) -> tuple[str, int, str, dict[str, str], str, str, int, int]:
     cfg = extra or {}
@@ -345,7 +345,7 @@ class _Hixl:
     ) -> "_Hixl":
         kvtc = vllm_config.kv_transfer_config
         extra = kvtc.get_from_extra_config("hixl_engine", {}) or {}
-        parsed = _parse_hixl_engine_v2_extra(
+        parsed = _parse_hixl_engine_extra(
             extra,
             host=host,
             kv_port=int(kvtc.kv_port),
